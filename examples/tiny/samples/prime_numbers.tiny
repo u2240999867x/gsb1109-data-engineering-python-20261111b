@@ -1,0 +1,26 @@
+int is_factorable_by(int a, int b) {
+    /* prime is not factorable by any number >= itself */
+    if b >= a then return 0; end
+
+    float quo := a / b;
+    int iquo := quo;
+    return quo = iquo;
+}
+
+int is_prime(int n) {
+    if is_factorable_by(n, 2) then return 0; end
+    if is_factorable_by(n, 3) then return 0; end
+    if is_factorable_by(n, 5) then return 0; end
+    if is_factorable_by(n, 7) then return 0; end
+
+    /* n is prime, assuming it is not > 120 */
+    return 1;
+}
+
+int main() {
+    int i := 2;
+    repeat
+        if is_prime(i) then write i; write endl; end
+        i := i + 1;
+    until i > 120
+}

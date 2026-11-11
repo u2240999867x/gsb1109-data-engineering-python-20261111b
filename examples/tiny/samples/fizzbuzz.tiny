@@ -1,0 +1,29 @@
+/* FizzBuzz in Tiny
+   Count from 1 to (limit), printing "Fizz" for multiples of 3, "Buzz" for multiples of 5,
+   and "FizzBuzz" for multiples of 15.
+*/
+
+int is_divisible(int a, int b) {
+    float quo := a / b;
+    int iquo := quo;
+    return quo = iquo;
+}
+
+int main() {
+    limit := 100;
+
+    i := 0;
+    repeat
+        i := i + 1;
+        show_num := 1;
+
+        if is_divisible(i, 3) then write "Fizz"; show_num := 0; end
+        if is_divisible(i, 5) then write "Buzz"; show_num := 0; end
+        if show_num then write i; end
+
+        write endl;
+
+    until i = limit
+
+    return 0;
+}
