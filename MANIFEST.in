@@ -1,0 +1,16 @@
+graft src
+graft tests
+graft docs
+
+include AUTHORS.rst
+include CONTRIBUTING.rst
+include CHANGELOG.rst
+include LICENSE.rst
+include README.rst
+include requirements.txt
+include tox.ini
+include tasks.py
+
+global-include py.typed
+
+global-exclude *.py[cod] __pycache__ *.so

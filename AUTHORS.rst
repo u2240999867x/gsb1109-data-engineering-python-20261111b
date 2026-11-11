@@ -1,0 +1,90 @@
+Authors
+=======
+
+
+Lead
+----
+
+- Derrick Gilland, dgilland@gmail.com, `dgilland@github <https://github.com/dgilland>`_
+
+
+Contributors
+------------
+
+- Tanveer Singh, `tanveerchana@github <https://github.com/tanveerchana>`_
+- Nathan Cahill, `nathancahill@github <https://github.com/nathancahill>`_
+- Klaus Sevensleeper, `k7sleeper@github <https://github.com/k7sleeper>`_
+- Bharadwaj Yarlagadda, `bharadwajyarlagadda@github <https://github.com/bharadwajyarlagadda>`_
+- Michael James, `urbnjamesmi1@github <https://github.com/urbnjamesmi1>`_
+- Tim Griesser, `tgriesser@github <https://github.com/tgriesser>`_
+- Shaun Patterson, `shaunpatterson@github <https://github.com/shaunpatterson>`_
+- Brian Beck, `beck3905@github <https://github.com/beck3905>`_
+- Frank Epperlein, `efenka@github <https://github.com/efenka>`_
+- Joshua Wilson, `jwilson8767@github <https://github.com/jwilson8767>`_
+- Eli Jose, `elijose55@github <https://github.com/elijose55>`_
+- Gonzalo Naveira, `gonzalonaveira@github <https://github.com/gonzalonaveira>`_
+- Wenbo Zhao, `zhaowb@github <https://github.com/zhaowb>`_
+- Mervyn Lee, `mervynlee94@github <https://github.com/mervynlee94>`_
+- Weineel Lee, `weineel@github <https://github.com/weineel>`_
+- bl4ckst0ne@github, `bl4ckst0ne@github <https://github.com/bl4ckst0ne>`_
+- Thomas, `DeviousStoat@github <https://github.com/DeviousStoat>`_
+- SeaStar Deng, `DSeaStar@github <https://github.com/DSeaStar>`_
+- CodingFeng101, `CodingFeng101@github <https://github.com/CodingFeng101>`_
+- uttam12331, `uttam12331@github <https://github.com/uttam12331>`_
+- santhreal, `santhreal@github <https://github.com/santhreal>`_
+- gaoflow, `gaoflow@github <https://github.com/gaoflow>`_
+- HarperZ9, `HarperZ9@github <https://github.com/HarperZ9>`_
+- oyeong011, `oyeong011@github <https://github.com/oyeong011>`_
+- jackwalkerlabs, `jackwalkerlabs@github <https://github.com/jackwalkerlabs>`_
+- Sun Haoyuan, `Shy7777@github <https://github.com/Shy7777>`_
+- emme1t, `emme1t@github <https://github.com/emme1t>`_
+- Vitaliy, `vitalivo@github <https://github.com/vitalivo>`_
+- MarkXian, `xianjianlf2@github <https://github.com/xianjianlf2>`_
+- Jake Wang, `jakezwang@github <https://github.com/jakezwang>`_
+- Gonghan-Princess, `Gonghan-Princess@github <https://github.com/Gonghan-Princess>`_
+- agammann, `agammann@github <https://github.com/agammann>`_
+- rupayon123, `rupayon123@github <https://github.com/rupayon123>`_
+- Likio3000, `Likio3000@github <https://github.com/Likio3000>`_
+- x0Lazarus, `x0Lazarus@github <https://github.com/x0Lazarus>`_
+- shkyyy18, `shkyyy18@github <https://github.com/shkyyy18>`_
+- fhgffy, `fhgffy@github <https://github.com/fhgffy>`_
+- Pralav Singh, `pralav-25@github <https://github.com/pralav-25>`_
+- Basil Chen, `rastagan-git@github <https://github.com/rastagan-git>`_
+- Kudala Bharani Kumar Reddy, `kudala-bharani@github <https://github.com/kudala-bharani>`_
+- WU Leizhi, `MbappeWU@github <https://github.com/MbappeWU>`_
+- Fan Wu, `FanWu-ai@github <https://github.com/FanWu-ai>`_
+- yuefdev, `yuefdev@github <https://github.com/yuefdev>`_
+- Huanyi Xie, `xiehuanyi@github <https://github.com/xiehuanyi>`_
+- Ryan Duguid, `ryanduguid@github <https://github.com/ryanduguid>`_
+- harbinresearcher, `harbinresearcher@github <https://github.com/harbinresearcher>`_
+- himanshu748, `himanshu748@github <https://github.com/himanshu748>`_
+- Bharat Kaurav, `TheNetherWatcher@github <https://github.com/TheNetherWatcher>`_
+- Muneeb Sheikh, `muneikh@github <https://github.com/muneikh>`_
+- Himanshu Kumar, `himanshu748@github <https://github.com/himanshu748>`_
+- Gambit-Checkmate, `Gambit-Checkmate@github <https://github.com/Gambit-Checkmate>`_
+- jaredrainsha, `jaredrainsha@github <https://github.com/jaredrainsha>`_
+- Terminal Chai, `terminalchai@github <https://github.com/terminalchai>`_
+- Rowan Vale, `theman6660@github <https://github.com/theman6660>`_
+- Jaden Fix, `jadenfix@github <https://github.com/jadenfix>`_
+- Apeksha Pandey, `Apeksha9389@github <https://github.com/Apeksha9389>`_
+- nk-batman21, `nk-batman21@github <https://github.com/nk-batman21>`_
+- hansu650, `hansu650@github <https://github.com/hansu650>`_
+- Rexyysilent, `Rexyysilent@github <https://github.com/Rexyysilent>`_
+- Gabrieljr42, `Gabrieljr42@github <https://github.com/Gabrieljr42>`_
+- Luxe7, `Luxe7@github <https://github.com/Luxe7>`_
+- Shaowei Chen, `123qeew@github <https://github.com/123qeew>`_
+- jipeng6036-del, `jipeng6036-del@github <https://github.com/jipeng6036-del>`_
+- Edson Henrique, `edsonsims@github <https://github.com/edsonsims>`_
+- Mayank Dhingra, `mayankdhingra02@github <https://github.com/mayankdhingra02>`_
+- KennyMcSimpson, `KennyMcSimpson@github <https://github.com/KennyMcSimpson>`_
+- ShahadatTest, `ShahadatTest@github <https://github.com/ShahadatTest>`_
+- jwalith4418-Mj, `jwalith4418-Mj@github <https://github.com/jwalith4418-Mj>`_
+- jihtsan, `jihtsan@github <https://github.com/jihtsan>`_
+- Jillur Rahman, `developerjillur@github <https://github.com/developerjillur>`_
+- BooGu, `boogu2005@github <https://github.com/boogu2005>`_
+- Awais Ur Rehman, `awais-ur-rehman@github <https://github.com/awais-ur-rehman>`_
+- Roland, `n0liu@github <https://github.com/n0liu>`_
+- Jinyong Li, `Jinyong-Li@github <https://github.com/Jinyong-Li>`_
+- wynneyin, `wynneyin@github <https://github.com/wynneyin>`_
+- Arin Aeruva, `arin30@github <https://github.com/arin30>`_
+- Cyber Marty, `Cyber-Marty@github <https://github.com/Cyber-Marty>`_

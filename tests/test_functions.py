@@ -1,0 +1,1097 @@
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
+from functools import partial
+import heapq
+import json
+import os
+from pathlib import Path
+import pickle
+import subprocess
+import sys
+import textwrap
+import threading
+import time
+from unittest import mock
+
+import pytest
+
+import pydash as _
+
+
+parametrize = pytest.mark.parametrize
+
+
+class Methods:
+    label = "base"
+
+    def instance(receiver, left, right):
+        return receiver.label, left, right
+
+    def positional_only(receiver, left, right, /):
+        return receiver.label, left, right
+
+    @classmethod
+    def class_method(receiver, left, right):
+        return receiver.label, left, right
+
+    @staticmethod
+    def static(left, right):
+        return left, right
+
+    def zero(receiver):
+        return receiver.label
+
+    def defaults(receiver, left=10, right=20):
+        return receiver.label, left, right
+
+    def mixed(receiver, left, *, right):
+        return receiver.label, left, right
+
+    def extras(receiver, left, **kwargs):
+        return receiver.label, left, kwargs
+
+    def variadic(*args):
+        return args
+
+    def named_variadic(receiver, *args):
+        return receiver.label, args
+
+
+class Derived(Methods):
+    label = "derived"
+
+
+@parametrize(
+    "case,expected",
+    [
+        ((lambda: 3, 2), 3),
+        ((lambda: 3, -1), 3),
+    ],
+)
+def test_after(case, expected):
+    done = _.after(*case)
+
+    for _x in range(case[1] - 1):
+        ret = done()
+        assert ret is None
+
+    ret = done()
+    assert ret == expected
+
+
+@parametrize(
+    "case,args,kwargs,expected",
+    [
+        ((lambda a=0, b=0, c=0, d=0: a + b + c + d, 1), (1, 2, 3, 4), {}, 1),
+        ((lambda a=0, b=0, c=0, d=0: a + b + c + d, 2), (1, 2, 3, 4), {}, 3),
+        ((lambda a=0, b=0, c=0, d=0: a + b + c + d, 3), (1, 2, 3, 4), {}, 6),
+        ((lambda a=0, b=0, c=0, d=0: a + b + c + d, 1), (1, 2, 3, 4), {"d": 10}, 11),
+        ((lambda a=0, b=0, c=0, d=0: a + b + c + d, 2), (1, 2, 3, 4), {"d": 10}, 13),
+        ((lambda a=0, b=0, c=0, d=0: a + b + c + d, 3), (1, 2, 3, 4), {"d": 10}, 16),
+        ((lambda a=0, b=0, c=0, d=0: a + b + c + d, None), (1, 2, 3, 4), {}, 10),
+        ((lambda a=0, b=0, c=0, d=0: a + b + c + d, -1), (1, 2, 3, 4), {}, 10),
+    ],
+)
+def test_ary(case, args, kwargs, expected):
+    assert _.ary(*case)(*args, **kwargs) == expected
+
+
+def test_ary_negative_limit_under_optimization():
+    script = "from pydash import ary; print(ary(lambda *args: args, -1)(1, 2, 3))"
+    result = subprocess.run(
+        [sys.executable, "-O", "-c", script],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=10,
+    )
+    assert result.stdout.strip() == "(1, 2, 3)"
+
+
+@parametrize(
+    "case,expected",
+    [
+        ((lambda: 3, 2), 3),
+        ((lambda: 3, -1), 3),
+    ],
+)
+def test_before(case, expected):
+    done = _.before(*case)
+
+    for _x in range(case[1] - 1):
+        ret = done()
+        assert ret == expected
+
+    ret = done()
+    assert ret is None
+
+
+@parametrize(
+    "case,arg,expected",
+    [
+        ((_.is_boolean, _.is_empty), [False, True], True),
+        ((_.is_boolean, _.is_empty), [False, None], False),
+    ],
+)
+def test_conjoin(case, arg, expected):
+    assert _.conjoin(*case)(arg) == expected
+
+
+@parametrize(
+    "case,arglist,expected",
+    [
+        ((lambda a, b, c: [a, b, c],), [(1, 2, 3)], [1, 2, 3]),
+        ((lambda a, b, c: [a, b, c],), [(1, 2), (3,)], [1, 2, 3]),
+        ((lambda a, b, c: [a, b, c],), [(1,), (2,), (3,)], [1, 2, 3]),
+        ((lambda *a: sum(a), 3), [(1, 1, 1)], 3),
+        ((lambda *a: sum(a), 3), [(1,), (1,), (1,)], 3),
+    ],
+)
+def test_curry(case, arglist, expected):
+    curried = _.curry(*case)
+
+    # Run test twice to verify curried can be reused
+    for _x in range(2):
+        ret = curried
+        for args in arglist:
+            ret = ret(*args)
+
+        assert ret == expected
+
+
+def test_curry_arity_max_from_func():
+    def func(data, accum, id):
+        accum[id] = _.reduce_(data, lambda total, n: total + n)
+        return accum
+
+    ids = [1]
+    data = [1, 2]
+
+    curried_func_with_data = _.curry(func)(data)
+    result = _.reduce_(ids, curried_func_with_data, {})
+
+    assert result == {1: 3}
+
+
+@pytest.mark.parametrize("curry", [_.curry, _.curry_right])
+@pytest.mark.parametrize(
+    "method,label",
+    [
+        (Methods().instance, "base"),
+        (Derived().instance, "derived"),
+        (Methods.class_method, "base"),
+        (Methods().class_method, "base"),
+        (Derived.class_method, "derived"),
+    ],
+)
+def test_curry_bound_method(curry, method, label):
+    curried = curry(method)
+    assert curried.arity == 2
+    assert curried._argcount == 2
+    for _attempt in range(2):
+        assert curried(1, 2) == (label, 1, 2)
+        first, second = (2, 1) if curry is _.curry_right else (1, 2)
+        remaining = curried(first)
+        assert remaining._argcount == 1
+        assert remaining(second) == (label, 1, 2)
+        assert curried(right=2)(left=1) == (label, 1, 2)
+        assert curried(left=1)(right=2) == (label, 1, 2)
+
+
+@pytest.mark.parametrize("curry", [_.curry, _.curry_right])
+@pytest.mark.parametrize("chained", [False, True])
+def test_curry_bound_method_as_iteratee(curry, chained):
+    curried = curry(Methods().instance)("fixed")
+    if chained:
+        actual = _.chain([1, 2]).map_(curried).value()
+    else:
+        actual = _.map_([1, 2], curried)
+    expected = (
+        [("base", 1, "fixed"), ("base", 2, "fixed")]
+        if curry is _.curry_right
+        else [("base", "fixed", 1), ("base", "fixed", 2)]
+    )
+    assert actual == expected
+
+
+@pytest.mark.parametrize("curry", [_.curry, _.curry_right])
+def test_curry_bound_method_zero_and_defaults(curry):
+    assert curry(Methods().zero)() == "base"
+    curried = curry(Methods().defaults)
+    assert curried.arity == 2
+    assert curried(1, 2) == ("base", 1, 2)
+    assert curry(Methods().defaults, arity=0)() == ("base", 10, 20)
+    assert curry(Methods().defaults, arity=1)(1, 2) == ("base", 1, 20)
+    first, second = (2, 1) if curry is _.curry_right else (1, 2)
+    assert curry(Methods().positional_only)(first)(second) == ("base", 1, 2)
+
+
+@pytest.mark.parametrize("curry", [_.curry, _.curry_right])
+def test_curry_other_callable_controls(curry):
+    receiver = Methods()
+    assert curry(Methods.instance)(receiver, 1, 2) == ("base", 1, 2)
+    assert curry(Methods.static)(1, 2) == (1, 2)
+    assert curry(partial(Methods.static, 1))(2) == (1, 2)
+    assert curry(receiver.variadic).arity == 0
+    assert curry(receiver.variadic)() == (receiver,)
+    assert curry(receiver.named_variadic).arity == 1
+    assert curry(receiver.named_variadic)(1, 2) == ("base", (1,))
+
+    class Callable:
+        def __call__(self, left, right):
+            return left, right
+
+    assert curry(Callable()).arity == 3
+    assert curry(Callable(), arity=2)(1, 2) == (1, 2)
+    assert curry(receiver.instance, arity=2)(1, 2) == ("base", 1, 2)
+
+
+@pytest.mark.parametrize("curry", [_.curry, _.curry_right])
+def test_curry_bound_method_keyword_parameter_controls(curry):
+    assert curry(Methods().mixed)(1, right=2) == ("base", 1, 2)
+    assert curry(Methods().extras)(1, tag=2) == ("base", 1, {"tag": 2})
+
+
+@parametrize(
+    "case,arglist,expected",
+    [
+        ((lambda a, b, c: [a, b, c],), [(1, 2, 3)], [1, 2, 3]),
+        ((lambda a, b, c: [a, b, c],), [(2, 3), (1,)], [1, 2, 3]),
+        ((lambda a, b, c: [a, b, c],), [(3,), (2,), (1,)], [1, 2, 3]),
+        ((lambda *a: sum(a), 3), [(1, 1, 1)], 3),
+        ((lambda *a: sum(a), 3), [(1,), (1,), (1,)], 3),
+    ],
+)
+def test_curry_right(case, arglist, expected):
+    curried = _.curry_right(*case)
+
+    # Run test twice to verify curried can be reused
+    for _x in range(2):
+        ret = curried
+        for args in arglist:
+            ret = ret(*args)
+
+        assert ret == expected
+
+
+def test_debounce():
+    calls = []
+
+    def func(*args):
+        calls.append(args)
+        return args
+
+    wait = 15
+    debounced = _.debounce(func, wait)
+
+    # First call is deferred; subsequent calls reset the wait.
+    assert debounced(1) is None
+    time.sleep(0.01)
+    assert debounced(2) is None
+    assert calls == []
+
+    time.sleep((wait + 15) / 1000.0)
+    assert calls == [(2,)]
+    assert debounced.last_result == (2,)
+
+    # After a quiet period, a new call is deferred again and returns the last result.
+    result = debounced(3)
+    assert result == (2,)
+    assert calls == [(2,)]
+
+    time.sleep((wait + 15) / 1000.0)
+    assert calls == [(2,), (3,)]
+
+
+def test_debounce_max_wait():
+    calls = []
+
+    def func():
+        now = _.now()
+        calls.append(now)
+        return now
+
+    wait = 15
+    max_wait = 30
+    debounced = _.debounce(func, wait, max_wait=max_wait)
+
+    start = _.now()
+    assert debounced() is None
+    assert calls == []
+
+    # Keep invoking so `wait` never elapses; `max_wait` should still fire.
+    deadline = start + max_wait + 10
+    while _.now() < deadline:
+        debounced()
+        time.sleep(0.01)
+
+    assert len(calls) >= 1
+    assert calls[0] - start >= max_wait - 10
+
+
+@parametrize("first_path", ["timer", "max_wait"])
+def test_callback_can_start_another_burst(first_path):
+    # Run in a subprocess so a lock regression fails with a bounded timeout.
+    script = textwrap.dedent("""
+        import json
+        import sys
+        from unittest.mock import patch
+        import pydash
+
+        clock = [0]
+        timers = []
+        calls = []
+
+        class Timer:
+            def __init__(self, interval, function, args):
+                self.due = clock[0] + round(interval * 1000)
+                self.function, self.args = function, args
+                self.cancelled = False
+                timers.append(self)
+            def start(self):
+                pass
+            def cancel(self):
+                self.cancelled = True
+
+        def advance(now):
+            clock[0] = now
+            for timer in list(timers):
+                if not timer.cancelled and timer.due <= now:
+                    timer.cancelled = True
+                    timer.function(*timer.args)
+
+        def callback(value):
+            calls.append([clock[0], value])
+            if len(calls) == 1:
+                debounced('reentrant')
+            return value
+
+        with (
+            patch('pydash.functions.threading.Timer', Timer),
+            patch('pydash.now', lambda: clock[0]),
+            patch('pydash.functions.time.monotonic_ns', lambda: clock[0] * 1_000_000),
+        ):
+            debounced = pydash.debounce(callback, 10, max_wait=25)
+            debounced('first')
+            if sys.argv[1] == 'timer':
+                advance(10)
+                start = 10
+            else:
+                clock[0] = 25
+                debounced('first')
+                start = 25
+            clock[0] = start + 10
+            debounced('middle')
+            clock[0] = start + 18
+            debounced('latest')
+            advance(start + 25)
+            assert calls == [[start, 'first'], [start + 25, 'latest']], calls
+            print(json.dumps(calls))
+    """)
+    env = dict(os.environ, PYTHONPATH=str(Path(_.__file__).resolve().parent.parent))
+    result = subprocess.run(
+        [sys.executable, "-c", script, first_path],
+        capture_output=True,
+        text=True,
+        timeout=3,
+        env=env,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert len(json.loads(result.stdout)) == 2
+
+
+@parametrize(
+    "func,wait,args,kwargs,expected",
+    [(lambda a, b, c: (a, b, c), 250, (1, 2), {"c": 3}, (1, 2, 3))],
+)
+def test_delay(mock_sleep, func, wait, args, kwargs, expected):  # noqa: PLR0917
+    result = _.delay(func, wait, *args, **kwargs)
+    assert result == expected
+    assert mock_sleep.call_args_list == [mock.call(pytest.approx(wait / 1000.0))]
+
+
+@parametrize(
+    "case,arg,expected",
+    [
+        ((_.is_boolean, _.is_empty), [False, True], True),
+        ((_.is_boolean, _.is_empty), [False, None], True),
+        ((_.is_string, _.is_number), ["one", 1, "two", 2], True),
+        ((_.is_string, _.is_number), [True, False, None, []], False),
+    ],
+)
+def test_disjoin(case, arg, expected):
+    assert _.disjoin(*case)(arg) == expected
+
+
+@parametrize(
+    "case,args,expected",
+    [
+        (lambda args: args, (1, 2, 3), (3, 2, 1)),
+        (lambda args: [i * 2 for i in args], (1, 2, 3), [6, 4, 2]),
+    ],
+)
+def flip(case, args, expected):
+    func = _.flip(case)
+    assert func(args) == expected
+
+
+@parametrize(
+    "case,args,expected",
+    [
+        ((lambda x: "!!!" + x + "!!!", lambda x: f"Hi {x}"), ("Bob",), "Hi !!!Bob!!!"),
+        ((lambda x: x + x, lambda x: x * x), (5,), 100),
+    ],
+)
+def test_flow(case, args, expected):
+    assert _.flow(*case)(*args) == expected
+
+
+@parametrize(
+    "case,args,expected",
+    [
+        ((lambda x: f"Hi {x}", lambda x: "!!!" + x + "!!!"), ("Bob",), "Hi !!!Bob!!!"),
+        ((lambda x: x + x, lambda x: x * x), (5,), 50),
+    ],
+)
+def test_flow_right(case, args, expected):
+    assert _.flow_right(*case)(*args) == expected
+
+
+@parametrize(
+    "func,args,expected",
+    [
+        (lambda x: x + x, (2, 0), 2),
+        (lambda x: x + x, (2, 1), 4),
+        (lambda x: x + x, (2, 2), 8),
+        (lambda x: x + x, (2, 3), 16),
+    ],
+)
+def test_iterated(func, args, expected):
+    assert _.iterated(func)(*args) == expected
+
+
+@parametrize(
+    "funcs,args,expected",
+    [
+        ((lambda a: a[0], lambda a: a[-1]), ("Foobar",), ["F", "r"]),
+        (
+            (lambda a, b: a[0] + b[-1], lambda a, b: a[-1] + b[0]),
+            ("Foobar", "Barbaz"),
+            ["Fz", "rB"],
+        ),
+    ],
+)
+def test_juxtapose(funcs, args, expected):
+    assert _.juxtapose(*funcs)(*args) == expected
+
+
+@parametrize(
+    "func,args",
+    [
+        (lambda item: item, (True,)),
+        (lambda item: item, (False,)),
+    ],
+)
+def test_negate(func, args):
+    assert _.negate(func)(*args) == (not func(*args))
+
+
+@parametrize("case,arglist,expected", [(lambda a: a * a, [(2,), (4,)], 4)])
+def test_once(case, arglist, expected):
+    fn = _.once(case)
+    for args in arglist:
+        assert fn(*args) == expected
+
+
+def test_once_overlapping_threads():
+    first_started = threading.Event()
+    second_started = threading.Event()
+    release_first = threading.Event()
+    calls = []
+
+    def callback(value):
+        calls.append(value)
+        if value == 1:
+            first_started.set()
+            assert release_first.wait(timeout=5)
+        return value
+
+    wrapped = _.once(callback)
+
+    def second_call():
+        second_started.set()
+        return wrapped(2)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(wrapped, 1)
+        try:
+            assert first_started.wait(timeout=5)
+            second = pool.submit(second_call)
+            assert second_started.wait(timeout=5)
+            with pytest.raises(TimeoutError):
+                second.result(timeout=0.1)
+        finally:
+            release_first.set()
+        assert first.result(timeout=5) == second.result(timeout=5) == 1
+    assert calls == [1]
+
+
+def test_once_retries_after_exception():
+    calls = []
+
+    def callback():
+        calls.append(None)
+        if len(calls) == 1:
+            raise ValueError("retry")
+
+    wrapped = _.once(callback)
+    with pytest.raises(ValueError, match="retry"):
+        wrapped()
+    assert wrapped() is None
+    assert wrapped() is None
+    assert len(calls) == 2
+
+
+def test_once_recursive_call():
+    def callback(value):
+        return wrapped(value - 1) + value if value else 0
+
+    wrapped = _.once(callback)
+    assert wrapped(3) == 6
+    assert wrapped(10) == 6
+
+
+@parametrize("called", [False, True])
+def test_once_pickle(called):
+    wrapped = _.once(int)
+    if called:
+        assert wrapped("7") == 7
+    restored = pickle.loads(pickle.dumps(wrapped))
+    assert restored("9") == (7 if called else 9)
+    assert restored("10") == (7 if called else 9)
+
+
+@parametrize(
+    "func,transforms,args,expected",
+    [
+        (lambda a, b: [a, b], [lambda x: x**2, lambda x: x * 2], (5, 10), [25, 20]),
+        (lambda a, b: [a, b], ([lambda x: x**2, lambda x: x * 2],), (5, 10), [25, 20]),
+    ],
+)
+def test_over_args(func, transforms, args, expected):
+    assert _.over_args(func, *transforms)(*args) == expected
+
+
+@pytest.mark.parametrize(
+    "transforms, arguments, expected",
+    [
+        ([], (3, 4), (3, 4)),
+        ([lambda value: value * 2], (3, 4, 5), (6, 4, 5)),
+        ([lambda value: value * 2, str], (3, 4, 5), (6, "4", 5)),
+        ([[lambda value: value * 2]], (3, 4), (6, 4)),
+        ([str, str], (3,), ("3",)),
+        ([str], (), ()),
+    ],
+)
+def test_over_args_preserves_arguments_without_transforms(transforms, arguments, expected):
+    wrapped = _.over_args(lambda *values: values, *transforms)
+    assert wrapped(*arguments) == expected
+
+
+def test_over_args_forwards_keyword_only_arguments():
+    marker = object()
+
+    def target(value, *, suffix):
+        return value, suffix
+
+    wrapped = _.over_args(target, str)
+    value, suffix = wrapped(3, suffix=marker)
+    assert value == "3"
+    assert suffix is marker
+
+
+def test_over_args_forwards_self_keyword_without_transforming_it():
+    def target(*, self):
+        return self
+
+    wrapped = _.over_args(target, str)
+    assert wrapped(self=3) == 3
+
+
+def test_over_args_keeps_tail_references():
+    marker = object()
+    wrapped = _.over_args(lambda first, second: (first, second), str)
+    result = wrapped(1, marker)
+    assert result[0] == "1"
+    assert result[1] is marker
+
+
+def test_over_args_transforms_only_present_arguments():
+    seen = []
+
+    def record(value):
+        seen.append(value)
+        return value * 2
+
+    wrapped = _.over_args(lambda *values: values, record, record, record)
+    assert wrapped(2) == (4,)
+    assert seen == [2]
+
+
+@parametrize(
+    "case,case_args,case_kwargs,args,expected",
+    [
+        (lambda a, b, c: a + b + c, ("a", "b"), {}, ("c",), "abc"),
+        (lambda a, b, c: a + b + c, ("a",), {"c": "d"}, ("b",), "abd"),
+    ],
+)
+def test_partial(case, case_args, case_kwargs, args, expected):
+    assert _.partial(case, *case_args, **case_kwargs)(*args) == expected
+
+
+def test_partial_as_iteratee():
+    func = _.partial(lambda offset, value, *args: value + offset, 5)
+    case = [1, 2, 3]
+    expected = [6, 7, 8]
+    assert _.map_(case, func) == expected
+
+
+@parametrize(
+    "func,expected",
+    [
+        (_.partial_right(_.round_, 2), [1.23, 2.35]),
+        (_.partial(_.round_, precision=2), [1.23, 2.35]),
+        (_.partial_right(_.floor, 1), [1.2, 2.3]),
+        (_.partial_right(_.ceil, 1), [1.3, 2.4]),
+    ],
+)
+def test_partial_of_rounding_function_as_iteratee(func, expected):
+    assert _.map_([1.234, 2.345], func) == expected
+
+
+def test_partial_of_builtin_method_as_iteratee():
+    assert _.map_(["-a-", "-b-"], _.partial_right(str.strip, "-")) == ["a", "b"]
+    assert _.times(2, _.partial(dict.copy, {"a": 1})) == [{"a": 1}, {"a": 1}]
+
+
+@parametrize(
+    "case,case_args,case_kwargs,args,expected",
+    [
+        (lambda a, b, c: a + b + c, ("a", "b"), {}, ("c",), "cab"),
+        (lambda a, b, c: a + b + c, ("a",), {"c": "d"}, ("b",), "bad"),
+    ],
+)
+def test_partial_right(case, case_args, case_kwargs, args, expected):
+    assert _.partial_right(case, *case_args, **case_kwargs)(*args) == expected
+
+
+@parametrize(
+    "case,args,kwargs,expected",
+    [
+        ((lambda a, b, c: [a, b, c], 2, 0, 1), ("b", "c", "a"), {}, ["a", "b", "c"]),
+        ((lambda a, b, c: [a, b, c], [2, 0, 1]), ("b", "c", "a"), {}, ["a", "b", "c"]),
+        ((lambda a, b, c: [a, b, c], 2, 1), ("b", "c", "a"), {}, ["a", "c", "b"]),
+        ((lambda a, b, c: [a, b, c], 1), ("b", "c", "a"), {}, ["c", "b", "a"]),
+        ((lambda a, b, c: [a, b, c], 3, 2, 0, 1), ("b", "c", "a"), {}, ["a", "b", "c"]),
+    ],
+)
+def test_rearg(case, args, kwargs, expected):
+    assert _.rearg(*case)(*args, **kwargs) == expected
+
+
+@parametrize("indexes", [(1, 1, 0), ([1, 1, 0],)])
+def test_rearg_repeated_indexes(indexes):
+    def collect(*args, suffix):
+        return args, suffix
+
+    rearranged = _.rearg(collect, *indexes)
+    assert rearranged("a", "b", "c", suffix="end") == (("b", "b", "a", "c"), "end")
+    assert rearranged("x", "y", suffix="again") == (("y", "y", "x"), "again")
+
+
+def test_rearg_repeated_indexes_preserve_identity():
+    value = []
+    rearranged = _.rearg(lambda *args: args, 0, 0)
+    first, second = rearranged(value)
+    assert first is value
+    assert second is value
+
+
+def test_rearg_repeated_indexes_skip_missing_arguments():
+    rearranged = _.rearg(lambda *args: args, 3, 1, 1, -1)
+    assert rearranged("a", "b", "c") == ("b", "b", "a", "c")
+    assert rearranged() == ()
+
+
+@parametrize(
+    "case,args,expected",
+    [
+        (lambda *args: args, ["a", "b", "c"], ("a", "b", "c")),
+        (lambda *args: ",".join(args), ["a", "b", "c"], "a,b,c"),
+        (lambda a, b, c: f"{a} {b} {c}", [1, 2, 3], "1 2 3"),
+    ],
+)
+def test_spread(case, args, expected):
+    assert _.spread(case)(args) == expected
+
+
+def test_throttle():
+    def func():
+        return _.now()
+
+    wait = 250
+    throttled = _.throttle(func, wait)
+
+    start = _.now()
+    present = _.now()
+
+    expected = throttled()
+
+    while (present - start) < (wait - 50):
+        result = throttled()
+        present = _.now()
+
+    assert result == expected
+
+    time.sleep(100 / 1000.0)
+    assert throttled() > expected
+
+
+def test_throttle_trailing_call():
+    calls = []
+    finished = threading.Event()
+
+    def func(value, *, suffix):
+        calls.append((value, suffix))
+        if value == "last":
+            finished.set()
+        return value
+
+    throttled = _.throttle(func, 100)
+    assert throttled("first", suffix="a") == "first"
+    assert throttled("middle", suffix="b") == "first"
+    assert throttled("last", suffix="c") == "first"
+    assert finished.wait(1), "the last call in the burst was dropped"
+    assert calls == [("first", "a"), ("last", "c")]
+
+
+@pytest.fixture
+def throttle_clock(monkeypatch):
+    now = [1000]
+    queue = []
+    timers = []
+
+    class Timer:
+        def __init__(self, interval, function, args):
+            self.when = now[0] + interval * 1000
+            self.function = function
+            self.args = args
+            self.cancelled = False
+            timers.append(self)
+
+        def start(self):
+            heapq.heappush(queue, (self.when, len(timers), self))
+
+        def cancel(self):
+            self.cancelled = True
+
+    def advance(milliseconds, run_timers=True):
+        target = now[0] + milliseconds
+        while run_timers and queue and queue[0][0] <= target:
+            when, _, timer = heapq.heappop(queue)
+            now[0] = max(now[0], when)
+            if not timer.cancelled:
+                timer.function(*timer.args)
+        now[0] = target
+
+    monkeypatch.setattr(_, "now", lambda: now[0])
+    monkeypatch.setattr(time, "monotonic_ns", lambda: now[0] * 1_000_000)
+    monkeypatch.setattr(threading, "Timer", Timer)
+    return advance, timers
+
+
+@parametrize("clock_jump", [-3_600_000, 3_600_000])
+def test_throttle_ignores_wall_clock_changes(throttle_clock, monkeypatch, clock_jump):
+    advance, _timers = throttle_clock
+    wall_clock = [1_000_000]
+    monkeypatch.setattr(_, "now", lambda: wall_clock[0])
+    func = mock.Mock(side_effect=lambda value: value)
+    throttled = _.throttle(func, 100)
+
+    assert throttled("first") == "first"
+    advance(40)
+    wall_clock[0] += clock_jump
+    assert throttled("latest") == "first"
+    func.assert_called_once_with("first")
+
+    advance(60)
+    assert func.call_args_list == [mock.call("first"), mock.call("latest")]
+
+
+@parametrize("clock_jump", [-3_600_000, 3_600_000])
+def test_debounce_max_wait_ignores_wall_clock_changes(throttle_clock, monkeypatch, clock_jump):
+    advance, _timers = throttle_clock
+    wall_clock = [1_000_000]
+    monkeypatch.setattr(_, "now", lambda: wall_clock[0])
+    func = mock.Mock(side_effect=lambda value: value)
+    debounced = _.debounce(func, 80, max_wait=100)
+
+    assert debounced("first") is None
+    advance(40)
+    wall_clock[0] += clock_jump
+    assert debounced("middle") is None
+    advance(40)
+    assert debounced("latest") is None
+    func.assert_not_called()
+
+    advance(20)
+    func.assert_called_once_with("latest")
+
+
+def test_throttle_single_call_does_not_repeat(throttle_clock):
+    advance, timers = throttle_clock
+    func = mock.Mock(return_value="result")
+    throttled = _.throttle(func, 100)
+    assert throttled("first") == "result"
+    advance(200)
+    func.assert_called_once_with("first")
+    assert timers == []
+
+
+def test_throttle_keeps_fixed_trailing_deadline(throttle_clock):
+    advance, _timers = throttle_clock
+    calls = []
+
+    def func(value):
+        calls.append((_.now(), value))
+        return value
+
+    throttled = _.throttle(func, 100)
+    assert throttled(1) == 1
+    advance(20)
+    assert throttled(2) == 1
+    advance(40)
+    assert throttled(3) == 1
+    advance(40)
+    assert calls == [(1000, 1), (1100, 3)]
+    assert throttled.last_result == 3
+    advance(50)
+    assert throttled(4) == 3
+    advance(50)
+    assert calls == [(1000, 1), (1100, 3), (1200, 4)]
+    advance(200)
+    assert throttled(5) == 5
+
+
+def test_throttle_late_timer_does_not_duplicate_new_call(throttle_clock):
+    advance, timers = throttle_clock
+    func = mock.Mock(side_effect=lambda value: value)
+    throttled = _.throttle(func, 100)
+    assert throttled("first") == "first"
+    advance(20)
+    throttled("old")
+    old_timer = timers[0]
+
+    # Simulate a busy timer thread: a new call arrives after the deadline first.
+    advance(100, run_timers=False)
+    assert throttled("new") == "new"
+    assert old_timer.cancelled
+    throttled("pending")
+    # Timer.cancel cannot stop a callback that has already started.
+    old_timer.function(*old_timer.args)
+    advance(100)
+    assert func.call_args_list == [mock.call("first"), mock.call("new"), mock.call("pending")]
+
+
+def test_throttle_reentrant_call_is_deferred(throttle_clock):
+    advance, _timers = throttle_clock
+    calls = []
+
+    def func(value):
+        calls.append(value)
+        if value == "first":
+            throttled("nested")
+        return value
+
+    throttled = _.throttle(func, 100)
+    assert throttled("first") == "first"
+    advance(100)
+    assert calls == ["first", "nested"]
+
+
+@parametrize(
+    "case,args,kwargs,expected",
+    [
+        (lambda a=0, b=0, c=0, d=0: a + b + c + d, (1, 2, 3, 4), {}, 1),
+        (lambda a=0, b=0, c=0, d=0: a + b + c + d, (1, 2, 3, 4), {"d": 10}, 11),
+    ],
+)
+def test_unary(case, args, kwargs, expected):
+    assert _.unary(case)(*args, **kwargs) == expected
+
+
+@parametrize(
+    "case,args,expected",
+    [
+        (
+            (lambda a: a.strip(), lambda func, text: f"<p>{func(text)}</p>"),
+            ("  hello world!  ",),
+            "<p>hello world!</p>",
+        )
+    ],
+)
+def test_wrap(case, args, expected):
+    assert _.wrap(*case)(*args) == expected
+
+
+def test_flow_argcount():
+    assert _.flow(lambda x, y: x + y, lambda x: x * 2)._argcount == 2
+
+
+def test_flow_right_argcount():
+    assert _.flow_right(lambda x: x * 2, lambda x, y: x + y)._argcount == 2
+
+
+@parametrize("factory", [_.flow, _.flow_right])
+def test_empty_flow_as_iteratee(factory):
+    pipeline = factory()
+    assert pipeline("value") is None
+    assert _.map_([1, 2], pipeline) == [None, None]
+    assert _.filter_([1, 2], pipeline) == []
+    assert _.chain([1, 2]).map_(pipeline).value() == [None, None]
+
+
+def test_juxtapose_argcount():
+    assert _.juxtapose(lambda x, y, z: x + y + z, lambda x, y, z: x * y * z)._argcount == 3
+
+
+def test_partial_argcount():
+    assert _.partial(lambda x, y, z: x + y + z, 1, 2)._argcount == 1
+
+
+def test_partial_right_argcount():
+    assert _.partial_right(lambda x, y, z: x + y + z, 1, 2)._argcount == 1
+
+
+def test_curry_argcount():
+    assert _.curry(lambda x, y, z: x + y + z)(1)._argcount == 2
+
+
+def test_curry_right_argcount():
+    assert _.curry_right(lambda x, y, z: x + y + z)(1)._argcount == 2
+
+
+def test_can_be_used_as_predicate_argcount_is_known():
+    def is_positive(x: int) -> bool:
+        return x > 0
+
+    assert _.filter_([-1, 0, 1], _.negate(is_positive)) == [-1, 0]
+
+
+@parametrize("factory", [_.partial, _.partial_right])
+def test_partial_keyword_only_arguments_as_iteratee(factory):
+    def transform(value, *, increment):
+        return value + increment
+
+    wrapped = factory(transform, increment=2)
+    assert wrapped(1) == 3
+    assert _.map_([1, 2], wrapped) == [3, 4]
+
+
+@parametrize("factory", [_.partial, _.partial_right])
+def test_partial_keyword_bound_middle_argument_as_iteratee(factory):
+    def transform(value, increment=0, scale=1):
+        return (value + increment) * scale
+
+    wrapped = factory(transform, increment=2)
+
+    assert wrapped(1) == 3
+    assert wrapped._argcount == 1
+    assert _.map_([1, 2], wrapped) == [3, 4]
+    assert _.chain([1, 2]).map_(wrapped).value() == [3, 4]
+
+
+@parametrize("factory", [_.partial, _.partial_right])
+def test_partial_keyword_bound_argument_argcount(factory):
+    def transform(value, increment=0, scale=1):
+        return (value + increment) * scale
+
+    assert factory(transform, scale=2)._argcount == 2
+    assert factory(transform, increment=2)._argcount == 1
+    assert factory(transform, increment=2, scale=3)._argcount == 1
+
+
+@parametrize("factory", [_.partial, _.partial_right])
+def test_partial_keyword_bound_argument_argcount_with_implicit_first_parameter(factory):
+    class Parser:
+        def parse(self, value, base=0, scale=1):
+            return (value + base) * scale
+
+        @classmethod
+        def parse_class(cls, value, base=0, scale=1):
+            return (value + base) * scale
+
+        def __call__(self, value, base=0, scale=1):
+            return (value + base) * scale
+
+    parser = Parser()
+
+    # The implicit `self`/`cls` that `getfullargspec` reports must not shift the bound slot.
+    assert factory(parser.parse, scale=2)._argcount == 2
+    assert factory(parser.parse, base=2)._argcount == 1
+    assert factory(parser, scale=2)._argcount == 2
+    assert factory(Parser.parse_class, scale=2)._argcount == 2
+
+
+def test_partial_keyword_bound_method_as_iteratee():
+    class Parser:
+        def parse(self, value, base=0, scale=1):
+            return (value + base) * scale
+
+    parser = Parser()
+
+    assert _.map_([1, 2], _.partial(parser.parse, scale=2)) == [2, 6]
+    assert _.map_([1, 2], _.partial(parser.parse, base=2)) == [3, 4]
+
+
+@parametrize("factory", [_.partial, _.partial_right])
+def test_partial_keyword_bound_argument_argcount_with_bound_positional(factory):
+    def transform(left, right, increment=0, scale=1):
+        return (left, right, increment, scale)
+
+    assert factory(transform, 10, increment=5)._argcount == 1
+    assert factory(transform, 10, 20, increment=5)._argcount == 0
+
+
+def test_partial_bound_positional_and_keyword_slot_as_iteratee():
+    def transform(left, right, increment=0, scale=1):
+        return (left, right, increment, scale)
+
+    # Slots before the keyword-bound parameter still receive the element.
+    assert _.map_([1, 2], _.partial(transform, 10, increment=5)) == [
+        (10, 1, 5, 1),
+        (10, 2, 5, 1),
+    ]
+    # A zero argument count calls the wrapper without the element or index.
+    assert _.map_([1, 2], _.partial(transform, 10, 20, increment=5)) == [
+        (10, 20, 5, 1),
+        (10, 20, 5, 1),
+    ]
+
+
+@parametrize("factory", [_.partial, _.partial_right])
+def test_partial_variable_keyword_arguments_as_iteratee(factory):
+    def transform(value, **options):
+        return value + options["increment"]
+
+    assert _.map_([1, 2], factory(transform, increment=2)) == [3, 4]
+
+
+@parametrize("factory", [_.partial, _.partial_right])
+def test_partial_nested_and_builtin_iteratees(factory):
+    def transform(value, increment=0):
+        return value + increment
+
+    assert _.map_([1, 2], factory(transform, increment=2)) == [3, 4]
+    assert _.map_([1, 2], factory(factory(transform), increment=2)) == [3, 4]
+    assert _.map_([1, 2], factory(str)) == ["1", "2"]
