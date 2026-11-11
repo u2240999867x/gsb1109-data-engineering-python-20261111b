@@ -1,0 +1,63 @@
+[project]
+name = "tinydb"
+version = "4.9.0"
+description = "TinyDB is a tiny, document oriented database optimized for your happiness :)"
+authors = [{ name = "Markus Siemens", email = "markus@m-siemens.de" }]
+requires-python = ">=3.10,<4"
+readme = "README.rst"
+license = "MIT"
+keywords = [
+    "database",
+    "nosql",
+]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: MIT License",
+    "Topic :: Database",
+    "Topic :: Database :: Database Engines/Servers",
+    "Topic :: Utilities",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Programming Language :: Python :: Implementation :: PyPy",
+    "Operating System :: OS Independent",
+    "Typing :: Typed",
+]
+
+[project.urls]
+Homepage = "https://github.com/msiemens/tinydb"
+Documentation = "https://tinydb.readthedocs.org/"
+Changelog = "https://tinydb.readthedocs.io/en/latest/changelog.html"
+Issues = "https://github.com/msiemens/tinydb/issues"
+
+[dependency-groups]
+dev = [
+    "pytest~=9.0",
+    "pytest-pycodestyle~=2.3",
+    "pytest-cov~=7.0",
+    "pycodestyle~=2.10",
+    "sphinx~=8.1",
+    "coveralls~=4.0",
+    "pyyaml~=6.0",
+    "pytest-mypy~=1.0 ; platform_python_implementation != 'PyPy'",
+    "types-PyYAML~=6.0",
+]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "tinydb",
+    "tests",
+]
+
+[tool.hatch.build.targets.wheel]
+include = ["tinydb"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

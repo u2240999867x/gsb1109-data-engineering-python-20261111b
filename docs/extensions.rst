@@ -1,0 +1,103 @@
+Extensions
+==========
+
+Here are some extensions that might be useful to you.
+
+An extension is listed here if it
+
+* works with TinyDB 4 or newer,
+* supports Python 3,
+* is published on PyPI, and
+* has not been archived by its maintainers.
+
+Extensions that stop meeting these requirements are removed from the list.
+
+``tinydb-rust``
+**************
+
+| **Repo:**        https://github.com/itsmorninghao/tinydb-rust/
+| **Status:**      *beta*
+| **Description:** A drop-in reimplementation of TinyDB that uses Rust for
+                   better performance.
+
+``tinydbjoin``
+**************
+
+| **Repo:**        https://github.com/FerdinaKusumah/tinydb-join
+| **Status:**      *beta*
+| **Description:** Joins between TinyDB tables, even when they live in
+                   different databases or storages: inner and left joins, and
+                   nesting related documents into their parent (one-to-many
+                   or belongs-to).
+
+``tinydbstorage``
+*****************
+
+| **Repo:**        https://github.com/FerdinaKusumah/tinydb-storage
+| **Status:**      *beta*
+| **Description:** Redis and S3 storages for TinyDB, including S3-compatible
+                   services such as MinIO and Cloudflare R2. A write that
+                   would overwrite a change made by another process fails
+                   instead.
+
+``aiotinydb``
+*************
+
+| **Repo:**        https://github.com/ASMfreaK/aiotinydb
+| **Status:**      *stable*
+| **Description:** asyncio compatibility shim for TinyDB. Enables usage of
+                   TinyDB in asyncio-aware contexts without slow synchronous
+                   IO.
+
+
+``BetterJSONStorage``
+*********************
+
+| **Repo:**        https://github.com/MrPigss/BetterJSONStorage
+| **Status:**      *stable*
+| **Description:** BetterJSONStorage is a faster 'Storage Type' for TinyDB. It
+                   uses the faster Orjson library for parsing the JSON and BLOSC
+                   for compression.
+
+
+``tinydb-serialization``
+************************
+
+| **Repo:**        https://github.com/msiemens/tinydb-serialization
+| **Status:**      *stable*
+| **Description:** ``tinydb-serialization`` provides serialization for objects
+                   that TinyDB otherwise couldn't handle.
+
+
+``tinydb-smartcache``
+*********************
+
+| **Repo:**        https://github.com/msiemens/tinydb-smartcache
+| **Status:**      *stable*
+| **Description:** ``tinydb-smartcache`` provides a smart query cache for
+                   TinyDB. It updates the query cache when
+                   inserting/removing/updating documents so the cache doesn't
+                   get invalidated. It's useful if you perform lots of queries
+                   while the data changes only little.
+
+
+.. _tinyrecord:
+
+``tinyrecord``
+**************
+
+| **Repo:**        https://github.com/eugene-eeo/tinyrecord
+| **Status:**      *stable*
+| **Description:** Tinyrecord is a library which implements experimental atomic
+                   transaction support for the TinyDB NoSQL database. It uses a
+                   record-first then execute architecture which allows us to
+                   minimize the time that we are within a thread lock.
+
+
+``tinydb-appengine``
+********************
+
+| **Repo:**        https://github.com/imalento/tinydb-appengine
+| **Status:**      *inactive*
+| **Description:** ``tinydb-appengine`` provides TinyDB storage for
+                   App Engine. You can use JSON readonly.
