@@ -1,0 +1,13 @@
+-e .
+blue
+coverage
+doc8
+mypy
+pylint
+pytest
+pytest-cov
+rstcheck
+sphinx
+tox
+twine
+wheel
