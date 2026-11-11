@@ -1,0 +1,23 @@
+# Python byte-code
+*.py[co]
+
+# Extension code
+*.c
+*.so
+
+# virutalenv directories
+/env*/
+
+# test files/directories
+.coverage
+.pytest_cache/
+/.tox/
+
+# setup and upload directories
+/build/
+/dist/
+*.egg-info/
+/docs/_build/
+
+# macOS metadata
+.DS_Store
