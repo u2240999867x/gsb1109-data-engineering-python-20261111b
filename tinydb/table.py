@@ -540,6 +540,12 @@ class Table:
         :returns: a list containing the updated document's ID
         """
 
+        # Materialize one-shot iterables (e.g. generators) up front: the
+        # rules are applied once per document below, so a generator would
+        # otherwise be exhausted by the first document and all following
+        # documents would silently receive no updates at all.
+        updates = list(updates)
+
         # Define the function that will perform the update
         def perform_update(fields, table, doc_id):
             if callable(fields):
@@ -579,6 +585,66 @@ class Table:
         self._update_table(updater)
 
         return updated_ids
+
+    def update_multiple_segmented(
+        self,
+        rules: Iterable[Mapping],
+        *,
+        rule_segment_size: int = 1000,
+        doc_segment_size: int = 1000,
+        state_path: Optional[str] = None,
+        on_checkpoint: Optional[Callable[[int, int], None]] = None,
+    ) -> list[dict]:
+        """
+        Apply a (possibly one-shot) source of serializable update rules in
+        segments, with checkpointing so an interrupted run can resume.
+
+        Each rule is a mapping with a serializable condition spec and
+        field operations::
+
+            {'cond': {'op': '==', 'path': 'char', 'value': 'a'},
+             'fields': {'int': 2, 'flag': {'$set': True}}}
+
+        Rules receive stable numbers (their 1-based position in the
+        source, unless a rule explicitly provides a ``number``). They are
+        applied row by row in the table's original document order; within
+        a row, rules run in source order, so a later rule's condition sees
+        values written by earlier rules on the same row -- the same
+        semantics as :meth:`update_multiple` with the full list.
+
+        Only one segment of rules and one segment of documents is held in
+        memory at a time; the rule source is materialized into a local
+        staging area next to ``state_path``. If the run is interrupted,
+        call this method again with the same ``state_path`` to resume from
+        the last confirmed row/rule boundary. The returned receipts are
+        identical to a run that received the full rule list at once.
+
+        Rules that need Python callbacks (callable conditions or field
+        transforms) cannot be serialized; keep using
+        :meth:`update_multiple` for those.
+
+        :param rules: an iterable of serializable rule mappings
+        :param rule_segment_size: rules held in memory per segment
+        :param doc_segment_size: documents held in memory per segment
+        :param state_path: checkpoint file path enabling resume; staging
+                           files are kept next to it. If ``None``, a
+                           temporary, non-resumable staging area is used
+        :param on_checkpoint: optional callback invoked with the
+                              ``(doc_segment, rule_segment)`` indexes
+                              after each confirmed boundary
+        :returns: a receipt per rule, in source order:
+                  ``{'rule': number, 'doc_ids': [...], 'count': n}``
+        """
+        from .segmented import run_segmented_update
+
+        return run_segmented_update(
+            self,
+            rules,
+            rule_segment_size=rule_segment_size,
+            doc_segment_size=doc_segment_size,
+            state_path=state_path,
+            on_checkpoint=on_checkpoint,
+        )
 
     def upsert(self, document: Mapping, cond: Optional[QueryLike] = None) -> list[int]:
         """

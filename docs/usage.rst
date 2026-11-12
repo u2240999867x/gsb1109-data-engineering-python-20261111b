@@ -341,6 +341,48 @@ You also can mix normal updates with update operations:
 ...     (delete('int'), where('char') == 'b'),
 ... ])
 
+.. note::
+
+    ``update_multiple`` accepts any iterable of rules, including
+    one-shot generators -- the rules are materialized once internally so
+    every document sees every rule.
+
+Segmented, resumable bulk updates
+.................................
+
+When the rules come from a one-shot source that is too large to hold in
+memory (e.g. streamed from an external system), use
+``update_multiple_segmented``. Rules are plain, JSON-serializable
+mappings with a condition spec and field operations:
+
+>>> db.update_multiple_segmented([
+...     {'cond': {'op': '==', 'path': 'char', 'value': 'a'},
+...      'fields': {'int': 2, 'flag': {'$set': True}}},
+...     {'cond': {'op': '==', 'path': 'char', 'value': 'b'},
+...      'fields': {'int': {'$inc': 3}, 'char': {'$unset': True}}},
+... ])  # doctest: +SKIP
+[{'rule': 1, 'doc_ids': [1], 'count': 1}, ...]
+
+Each rule gets a stable number (its 1-based position in the source,
+unless the rule provides an explicit ``number``). Rules are applied row
+by row in the table's original document order; within a row they run in
+source order, so a later rule's condition sees values written by earlier
+rules on the same row -- the same semantics as ``update_multiple`` with
+the full list.
+
+Only one segment of rules (``rule_segment_size``) and one segment of
+documents (``doc_segment_size``) is held in memory at a time; the rule
+source is materialized into a local staging area next to the
+``state_path`` checkpoint file. If the run is interrupted, call the
+method again with the same ``state_path`` to resume from the last
+confirmed row/rule boundary. The returned receipts (original rule
+number, hit row IDs and occurrence count per rule) are identical to a
+run that received the full rule list at once.
+
+Rules that need Python callbacks (callable conditions or field
+transforms) cannot be serialized; keep using ``update_multiple`` for
+those.
+
 Data access and modification
 ----------------------------
 

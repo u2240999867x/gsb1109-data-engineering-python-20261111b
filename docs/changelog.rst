@@ -19,6 +19,24 @@ see `semver.org <http://semver.org/>`_
           syntax (``Query()['some']['nested']['field']``) that will
           not break even when new methods are added to the ``Query`` API.
 
+Unreleased
+^^^^^^^^^^
+
+- Fix: Make ``Table.update_multiple`` work with one-shot iterables (e.g.
+  generators) of rules. Previously the rules were consumed by the first
+  document, so all following documents silently received no updates.
+  The rules are now materialized once before being applied.
+- Feature: Add ``Table.update_multiple_segmented`` for segmented,
+  resumable replay of large, one-shot rule sources. Rules are
+  JSON-serializable mappings with stable numbers, condition specs and
+  field operations; only one segment of rules and one segment of
+  documents is held in memory at a time, progress is checkpointed to
+  disk, and an interrupted run can resume from the last confirmed
+  row/rule boundary via ``state_path``. The returned receipts (rule
+  number, hit row IDs, occurrence count) match a run that received the
+  full rule list at once. Callback-style rules keep using
+  ``Table.update_multiple``.
+
 v4.9.0 (2026-08-06)
 ^^^^^^^^^^^^^^^^^^^
 

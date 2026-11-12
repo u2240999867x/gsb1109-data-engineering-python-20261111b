@@ -101,6 +101,13 @@ details.
     :exclude-members: __weakref__
     :member-order: bysource
 
+``tinydb.segmented``
+--------------------
+
+.. automodule:: tinydb.segmented
+    :members: compile_condition, apply_field_ops, run_segmented_update
+    :member-order: bysource
+
 ``tinydb.storage``
 ------------------
 

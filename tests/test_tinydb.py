@@ -394,6 +394,18 @@ def test_update_multiple_operation(db: TinyDB):
     assert db.count(where('int') == 2) == 2
 
 
+def test_update_multiple_generator(db: TinyDB):
+    # A one-shot iterable (generator) of rules must behave exactly like
+    # the full list: every document sees every rule, not just the first
+    # document.
+    db.update_multiple(
+        ({'int': 2}, where('char') == c) for c in 'abc'
+    )
+
+    assert db.count(where('int') == 2) == 3
+    assert db.count(where('int') == 1) == 0
+
+
 def test_upsert(db: TinyDB):
     assert len(db) == 3
 
