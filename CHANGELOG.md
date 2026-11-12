@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+**New**:
+
+* Add `voluptuous.json_schema.to_json_schema()`: export a schema to a JSON
+  Schema contract with a coverage report (covered columns, divergences with
+  witness JSON values, and rules marked unsupported before any execution)
+
 **Fixes**:
 
 * [#539](https://github.com/alecthomas/voluptuous/pull/539): Raise `Invalid` instead of leaking `TypeError`/`ValueError` for non-numeric input to the `Number` validator
