@@ -58,6 +58,7 @@ SortedKeysView
 
    .. automethod:: __getitem__
    .. automethod:: __delitem__
+   .. automethod:: freeze
 
 
 SortedItemsView
@@ -67,6 +68,8 @@ SortedItemsView
    :show-inheritance:
 
    .. automethod:: __getitem__
+   .. automethod:: __delitem__
+   .. automethod:: freeze
 
 
 SortedValuesView
@@ -76,3 +79,19 @@ SortedValuesView
    :show-inheritance:
 
    .. automethod:: __getitem__
+   .. automethod:: __delitem__
+   .. automethod:: freeze
+
+
+FrozenViewRanking
+.................
+
+.. autoclass:: sortedcontainers.FrozenViewRanking
+   :show-inheritance:
+
+   .. automethod:: locate
+   .. automethod:: quarantine
+   .. automethod:: quarantine_all
+   .. autoattribute:: token
+   .. autoattribute:: version
+   .. autoattribute:: quarantined

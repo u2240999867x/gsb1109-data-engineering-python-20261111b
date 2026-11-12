@@ -7,6 +7,18 @@ Sorted Containers Release History
 
 .. currentmodule:: sortedcontainers
 
+Unreleased
+----------
+
+**API Changes**
+
+* Add ``SortedList.version`` and ``SortedList.freeze`` returning a
+  ``FrozenRanking`` snapshot that locates and quarantines rows by old rank.
+* Add ``freeze`` to the sorted dict keys, items, and values views,
+  returning a ``FrozenViewRanking`` backed by stable dict keys.
+* Add ``StaleRankError`` and ``RankConflictError`` for rows that were
+  removed or changed after a ranking was frozen.
+
 2.4.0 (2021-05-16)
 ------------------
 

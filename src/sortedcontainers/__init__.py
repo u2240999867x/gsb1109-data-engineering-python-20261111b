@@ -46,12 +46,20 @@ testing has 100% coverage with unit tests and hours of stress.
 """
 
 from .sorteddict import (
+    FrozenViewRanking,
     SortedDict,
     SortedItemsView,
     SortedKeysView,
     SortedValuesView,
 )
-from .sortedlist import SortedKeyList, SortedList, SortedListWithKey
+from .sortedlist import (
+    FrozenRanking,
+    RankConflictError,
+    SortedKeyList,
+    SortedList,
+    SortedListWithKey,
+    StaleRankError,
+)
 from .sortedset import SortedSet
 
 __all__ = [
@@ -63,6 +71,10 @@ __all__ = [
     'SortedItemsView',
     'SortedValuesView',
     'SortedSet',
+    'FrozenRanking',
+    'FrozenViewRanking',
+    'StaleRankError',
+    'RankConflictError',
 ]
 
 __title__ = 'sortedcontainers'

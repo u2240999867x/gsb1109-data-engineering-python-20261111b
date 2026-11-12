@@ -15,8 +15,10 @@ Sorted list implementations:
 """
 # pylint: disable=too-many-lines
 
+import copy
 import sys
 import traceback
+import uuid
 from bisect import bisect_left, bisect_right, insort
 from collections.abc import MutableSequence, Sequence
 from functools import reduce
@@ -25,6 +27,23 @@ from math import log
 from operator import add, eq, ge, gt, iadd, le, lt, ne
 from reprlib import recursive_repr
 from textwrap import dedent
+
+
+class StaleRankError(LookupError):
+    """Raised when a frozen ranking can no longer locate a row.
+
+    The row identified by an old rank has been removed from the live
+    collection, or the frozen ranking does not correspond to the current
+    state of the collection.
+    """
+
+
+class RankConflictError(StaleRankError):
+    """Raised when the row at an old rank changed since the ranking froze.
+
+    The same business record is still present but its value no longer
+    compares equal to the value recorded in the frozen ranking.
+    """
 
 
 class SortedList(MutableSequence):
@@ -111,6 +130,7 @@ class SortedList(MutableSequence):
         self._maxes = []
         self._index = []
         self._offset = 0
+        self._version = 0
 
         if iterable is not None:
             self._update(iterable)
@@ -187,6 +207,7 @@ class SortedList(MutableSequence):
         del self._maxes[:]
         del self._index[:]
         self._offset = 0
+        self._version += 1
 
     _clear = clear
 
@@ -224,6 +245,7 @@ class SortedList(MutableSequence):
             _maxes.append(value)
 
         self._len += 1
+        self._version += 1
 
     def _expand(self, pos):
         """Split sublists with length greater than double the load-factor.
@@ -275,6 +297,11 @@ class SortedList(MutableSequence):
         _maxes = self._maxes
         values = sorted(iterable)
 
+        if not values:
+            return
+
+        start_version = self._version
+
         if _maxes:
             if len(values) * 4 >= self._len:
                 _lists.append(values)
@@ -285,6 +312,7 @@ class SortedList(MutableSequence):
                 _add = self.add
                 for val in values:
                     _add(val)
+                self._version = start_version + 1
                 return
 
         _load = self._load
@@ -294,6 +322,7 @@ class SortedList(MutableSequence):
         _maxes.extend(sublist[-1] for sublist in _lists)
         self._len = len(values)
         del self._index[:]
+        self._version = start_version + 1
 
     _update = update
 
@@ -419,6 +448,7 @@ class SortedList(MutableSequence):
 
         del _lists_pos[idx]
         self._len -= 1
+        self._version += 1
 
         len_lists_pos = len(_lists_pos)
 
@@ -1512,6 +1542,42 @@ class SortedList(MutableSequence):
         """
         return f'{type(self).__name__}({list(self)!r})'
 
+    @property
+    def version(self):
+        """Monotonic version counter of the sorted list.
+
+        The version starts at zero and is incremented once for every
+        structural mutation (adding, removing, or clearing values). A frozen
+        ranking records the version at freeze time and uses it to certify
+        that an old rank still refers to the same business record.
+
+        """
+        return self._version
+
+    def freeze(self, token=None):
+        """Freeze the current ranking into a snapshot keyed by old rank.
+
+        The returned :class:`FrozenRanking` records the row order, row
+        values, and :attr:`version` of the sorted list at call time. Rows
+        can later be located and isolated by their old rank even when other
+        rows have been inserted or removed in the meantime.
+
+        Optional `token` identifies the frozen ranking in receipts. A random
+        token is generated when none is given.
+
+        >>> sl = SortedList('abcde')
+        >>> ranking = sl.freeze()
+        >>> ranking.version == sl.version
+        True
+        >>> ranking[2]
+        'c'
+
+        :param token: frozen ranking identifier (optional)
+        :return: frozen ranking of this sorted list
+
+        """
+        return FrozenRanking(self, token)
+
     def _check(self):
         """Check invariants of sorted list.
 
@@ -1649,6 +1715,7 @@ class SortedKeyList(SortedList):
         self._maxes = []
         self._index = []
         self._offset = 0
+        self._version = 0
 
         if iterable is not None:
             self._update(iterable)
@@ -1672,6 +1739,7 @@ class SortedKeyList(SortedList):
         del self._keys[:]
         del self._maxes[:]
         del self._index[:]
+        self._version += 1
 
     _clear = clear
 
@@ -1717,6 +1785,7 @@ class SortedKeyList(SortedList):
             _maxes.append(key)
 
         self._len += 1
+        self._version += 1
 
     def _expand(self, pos):
         """Split sublists with length greater than double the load-factor.
@@ -1775,6 +1844,11 @@ class SortedKeyList(SortedList):
         _maxes = self._maxes
         values = sorted(iterable, key=self._key)
 
+        if not values:
+            return
+
+        start_version = self._version
+
         if _maxes:
             if len(values) * 4 >= self._len:
                 _lists.append(values)
@@ -1785,6 +1859,7 @@ class SortedKeyList(SortedList):
                 _add = self.add
                 for val in values:
                     _add(val)
+                self._version = start_version + 1
                 return
 
         _load = self._load
@@ -1795,6 +1870,7 @@ class SortedKeyList(SortedList):
         _maxes.extend(sublist[-1] for sublist in _keys)
         self._len = len(values)
         del self._index[:]
+        self._version = start_version + 1
 
     _update = update
 
@@ -1970,6 +2046,7 @@ class SortedKeyList(SortedList):
         del keys_pos[idx]
         del lists_pos[idx]
         self._len -= 1
+        self._version += 1
 
         len_keys_pos = len(keys_pos)
 
@@ -2527,3 +2604,241 @@ class SortedKeyList(SortedList):
 
 
 SortedListWithKey = SortedKeyList
+
+
+class FrozenRanking:
+    """Frozen ranking of a :class:`SortedList` at a past version.
+
+    A frozen ranking captures the rows of a sorted list together with their
+    old ranks and the list's :attr:`~SortedList.version`. Rows can later be
+    located by their old rank even though other rows may have been inserted
+    or removed in the meantime.
+
+    Old ranks are stable: an old rank always resolves against the frozen
+    row order rather than the current positions. Negative ranks are relative
+    to the end of the frozen list.
+
+    When the target row's value has changed, :class:`RankConflictError` is
+    raised. When the target row has been removed, or the ranking belongs to
+    a different list, :class:`StaleRankError` is raised.
+
+    """
+
+    def __init__(self, source, token=None):
+        self._source = source
+        self._token = uuid.uuid4().hex if token is None else token
+        self._frozen_version = source._version
+        self._frozen_len = len(source)
+        self._refs = tuple(source)
+        self._rows = tuple(self._snapshot(value) for value in self._refs)
+        self._quarantined = {}
+
+    @staticmethod
+    def _snapshot(value):
+        """Return an independent snapshot of `value` for conflict detection.
+
+        Prefers a deep copy so that nested mutations are detected. Falls
+        back to a shallow copy and finally the original reference when the
+        value cannot be copied.
+
+        """
+        try:
+            return copy.deepcopy(value)
+        except (TypeError, copy.Error):
+            try:
+                return copy.copy(value)
+            except TypeError:
+                return value
+
+    def __len__(self):
+        """Return the number of rows in the frozen ranking."""
+        return len(self._rows)
+
+    def __iter__(self):
+        """Iterate over the frozen rows in old-rank order."""
+        return iter(self._rows)
+
+    @property
+    def token(self):
+        """Identifier of this frozen ranking, shown on every receipt."""
+        return self._token
+
+    @property
+    def version(self):
+        """Version of the sorted list recorded when the ranking froze."""
+        return self._frozen_version
+
+    @property
+    def quarantined(self):
+        """Mapping of old rank to the receipt of each quarantined row."""
+        return dict(self._quarantined)
+
+    def _resolve(self, old_rank):
+        """Normalize `old_rank` against the frozen length and range-check it."""
+        if not isinstance(old_rank, int) or isinstance(old_rank, bool):
+            raise TypeError('old rank must be an integer')
+
+        rank = old_rank + self._frozen_len if old_rank < 0 else old_rank
+
+        if not 0 <= rank < self._frozen_len:
+            raise IndexError('old rank out of range')
+
+        return rank
+
+    def __getitem__(self, old_rank):
+        """Return the frozen value at `old_rank`.
+
+        Negative ranks are relative to the end of the frozen list.
+
+        :param int old_rank: rank in the frozen ranking
+        :return: value recorded at freeze time
+        :raises IndexError: if the old rank is out of range
+
+        """
+        return self._rows[self._resolve(old_rank)]
+
+    def locate(self, old_rank):
+        """Locate the live row previously recorded at `old_rank`.
+
+        Returns ``(rank, value)`` where ``rank`` is the current rank of the
+        row in the sorted list and ``value`` is its current value.
+
+        :param int old_rank: rank in the frozen ranking
+        :return: current rank and value of the same business record
+        :raises IndexError: if the old rank is out of range
+        :raises RankConflictError: if the row value changed
+        :raises StaleRankError: if the row was removed or the list changed
+
+        """
+        rank = self._resolve(old_rank)
+        expected = self._rows[rank]
+        source = self._source
+
+        try:
+            current = source.index(expected)
+        except ValueError:
+            # No equal value remains. The original object still being part
+            # of the list means it was mutated in place (its value changed):
+            # report a conflict. Otherwise the row was removed: it is stale.
+            # Identity is checked directly because a mutated value may no
+            # longer occupy its sorted position.
+
+            original = self._refs[rank]
+            still_present = any(
+                item is original for sublist in source._lists for item in sublist
+            )
+
+            if not still_present:
+                raise StaleRankError(
+                    f'row at old rank {rank} no longer present in sorted list'
+                ) from None
+
+            raise RankConflictError(
+                f'row at old rank {rank} changed: '
+                f'expected {expected!r}, found {original!r}'
+            ) from None
+
+        value = source[current]
+
+        if value != expected:
+            raise RankConflictError(
+                f'row at old rank {rank} changed: '
+                f'expected {expected!r}, found {value!r}'
+            )
+
+        return current, value
+
+    def _make_receipt(self, old_rank, current_rank, value, action):
+        return {
+            'token': self._token,
+            'old_rank': old_rank,
+            'current_rank': current_rank,
+            'version': self._source._version,
+            'frozen_version': self._frozen_version,
+            'value': value,
+            'action': action,
+        }
+
+    def quarantine(self, old_rank):
+        """Quarantine the row at `old_rank` and return a receipt.
+
+        The row is located by its old rank regardless of rows inserted or
+        removed elsewhere. Repeating a request for an already quarantined
+        row does not delete anything again, but a receipt is still returned
+        with ``action`` set to ``'duplicate'``.
+
+        :param int old_rank: rank in the frozen ranking
+        :return: receipt describing the quarantine action
+        :raises IndexError: if the old rank is out of range
+        :raises RankConflictError: if the row value changed
+        :raises StaleRankError: if the row was removed or the list changed
+
+        """
+        rank = self._resolve(old_rank)
+
+        if rank in self._quarantined:
+            receipt = dict(self._quarantined[rank])
+            receipt['action'] = 'duplicate'
+            return receipt
+
+        current_rank, value = self.locate(rank)
+        self._source.pop(current_rank)
+        receipt = self._make_receipt(rank, current_rank, value, 'quarantined')
+        self._quarantined[rank] = receipt
+        return receipt
+
+    def quarantine_all(self, old_ranks):
+        """Quarantine several rows by old rank, returning one receipt each.
+
+        Every requested rank produces a receipt, including duplicate
+        requests. All rows are validated before any deletion: on conflict or
+        missing row, nothing is removed and the mapping is left unchanged.
+
+        :param old_ranks: iterable of ranks in the frozen ranking
+        :return: list of receipts in request order
+        :raises IndexError: if an old rank is out of range
+        :raises RankConflictError: if a target row value changed
+        :raises StaleRankError: if a target row was removed
+
+        """
+        normalized = [self._resolve(rank) for rank in old_ranks]
+        plan = []
+        seen = set()
+
+        for rank in normalized:
+            if rank in self._quarantined or rank in seen:
+                plan.append((rank, None, None, 'duplicate'))
+            else:
+                seen.add(rank)
+                current_rank, value = self.locate(rank)
+                plan.append((rank, current_rank, value, 'quarantined'))
+
+        # Delete from the greatest current rank to the least so that the
+        # remaining current ranks stay valid throughout the loop.
+
+        for _rank, current_rank, _value, _action in sorted(
+            (item for item in plan if item[3] == 'quarantined'),
+            key=lambda item: item[1],
+            reverse=True,
+        ):
+            self._source.pop(current_rank)
+
+        receipts = []
+
+        for rank, current_rank, value, action in plan:
+            if action == 'quarantined':
+                receipt = self._make_receipt(rank, current_rank, value, action)
+                self._quarantined[rank] = receipt
+            else:
+                receipt = dict(self._quarantined[rank])
+                receipt['action'] = 'duplicate'
+
+            receipts.append(receipt)
+
+        return receipts
+
+    def __repr__(self):
+        return (
+            f'{type(self).__name__}(token={self._token!r}, '
+            f'version={self._frozen_version}, rows={self._frozen_len})'
+        )

@@ -16,11 +16,18 @@ Sorted dict implementations:
 
 """
 
+import copy
+import uuid
 import warnings
 from collections.abc import ItemsView, KeysView, Mapping, Sequence, ValuesView
 from itertools import chain
 
-from .sortedlist import SortedList, recursive_repr
+from .sortedlist import (
+    RankConflictError,
+    SortedList,
+    StaleRankError,
+    recursive_repr,
+)
 from .sortedset import SortedSet
 
 
@@ -191,7 +198,7 @@ class SortedDict(dict):
             return self._iloc
         except AttributeError:
             warnings.warn(
-                'sorted_dict.iloc is deprecated.' ' Use SortedDict.keys() instead.',
+                'sorted_dict.iloc is deprecated. Use SortedDict.keys() instead.',
                 DeprecationWarning,
                 stacklevel=2,
             )
@@ -608,6 +615,20 @@ class SortedKeysView(KeysView, Sequence):
     def _from_iterable(cls, it):
         return SortedSet(it)
 
+    def freeze(self, token=None):
+        """Freeze the current key ranking into a snapshot keyed by old rank.
+
+        >>> sd = SortedDict({'a': 1, 'b': 2, 'c': 3})
+        >>> ranking = sd.keys().freeze()
+        >>> ranking[1]
+        'b'
+
+        :param token: frozen ranking identifier (optional)
+        :return: frozen ranking of this keys view
+
+        """
+        return FrozenViewRanking(self, token)
+
     def __getitem__(self, index):
         """Lookup key at `index` in sorted keys views.
 
@@ -654,6 +675,20 @@ class SortedItemsView(ItemsView, Sequence):
     @classmethod
     def _from_iterable(cls, it):
         return SortedSet(it)
+
+    def freeze(self, token=None):
+        """Freeze the current item ranking into a snapshot keyed by old rank.
+
+        >>> sd = SortedDict({'a': 1, 'b': 2, 'c': 3})
+        >>> ranking = sd.items().freeze()
+        >>> ranking[1]
+        ('b', 2)
+
+        :param token: frozen ranking identifier (optional)
+        :return: frozen ranking of this items view
+
+        """
+        return FrozenViewRanking(self, token)
 
     def __getitem__(self, index):
         """Lookup item at `index` in sorted items view.
@@ -706,6 +741,20 @@ class SortedValuesView(ValuesView, Sequence):
 
     __slots__ = ()
 
+    def freeze(self, token=None):
+        """Freeze the current value ranking into a snapshot keyed by old rank.
+
+        >>> sd = SortedDict({'a': 2, 'b': 1, 'c': 3})
+        >>> ranking = sd.values().freeze()
+        >>> ranking[1]
+        1
+
+        :param token: frozen ranking identifier (optional)
+        :return: frozen ranking of this values view
+
+        """
+        return FrozenViewRanking(self, token)
+
     def __getitem__(self, index):
         """Lookup value at `index` in sorted values view.
 
@@ -744,3 +793,221 @@ class SortedValuesView(ValuesView, Sequence):
         return _mapping[key]
 
     __delitem__ = _view_delitem
+
+
+class FrozenViewRanking:
+    """Frozen ranking of a sorted dict row view at a past version.
+
+    A frozen view ranking captures the rows of a :class:`SortedKeysView`,
+    :class:`SortedItemsView`, or :class:`SortedValuesView` together with
+    their old ranks and the backing sorted list's
+    :attr:`~sortedcontainers.SortedList.version`. Rows are located by the
+    stable dict key recorded at each old rank, so inserting or removing
+    other rows never makes a quarantine target drift.
+
+    Negative ranks are relative to the end of the frozen ranking. A value
+    change on the same key raises :class:`RankConflictError`; a removed key
+    raises :class:`StaleRankError`.
+
+    """
+
+    def __init__(self, view, token=None):
+        mapping = view._mapping
+        self._view = view
+        self._mapping = mapping
+        self._list = mapping._list
+        self._token = uuid.uuid4().hex if token is None else token
+        self._frozen_version = self._list._version
+        self._frozen_len = len(self._list)
+        self._keys = tuple(self._list)
+        self._rows = tuple(self._snapshot(row) for row in view)
+        self._quarantined = {}
+
+    @staticmethod
+    def _snapshot(row):
+        """Return an independent snapshot of a view row for conflict detection."""
+        try:
+            return copy.deepcopy(row)
+        except (TypeError, copy.Error):
+            try:
+                return copy.copy(row)
+            except TypeError:
+                return row
+
+    def __len__(self):
+        """Return the number of rows in the frozen ranking."""
+        return self._frozen_len
+
+    def __iter__(self):
+        """Iterate over the frozen rows in old-rank order."""
+        return iter(self._rows)
+
+    @property
+    def token(self):
+        """Identifier of this frozen ranking, shown on every receipt."""
+        return self._token
+
+    @property
+    def version(self):
+        """Version of the backing sorted list recorded at freeze time."""
+        return self._frozen_version
+
+    @property
+    def quarantined(self):
+        """Mapping of old rank to the receipt of each quarantined row."""
+        return dict(self._quarantined)
+
+    def _resolve(self, old_rank):
+        """Normalize `old_rank` against the frozen length and range-check it."""
+        if not isinstance(old_rank, int) or isinstance(old_rank, bool):
+            raise TypeError('old rank must be an integer')
+
+        rank = old_rank + self._frozen_len if old_rank < 0 else old_rank
+
+        if not 0 <= rank < self._frozen_len:
+            raise IndexError('old rank out of range')
+
+        return rank
+
+    def __getitem__(self, old_rank):
+        """Return the frozen row at `old_rank`.
+
+        :param int old_rank: rank in the frozen ranking
+        :return: key, ``(key, value)`` pair, or value recorded at freeze time
+        :raises IndexError: if the old rank is out of range
+
+        """
+        return self._rows[self._resolve(old_rank)]
+
+    def locate(self, old_rank):
+        """Locate the live row previously recorded at `old_rank`.
+
+        Returns ``(rank, row)`` where ``rank`` is the current rank of the
+        row's key in the sorted dict and ``row`` matches the frozen view's
+        row type (key, ``(key, value)`` pair, or value).
+
+        :param int old_rank: rank in the frozen ranking
+        :return: current rank and current row of the same business record
+        :raises IndexError: if the old rank is out of range
+        :raises RankConflictError: if the row value changed
+        :raises StaleRankError: if the row's key was removed
+
+        """
+        rank = self._resolve(old_rank)
+        key = self._keys[rank]
+        mapping = self._mapping
+
+        if key not in mapping:
+            raise StaleRankError(
+                f'row at old rank {rank} (key {key!r}) no longer present'
+            )
+
+        current_rank = self._list.index(key)
+        expected = self._rows[rank]
+
+        if isinstance(self._view, SortedKeysView):
+            row = key
+        elif isinstance(self._view, SortedItemsView):
+            row = (key, mapping[key])
+        else:
+            row = mapping[key]
+
+        if row != expected:
+            raise RankConflictError(
+                f'row at old rank {rank} (key {key!r}) changed: '
+                f'expected {expected!r}, found {row!r}'
+            )
+
+        return current_rank, row
+
+    def _make_receipt(self, old_rank, current_rank, key, row, action):
+        return {
+            'token': self._token,
+            'old_rank': old_rank,
+            'current_rank': current_rank,
+            'key': key,
+            'row': row,
+            'version': self._list._version,
+            'frozen_version': self._frozen_version,
+            'action': action,
+        }
+
+    def quarantine(self, old_rank):
+        """Quarantine the row at `old_rank` and return a receipt.
+
+        The row is located by the stable key recorded at its old rank, so
+        inserts and removals elsewhere do not move the target. Repeating a
+        request for an already quarantined row deletes nothing again but
+        still returns a receipt with ``action`` set to ``'duplicate'``.
+
+        :param int old_rank: rank in the frozen ranking
+        :return: receipt describing the quarantine action
+        :raises IndexError: if the old rank is out of range
+        :raises RankConflictError: if the row value changed
+        :raises StaleRankError: if the row's key was removed
+
+        """
+        rank = self._resolve(old_rank)
+
+        if rank in self._quarantined:
+            receipt = dict(self._quarantined[rank])
+            receipt['action'] = 'duplicate'
+            return receipt
+
+        current_rank, row = self.locate(rank)
+        key = self._keys[rank]
+        del self._mapping[key]
+        receipt = self._make_receipt(rank, current_rank, key, row, 'quarantined')
+        self._quarantined[rank] = receipt
+        return receipt
+
+    def quarantine_all(self, old_ranks):
+        """Quarantine several rows by old rank, returning one receipt each.
+
+        Every requested rank produces a receipt, including duplicate
+        requests. All rows are validated before any deletion: on conflict or
+        missing key, nothing is removed and the mapping is left unchanged.
+
+        :param old_ranks: iterable of ranks in the frozen ranking
+        :return: list of receipts in request order
+        :raises IndexError: if an old rank is out of range
+        :raises RankConflictError: if a target row value changed
+        :raises StaleRankError: if a target key was removed
+
+        """
+        normalized = [self._resolve(rank) for rank in old_ranks]
+        plan = []
+        seen = set()
+
+        for rank in normalized:
+            if rank in self._quarantined or rank in seen:
+                plan.append((rank, None, None, 'duplicate'))
+            else:
+                seen.add(rank)
+                current_rank, row = self.locate(rank)
+                plan.append((rank, current_rank, row, 'quarantined'))
+
+        for rank, _current_rank, _row, action in plan:
+            if action == 'quarantined':
+                del self._mapping[self._keys[rank]]
+
+        receipts = []
+
+        for rank, current_rank, row, action in plan:
+            if action == 'quarantined':
+                key = self._keys[rank]
+                receipt = self._make_receipt(rank, current_rank, key, row, action)
+                self._quarantined[rank] = receipt
+            else:
+                receipt = dict(self._quarantined[rank])
+                receipt['action'] = 'duplicate'
+
+            receipts.append(receipt)
+
+        return receipts
+
+    def __repr__(self):
+        return (
+            f'{type(self).__name__}(token={self._token!r}, '
+            f'version={self._frozen_version}, rows={self._frozen_len})'
+        )

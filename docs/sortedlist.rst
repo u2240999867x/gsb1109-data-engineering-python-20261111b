@@ -46,6 +46,8 @@ SortedList
    .. automethod:: insert
    .. automethod:: reverse
    .. automethod:: __setitem__
+   .. autoattribute:: version
+   .. automethod:: freeze
 
 
 SortedKeyList
@@ -61,3 +63,27 @@ SortedKeyList
    .. automethod:: irange_key
 
 .. autoclass:: sortedcontainers.SortedListWithKey
+
+
+FrozenRanking
+.............
+
+.. autoclass:: sortedcontainers.FrozenRanking
+   :show-inheritance:
+
+   .. automethod:: locate
+   .. automethod:: quarantine
+   .. automethod:: quarantine_all
+   .. autoattribute:: token
+   .. autoattribute:: version
+   .. autoattribute:: quarantined
+
+
+Exceptions
+..........
+
+.. autoclass:: sortedcontainers.StaleRankError
+   :show-inheritance:
+
+.. autoclass:: sortedcontainers.RankConflictError
+   :show-inheritance:
