@@ -4,18 +4,23 @@ from probables.blooms import (
     BloomFilter,
     BloomFilterOnDisk,
     CountingBloomFilter,
+    DurableBloomFilter,
     ExpandingBloomFilter,
+    GenerationReader,
     RotatingBloomFilter,
 )
 from probables.countminsketch import CountMeanMinSketch, CountMeanSketch, CountMinSketch, HeavyHitters, StreamThreshold
 from probables.cuckoo import CountingCuckooFilter, CuckooFilter
 from probables.exceptions import (
     CuckooFilterFullError,
+    DurableBloomError,
+    DurableBloomRecoveryError,
     InitializationError,
     NotSupportedError,
     ProbablesBaseException,
     RotatingBloomFilterError,
     SimilarityError,
+    StaleWriterError,
 )
 from probables.quotientfilter import QuotientFilter
 from probables.utilities import Bitarray
@@ -50,4 +55,9 @@ __all__ = [
     "QuotientFilter",
     "Bitarray",
     "SimilarityError",
+    "DurableBloomFilter",
+    "GenerationReader",
+    "DurableBloomError",
+    "StaleWriterError",
+    "DurableBloomRecoveryError",
 ]

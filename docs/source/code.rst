@@ -41,6 +41,25 @@ BloomFilterOnDisk
 
 For more information of all methods and properties, see `BloomFilter`_.
 
+DurableBloomFilter
++++++++++++++++++++++++++++++++
+
+A durable, multi-process, batched Bloom filter stored in a directory. It
+supports exactly-once batch submission, generation-level takeover fencing,
+all-or-nothing crash recovery and immutable generation snapshots.
+
+.. autoclass:: probables.DurableBloomFilter
+    :members:
+
+GenerationReader
++++++++++++++++++++++++++++++++
+
+A read-only, stable snapshot of one immutable generation layer of a
+:class:`probables.DurableBloomFilter`.
+
+.. autoclass:: probables.GenerationReader
+    :members:
+
 ExpandingBloomFilter
 +++++++++++++++++++++++++++++++
 
