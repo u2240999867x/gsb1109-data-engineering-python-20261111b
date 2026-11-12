@@ -212,10 +212,13 @@ class QuotientFilter:
             int: The next hash stored in the quotient filter"""
         queue: list[int] = []
 
-        # find first empty location
+        # find first empty location; a full table has none, so start the
+        # wrap-around scan at slot 0
         start = 0
-        while not self._is_empty_element(start):
+        while start < self._size and not self._is_empty_element(start):
             start += 1
+        if start == self._size:
+            start = 0
 
         cur_quot = 0
         for i in range(start, self._size + start):  # this will allow for wrap-arounds
@@ -403,6 +406,7 @@ class QuotientFilter:
 
         if self._is_empty_element(next_idx) or self._is_cluster_start(next_idx):
             self._remove_and_clear_bits(idx, q, remove_orig_idx)
+            self._elements_added -= 1
             return
 
         min_idx = self._find_cluster_start(idx)
@@ -412,6 +416,7 @@ class QuotientFilter:
         if remove_orig_idx:
             self._is_occupied[q] = 0
         self._fixup_cluster(min_idx, next_idx)
+        self._elements_added -= 1
 
     def _should_remove_orig_idx(self, idx: int, next_idx: int) -> bool:
         return self._is_run_or_cluster_start(idx) and self._is_continuation[next_idx] == 0
@@ -527,11 +532,11 @@ class QuotientFilter:
             bool: True if the metadata bits are all passing; False otherwise"""
         is_valid = True
         for i in range(self._size):
-            if self._is_occupied[i] == 0 and self._is_continuation == 1 and self._is_shifted == 0:
+            if self._is_occupied[i] == 0 and self._is_continuation[i] == 1 and self._is_shifted[i] == 0:
                 if verbose:
                     print(f"Row failed: {i}")
                 is_valid = False
-            if self._is_occupied[i] == 1 and self._is_continuation == 1 and self._is_shifted == 0:
+            if self._is_occupied[i] == 1 and self._is_continuation[i] == 1 and self._is_shifted[i] == 0:
                 if verbose:
                     print(f"Row failed: {i}")
                 is_valid = False
