@@ -11,6 +11,7 @@ SortedList
    .. automethod:: __init__
    .. automethod:: add
    .. automethod:: update
+   .. automethod:: merge_presorted
    .. automethod:: clear
    .. automethod:: discard
    .. automethod:: remove
@@ -56,6 +57,7 @@ SortedKeyList
 
    .. automethod:: __init__
    .. autoattribute:: key
+   .. automethod:: merge_presorted
    .. automethod:: bisect_key_left
    .. automethod:: bisect_key_right
    .. automethod:: irange_key

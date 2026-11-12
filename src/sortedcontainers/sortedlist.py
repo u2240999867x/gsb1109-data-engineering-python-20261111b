@@ -297,6 +297,163 @@ class SortedList(MutableSequence):
 
     _update = update
 
+    def merge_presorted(self, iterable):
+        """Merge values from `iterable` already in ascending order.
+
+        Unlike :func:`SortedList.update`, the values are not sorted again.
+        This suits pre-sorted partitions, such as fact-table slices ordered
+        by the same business key, that can be merged directly.
+
+        The iterable is consumed in a single pass. If two consecutive values
+        are out of order, :exc:`ValueError` is raised; if a value is not
+        comparable with the values stored, :exc:`TypeError` is raised. The
+        input is staged first, so any failure aborts before the list changes:
+        previously visible values, their ranks and equal-value group order
+        are preserved.
+
+        Equal values keep a stable order: values already stored precede the
+        incoming values that compare equal to them.
+
+        Runtime complexity: `O(k*log(n/k))` -- approximate, where `k` is the
+        number of incoming values. Only the internal sublists whose range
+        overlaps the incoming values are rebuilt; unrelated sublists are
+        never scanned.
+
+        >>> sl = SortedList([2, 4, 6])
+        >>> sl.merge_presorted([1, 3, 5, 7])
+        >>> sl
+        SortedList([1, 2, 3, 4, 5, 6, 7])
+        >>> sl.merge_presorted([3, 1])
+        Traceback (most recent call last):
+          ...
+        ValueError: merge_presorted expects an ascending iterable
+
+        :param iterable: values in ascending order to merge into the list
+        :raises ValueError: if the iterable is not in ascending order
+
+        """
+        staged = []
+        first = True
+        previous = None
+
+        for value in iterable:
+            if not first and previous > value:
+                raise ValueError('merge_presorted expects an ascending iterable')
+            staged.append(value)
+            previous = value
+            first = False
+
+        if not staged:
+            return
+
+        if self._maxes:
+            self._check_staged_compatible(staged)
+
+        _lists = self._lists
+        _maxes = self._maxes
+
+        if not _maxes:
+            _load = self._load
+            _lists.extend(
+                staged[pos : (pos + _load)] for pos in range(0, len(staged), _load)
+            )
+            _maxes.extend(sublist[-1] for sublist in _lists)
+            self._len = len(staged)
+            del self._index[:]
+            return
+
+        self._merge_staged(staged, staged)
+
+    def _check_staged_compatible(self, keys):
+        """Raise TypeError if staged keys cannot compare with stored keys.
+
+        Runs before any mutation so that type incompatibility discovered
+        between the incoming partition and the stored partitions aborts the
+        merge atomically. Stored keys belong to one total ordering, so a
+        representative stored key exercises both ordering operators for every
+        staged key.
+
+        """
+        representative = self._maxes[0]
+        for key in keys:
+            key < representative
+            key > representative
+
+    def _merge_staged(self, values, keys):
+        """Merge staged sorted `values` into the internal sublists.
+
+        The list must be non-empty and `keys` must be sorted and have the same
+        length as `values`. For :class:`SortedList` values are their own keys.
+        Only sublists whose range overlaps the staged keys are rebuilt.
+
+        Target blocks are chosen exactly as in :func:`SortedList.add`, via
+        ``bisect_right`` on the block maxima, so a key is routed to the first
+        block whose maximum is strictly greater. Keys equal to a block maximum
+        are therefore never spliced into that block but handed back to the
+        bisect, which keeps equal-key groups together behind every stored
+        equal value.
+
+        """
+        _lists = self._lists
+        _maxes = self._maxes
+        count = len(keys)
+
+        del self._index[:]
+
+        start = 0
+        block = bisect_right(_maxes, keys[0])
+
+        while start < count:
+            if block == len(_maxes):
+                block -= 1
+                _lists[block].extend(values[start:])
+                _maxes[block] = keys[-1]
+                self._len += count - start
+                self._split_until_loaded(block)
+                return
+
+            limit = _maxes[block]
+            end = bisect_left(keys, limit, start)
+
+            if end == start:
+                block = bisect_right(_maxes, keys[start], block + 1)
+                continue
+
+            _lists[block] = self._merge_value_runs(_lists[block], values[start:end])
+            _maxes[block] = _lists[block][-1]
+            self._len += end - start
+            start = end
+            block = self._split_until_loaded(block)
+
+            if start < count:
+                block = bisect_right(_maxes, keys[start], block + 1)
+
+    def _merge_value_runs(self, old, new):
+        """Stable-merge two ascending value runs, old values first on ties."""
+        merged = []
+        oi = ni = 0
+        old_len, new_len = len(old), len(new)
+
+        while oi < old_len and ni < new_len:
+            if new[ni] < old[oi]:
+                merged.append(new[ni])
+                ni += 1
+            else:
+                merged.append(old[oi])
+                oi += 1
+
+        merged.extend(old[oi:])
+        merged.extend(new[ni:])
+        return merged
+
+    def _split_until_loaded(self, pos):
+        """Split a sublist grown by a bulk splice back under the load limit."""
+        double = self._load << 1
+        while len(self._lists[pos]) > double:
+            self._expand(pos)
+            pos += 1
+        return pos
+
     def __contains__(self, value):
         """Return true if `value` is an element of the sorted list.
 
@@ -1797,6 +1954,170 @@ class SortedKeyList(SortedList):
         del self._index[:]
 
     _update = update
+
+    def merge_presorted(self, iterable):
+        """Merge values from `iterable` already ordered by the key function.
+
+        Unlike :func:`SortedKeyList.update`, neither the values nor the keys
+        are sorted again, and each key is computed exactly once. This suits
+        pre-sorted partitions, such as fact-table slices ordered by the same
+        business key, that carry their ordering in the key.
+
+        The iterable is consumed in a single pass. If two consecutive keys
+        are out of order, :exc:`ValueError` is raised; if a key is not
+        comparable with the keys stored, :exc:`TypeError` is raised. The
+        values and their keys are staged first, so any failure aborts before
+        the list changes: previously visible values, their ranks and
+        equal-key group order are preserved.
+
+        Equal keys keep a stable order: values already stored precede the
+        incoming values with the same key.
+
+        Runtime complexity: `O(k*log(n/k))` -- approximate, where `k` is the
+        number of incoming values. Only the internal sublists whose key range
+        overlaps the incoming keys are rebuilt; unrelated sublists, and their
+        stored keys, are never scanned.
+
+        >>> from operator import neg
+        >>> skl = SortedKeyList([2, 4, 6], key=neg)
+        >>> skl.merge_presorted([7, 5, 3, 1])
+        >>> skl
+        SortedKeyList([7, 6, 5, 4, 3, 2, 1], key=<built-in function neg>)
+
+        :param iterable: values in ascending key order to merge into the list
+        :raises ValueError: if the iterable is not in ascending key order
+
+        """
+        staged_values = []
+        staged_keys = []
+        first = True
+        previous = None
+
+        for value in iterable:
+            key = self._key(value)
+            if not first and previous > key:
+                raise ValueError('merge_presorted expects an ascending iterable')
+            staged_values.append(value)
+            staged_keys.append(key)
+            previous = key
+            first = False
+
+        if not staged_values:
+            return
+
+        if self._maxes:
+            self._check_staged_compatible(staged_keys)
+
+        _lists = self._lists
+        _keys = self._keys
+        _maxes = self._maxes
+
+        if not _maxes:
+            _load = self._load
+            _lists.extend(
+                staged_values[pos : (pos + _load)]
+                for pos in range(0, len(staged_values), _load)
+            )
+            _keys.extend(
+                staged_keys[pos : (pos + _load)]
+                for pos in range(0, len(staged_keys), _load)
+            )
+            _maxes.extend(sublist[-1] for sublist in _keys)
+            self._len = len(staged_values)
+            del self._index[:]
+            return
+
+        self._merge_staged(staged_values, staged_keys)
+
+    def _check_staged_compatible(self, keys):
+        """Raise TypeError if staged keys cannot compare with stored keys.
+
+        Runs before any mutation so that type incompatibility discovered
+        between the incoming partition and the stored partitions aborts the
+        merge atomically. Stored keys belong to one total ordering, so a
+        representative stored key exercises both ordering operators for every
+        staged key.
+
+        """
+        representative = self._maxes[0]
+        for key in keys:
+            key < representative
+            key > representative
+
+    def _merge_staged(self, values, keys):
+        """Merge staged sorted `values` with their precomputed `keys`.
+
+        The list must be non-empty and `keys` must be sorted and have the same
+        length as `values`. Only sublists whose key range overlaps the staged
+        keys are rebuilt; the stored key sublists of unrelated blocks are not
+        touched.
+
+        As with :func:`SortedKeyList.add`, target blocks are found with
+        ``bisect_right`` on the block maxima and incoming keys equal to a block
+        maximum are routed onward rather than spliced into that block, so
+        equal-key groups stay together behind the stored equal keys.
+
+        """
+        _lists = self._lists
+        _keys = self._keys
+        _maxes = self._maxes
+        count = len(keys)
+
+        del self._index[:]
+
+        start = 0
+        block = bisect_right(_maxes, keys[0])
+
+        while start < count:
+            if block == len(_maxes):
+                block -= 1
+                _lists[block].extend(values[start:])
+                _keys[block].extend(keys[start:])
+                _maxes[block] = keys[-1]
+                self._len += count - start
+                self._split_until_loaded(block)
+                return
+
+            limit = _maxes[block]
+            end = bisect_left(keys, limit, start)
+
+            if end == start:
+                block = bisect_right(_maxes, keys[start], block + 1)
+                continue
+
+            old_values = _lists[block]
+            old_keys = _keys[block]
+            new_values = values[start:end]
+            new_keys = keys[start:end]
+            merged_values = []
+            merged_keys = []
+            oi = ni = 0
+            old_len, new_len = len(old_keys), len(new_keys)
+
+            while oi < old_len and ni < new_len:
+                if new_keys[ni] < old_keys[oi]:
+                    merged_values.append(new_values[ni])
+                    merged_keys.append(new_keys[ni])
+                    ni += 1
+                else:
+                    merged_values.append(old_values[oi])
+                    merged_keys.append(old_keys[oi])
+                    oi += 1
+
+            merged_values.extend(old_values[oi:])
+            merged_keys.extend(old_keys[oi:])
+            merged_values.extend(new_values[ni:])
+            merged_keys.extend(new_keys[ni:])
+
+            _lists[block] = merged_values
+            _keys[block] = merged_keys
+            _maxes[block] = merged_keys[-1]
+            self._len += end - start
+            start = end
+            block = self._split_until_loaded(block)
+
+            if start < count:
+                block = bisect_right(_maxes, keys[start], block + 1)
 
     def __contains__(self, value):
         """Return true if `value` is an element of the sorted-key list.
