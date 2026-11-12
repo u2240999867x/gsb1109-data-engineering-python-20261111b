@@ -52,6 +52,15 @@ from .sorteddict import (
     SortedValuesView,
 )
 from .sortedlist import SortedKeyList, SortedList, SortedListWithKey
+from .sortedmigration import (
+    CursorPlan,
+    InvalidCursorError,
+    Migration,
+    Snapshot,
+    SortPolicyRegistry,
+    migrate,
+    register_policy,
+)
 from .sortedset import SortedSet
 
 __all__ = [
@@ -63,6 +72,13 @@ __all__ = [
     'SortedItemsView',
     'SortedValuesView',
     'SortedSet',
+    'Snapshot',
+    'Migration',
+    'CursorPlan',
+    'SortPolicyRegistry',
+    'InvalidCursorError',
+    'migrate',
+    'register_policy',
 ]
 
 __title__ = 'sortedcontainers'
