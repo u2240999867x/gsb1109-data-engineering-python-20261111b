@@ -1,6 +1,7 @@
 from __future__ import absolute_import
 
 from ast import literal_eval
+from collections import defaultdict
 from copy import copy
 from datetime import date, datetime
 import re
@@ -174,6 +175,12 @@ class BareValidator(object):
         """ The path within the schema to the current sub-schema.
             Type: :class:`tuple` """
         self.update = False
+        self.reconciliation = {}
+        """ Reports how list details of the last validation were aligned with
+            the explicitly provided ``original`` snapshot. Mapped by the
+            document path of a reconciled list to buckets named ``added``,
+            ``removed``, ``moved`` and ``unmatched``.
+            Type: :class:`dict` """
         self.error_handler = self.__init_error_handler(kwargs)
         """ The error handler used to format :attr:`~cerberus.Validator.errors`
             and process submitted errors with
@@ -494,6 +501,22 @@ class BareValidator(object):
         Type: :class:`bool`
         """
         return self._config.get('is_child', False)
+
+    @property
+    def original(self):
+        """
+        The previously stored snapshot that the current document is reconciled
+        against, if one was passed explicitly to :meth:`~cerberus.Validator.validate`.
+        Type: any :term:`mapping` or :obj:`None`
+        """
+        return self._config.get('original')
+
+    @property
+    def _reconcile_state(self):
+        """Shared state that suppresses default ``readonly`` errors for details
+        which have been reconciled against an original snapshot. Child
+        validators share this mapping with their parent."""
+        return self._config.setdefault('_reconcile_state', {})
 
     @property
     def _is_normalized(self):
@@ -944,6 +967,303 @@ class BareValidator(object):
         ):
             self._validate_readonly(schema[field]['readonly'], field, mapping[field])
 
+    def __capture_provided_fields(self, document, path=()):
+        """Records which columns each mapping of the raw patch carried. Columns
+        absent from the patch are later treated as not provided rather than as
+        data that was written back unchanged."""
+        if not isinstance(document, Mapping):
+            return
+        self._reconcile_state[('__provided__',) + path] = set(document)
+        for field, value in document.items():
+            if isinstance(value, Mapping):
+                self.__capture_provided_fields(value, path + (field,))
+            elif isinstance(value, Sequence) and not isinstance(value, _str_type):
+                for index, item in enumerate(value):
+                    self.__capture_provided_fields(item, path + (field, index))
+
+    def __reconcile_readonly(self, document, original, schema):
+        """
+        Walks the normalized document alongside the explicitly provided original
+        snapshot. ``readonly`` columns are compared against the values stored in
+        that snapshot instead of being rejected merely for being present. List
+        details are aligned by a declared ``reconcile`` business key.
+        """
+        self.__reconcile_mapping(document, original, schema, (), ())
+
+    def __reconcile_mapping(self, document, original, schema, doc_path, sch_path):
+        if not isinstance(document, Mapping) or not isinstance(original, Mapping):
+            return
+        if self.__is_isolated(doc_path):
+            return
+
+        for field, definitions in schema.items():
+            rules = self._resolve_rules_set(definitions)
+            if field not in document or field not in original:
+                continue
+
+            if rules.get('readonly'):
+                self.__reconcile_readonly_field(
+                    field, document, original, rules, doc_path, sch_path
+                )
+                continue
+
+            nested_schema = self._resolve_schema(rules.get('schema'))
+            if nested_schema is None:
+                continue
+
+            value = document[field]
+            original_value = original[field]
+            if isinstance(value, Mapping) and isinstance(original_value, Mapping):
+                self.__reconcile_mapping(
+                    value,
+                    original_value,
+                    nested_schema,
+                    doc_path + (field,),
+                    sch_path + (field, 'schema'),
+                )
+            elif (
+                isinstance(value, Sequence)
+                and not isinstance(value, _str_type)
+                and isinstance(original_value, Sequence)
+                and not isinstance(original_value, _str_type)
+            ):
+                self.__reconcile_sequence(
+                    field,
+                    value,
+                    original_value,
+                    nested_schema,
+                    doc_path,
+                    sch_path,
+                )
+
+    def __reconcile_readonly_field(
+        self, field, document, original, rules, doc_path, sch_path
+    ):
+        field_path = doc_path + (field,)
+        provided = self._reconcile_state.get(
+            ('__provided__',) + doc_path, set()
+        )
+
+        # A column the patch didn't carry must not be counted as a change,
+        # even if normalization (e.g. a default) writes it back.
+        if field not in provided:
+            self._reconcile_state[field_path] = 'ok'
+            return
+
+        # The stored snapshot already holds the value as written under its own
+        # rules; it must not be recomputed with the current rules, otherwise a
+        # genuine renumber could be masked.
+        old_value = original[field]
+        new_value = document[field]
+        if new_value == old_value:
+            self._reconcile_state[field_path] = 'ok'
+        else:
+            self._reconcile_state[field_path] = 'changed'
+            self.__reconcile_error(
+                field_path,
+                sch_path + (field, 'readonly'),
+                errors.READONLY_VALUE_CHANGED,
+                rules.get('readonly'),
+                new_value,
+                (old_value, new_value),
+            )
+
+    def __reconcile_sequence(
+        self,
+        field,
+        values,
+        original_values,
+        item_schema,
+        doc_path,
+        sch_path,
+    ):
+        list_path = doc_path + (field,)
+        item_rules = self._resolve_rules_set(item_schema)
+        nested_schema = self._resolve_schema(item_rules.get('schema'))
+        business_key = item_rules.get('reconcile')
+
+        if business_key is None:
+            if nested_schema is None:
+                return
+            for index, (new_item, old_item) in enumerate(
+                zip(values, original_values)
+            ):
+                if isinstance(new_item, Mapping) and isinstance(old_item, Mapping):
+                    self.__reconcile_mapping(
+                        new_item,
+                        old_item,
+                        nested_schema,
+                        list_path + (index,),
+                        sch_path + (field, 'schema', 'schema'),
+                    )
+            return
+
+        alignment = self.__align_details(
+            values,
+            original_values,
+            business_key,
+            list_path,
+            sch_path + (field, 'reconcile'),
+        )
+        self.reconciliation[list_path] = alignment
+
+        for entry in alignment['unmatched']:
+            for new_index in entry['new_positions']:
+                self._reconcile_state[
+                    ('__isolated__',) + list_path + (new_index,)
+                ] = True
+        for new_index in alignment['added']:
+            # Read-only values of newly added details are echoed system values,
+            # not client edits; the alignment report already lists them.
+            self._reconcile_state[
+                ('__added__',) + list_path + (new_index,)
+            ] = True
+
+        if nested_schema is None:
+            return
+
+        for new_index, old_index in alignment['matched'].items():
+            self.__reconcile_mapping(
+                values[new_index],
+                original_values[old_index],
+                nested_schema,
+                list_path + (new_index,),
+                sch_path + (field, 'schema', 'schema'),
+            )
+
+    def __align_details(
+        self, values, original_values, business_key, list_path, rule_path
+    ):
+        key_fields = (
+            (business_key,)
+            if isinstance(business_key, _str_type)
+            else tuple(business_key)
+        )
+
+        def key_of(item):
+            if not isinstance(item, Mapping):
+                return (item,)
+            return tuple(
+                self.__normalize_key_part(item.get(key_field))
+                for key_field in key_fields
+            )
+
+        new_indexes_by_key = defaultdict(list)
+        old_indexes_by_key = defaultdict(list)
+        for index, item in enumerate(values):
+            new_indexes_by_key[key_of(item)].append(index)
+        for index, item in enumerate(original_values):
+            old_indexes_by_key[key_of(item)].append(index)
+
+        matched = {}
+        added = []
+        removed = []
+        moved = []
+        unmatched = []
+
+        for key, new_indexes in new_indexes_by_key.items():
+            old_indexes = old_indexes_by_key.pop(key, [])
+            if len(new_indexes) == 1 and len(old_indexes) == 1:
+                new_index, old_index = new_indexes[0], old_indexes[0]
+                matched[new_index] = old_index
+                if new_index != old_index:
+                    moved.append({'key': key, 'from': old_index, 'to': new_index})
+            elif not old_indexes:
+                added.extend(new_indexes)
+            else:
+                unmatched.append(
+                    {
+                        'key': key,
+                        'old_positions': tuple(old_indexes),
+                        'new_positions': tuple(new_indexes),
+                    }
+                )
+                self.__reconcile_error(
+                    list_path,
+                    rule_path,
+                    errors.UNMATCHED_DETAIL,
+                    key_fields,
+                    None,
+                    (tuple(old_indexes), tuple(new_indexes)),
+                )
+
+        for old_indexes in old_indexes_by_key.values():
+            removed.extend(old_indexes)
+
+        return {
+            'key': key_fields,
+            'matched': matched,
+            'added': sorted(added),
+            'removed': sorted(removed),
+            'moved': sorted(moved, key=lambda item: item['to']),
+            'unmatched': unmatched,
+        }
+
+    @staticmethod
+    def __normalize_key_part(value):
+        if isinstance(value, _str_type):
+            return value.strip().lower()
+        return value
+
+    def __is_isolated(self, path):
+        """Details that cannot be aligned after a key collision are isolated;
+        only the dedicated alignment error reports them."""
+        return self.__subtree_flagged(path, '__isolated__')
+
+    def __is_added(self, path):
+        """Newly added details only appear in the alignment report; their
+        echoed read-only values are not treated as edits."""
+        return self.__subtree_flagged(path, '__added__')
+
+    def __subtree_flagged(self, path, flag):
+        marker = (flag,)
+        for depth in range(len(path) + 1):
+            if self._reconcile_state.get(marker + path[:depth]):
+                return True
+        return False
+
+    def __reconcile_error(
+        self, document_path, schema_path, error_definition, constraint, value, info
+    ):
+        error = errors.ValidationError(
+            document_path,
+            schema_path,
+            error_definition.code,
+            error_definition.rule,
+            constraint,
+            value,
+            info,
+        )
+        self._error([error])
+
+    def __prune_reconciled_readonly_errors(self):
+        state_keys = tuple(self._reconcile_state)
+        reconciled_paths = {
+            path
+            for path in state_keys
+            if path and path[0] not in ('__provided__', '__isolated__', '__added__')
+        }
+        has_subtree_flags = any(
+            key[0] in ('__isolated__', '__added__') for key in state_keys
+        )
+        if not reconciled_paths and not has_subtree_flags:
+            return
+        self._errors = errors.ErrorList(
+            error
+            for error in self._errors
+            if not (
+                error.code == errors.READONLY_FIELD.code
+                and (
+                    error.document_path in reconciled_paths
+                    or self.__is_isolated(error.document_path)
+                    or self.__is_added(error.document_path)
+                )
+            )
+        )
+        self._errors.sort()
+        self.document_error_tree = errors.DocumentErrorTree(self._errors)
+        self.schema_error_tree = errors.SchemaErrorTree(self._errors)
+
     def __normalize_default_fields(self, mapping, schema):
         empty_fields = [
             x
@@ -1006,7 +1326,9 @@ class BareValidator(object):
 
     # # Validating
 
-    def validate(self, document, schema=None, update=False, normalize=True):
+    def validate(
+        self, document, schema=None, update=False, normalize=True, original=None
+    ):
         """
         Normalizes and validates a mapping against a validation-schema of defined rules.
 
@@ -1020,6 +1342,12 @@ class BareValidator(object):
         :type update: :class:`bool`
         :param normalize: If ``True``, normalize the document before validation.
         :type normalize: :class:`bool`
+        :param original: An optional, previously stored snapshot of the same
+                         document. When given, ``readonly`` fields are compared
+                         against the matching detail of this snapshot instead of
+                         being rejected outright. List details are aligned by the
+                         declared ``reconcile`` business key.
+        :type original: any :term:`mapping` or :obj:`None`
 
         :return: ``True`` if validation succeeds, otherwise ``False``. Check
                  the :func:`errors` property for a list of processing errors.
@@ -1028,9 +1356,24 @@ class BareValidator(object):
         self.update = update
         self._unrequired_by_excludes = set()
 
+        if not self.is_child:
+            # Child validators inherit the reconciliation context through their
+            # copied configuration instead of starting a new reconciliation.
+            self.reconciliation = {}
+            self._config['original'] = (
+                copy(original) if original is not None else None
+            )
+            self._config['_reconcile_state'] = {}
+
         self.__init_processing(document, schema)
+        if self.original is not None:
+            self.__capture_provided_fields(self.document)
         if normalize:
             self.__normalize_mapping(self.document, self.schema)
+
+        if self.original is not None and normalize:
+            self.__reconcile_readonly(self.document, self.original, self.schema)
+            self.__prune_reconciled_readonly_errors()
 
         for field in self.document:
             if self.ignore_none_values and self.document[field] is None:
@@ -1100,7 +1443,13 @@ class BareValidator(object):
             for x in definitions
             if x not in rules_queue
             and x not in self.normalization_rules
-            and x not in ('allow_unknown', 'require_all', 'meta', 'required')
+            and x not in (
+                'allow_unknown',
+                'reconcile',
+                'require_all',
+                'meta',
+                'required',
+            )
         )
         self._remaining_rules = rules_queue
 
@@ -1412,6 +1761,22 @@ class BareValidator(object):
     def _validate_readonly(self, readonly, field, value):
         """{'type': 'boolean'}"""
         if readonly:
+            field_path = self.document_path + (field,)
+            if self.original is not None and (
+                self.__is_isolated(field_path) or self.__is_added(field_path)
+            ):
+                # Alignment failures and added details are covered by the
+                # reconciliation report rather than read-only errors.
+                return
+            verdict = self._reconcile_state.get(field_path)
+            if verdict == 'ok':
+                # The value matches the original snapshot, so carrying it in
+                # the patch is not considered a modification.
+                return
+            if verdict == 'changed':
+                # The dedicated error was filed during reconciliation.
+                self._drop_remaining_rules()
+                return
             if not self._is_normalized:
                 self._error(field, errors.READONLY_FIELD)
             # If the document was normalized (and therefore already been
@@ -1425,6 +1790,12 @@ class BareValidator(object):
             )
             if self._is_normalized and has_error:
                 self._drop_remaining_rules()
+
+    _validate_reconcile = dummy_for_rule_validation(
+        """ {'oneof': [{'type': 'string'},
+                       {'type': 'list',
+                        'schema': {'type': 'string'}}]} """
+    )
 
     def _validate_regex(self, pattern, field, value):
         """{'type': 'string'}"""

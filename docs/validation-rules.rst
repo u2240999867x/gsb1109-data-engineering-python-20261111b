@@ -648,9 +648,43 @@ A validator can be configured with the initialization argument
 ``purge_readonly`` and the property with the same name to let it delete all
 fields that have this rule defined positively.
 
+When :meth:`~cerberus.Validator.validate` is given an explicit ``original``
+snapshot, a readonly field that is carried back with its stored value is no
+longer treated as a modification; only an actually different value fails.
+List details can be aligned for that comparison with the
+:ref:`reconcile` rule.
+
 .. versionchanged:: 1.0.2
    Can be used in conjunction with ``default`` and ``default_setter``,
    see :ref:`default-values`.
+
+.. _reconcile:
+
+reconcile
+---------
+Declares the stable business key of a list's details as a field name or a
+list of field names. It only takes effect when :meth:`~cerberus.Validator.validate`
+is called with an explicit ``original`` snapshot of the previously stored
+document.
+
+Instead of rejecting a ``readonly`` column merely because the full snapshot
+carries it back, the details of both documents are aligned by this key after
+normalization (string keys are compared case-insensitively and stripped of
+surrounding whitespace). Each aligned pair is then compared column by column:
+a ``readonly`` value that differs from the stored one raises an error, while
+carrying the unchanged value back is accepted. Columns that do not appear in
+the patch are treated as not provided and never count as a change.
+
+The alignment of each reconciled list is reported on the validator's
+``reconciliation`` attribute with the buckets ``added``, ``removed``,
+``moved``, ``matched`` and ``unmatched``. If normalized keys collide so that
+details cannot be aligned unambiguously, the affected details are isolated
+and an error reports their positions on both sides; all remaining details are
+still validated.
+
+Values from the ``original`` snapshot are compared as they were stored rather
+than being recomputed under the current normalization rules, so a genuine
+change of a read-only value cannot be masked by a new coercion.
 
 regex
 -----

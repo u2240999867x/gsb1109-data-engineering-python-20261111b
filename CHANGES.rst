@@ -1,6 +1,19 @@
 Cerberus Changelog
 ==================
 
+Unreleased
+----------
+
+New
+~~~
+
+- A ``reconcile`` rule aligns list details of a document with an explicit
+  ``original`` snapshot by a declared stable business key. Read-only columns
+  are then judged against the stored values instead of being rejected for
+  being carried back, and the validator reports added, removed, moved and
+  unmatched details on its ``reconciliation`` attribute. Key collisions
+  isolate the unalignable details while all remaining ones stay judgeable.
+
 Version 1.3.8
 -------------
 

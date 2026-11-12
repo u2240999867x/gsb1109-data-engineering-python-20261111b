@@ -88,7 +88,8 @@ def test_validated_schema_cache():
     v = Validator({'foozifix': {'coerce': int}})
     assert len(v._valid_schemas) == cache_size
 
-    max_cache_size = 163
+    # The reconcile test module adds further distinct definition schemas.
+    max_cache_size = 180
     assert cache_size <= max_cache_size, (
         "There's an unexpected high amount (%s) of cached valid "
         "definition schemas. Unless you added further tests, "
