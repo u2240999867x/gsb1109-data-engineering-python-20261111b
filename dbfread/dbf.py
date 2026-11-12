@@ -14,6 +14,7 @@ from .memo import find_memofile, open_memofile, FakeMemoFile
 from .codepages import guess_encoding
 from .dbversions import get_dbversion_string
 from .exceptions import DBFNotFound, MissingMemoFile
+from .header_audit import HeaderAuditor
 
 _py_version = (sys.version_info.major, sys.version_info.minor)
 _py_impl = platform.python_implementation()
@@ -92,7 +93,10 @@ class DBF(object):
                  load=False,
                  raw=False,
                  ignore_missing_memofile=False,
-                 char_decode_errors='strict'):
+                 char_decode_errors='strict',
+                 header_audit=False,
+                 format_variants=None,
+                 known_rows=None):
 
         self.encoding = encoding
         self.ignorecase = ignorecase
@@ -101,6 +105,10 @@ class DBF(object):
         self.raw = raw
         self.ignore_missing_memofile = ignore_missing_memofile
         self.char_decode_errors = char_decode_errors
+        self.header_audit_enabled = header_audit
+        self.format_variants = format_variants
+        self.known_rows = known_rows
+        self.audit_report = None
 
         if recfactory is None:
             self.recfactory = lambda items: items
@@ -125,10 +133,16 @@ class DBF(object):
         self.header = None
         self.fields = []       # namedtuples
         self.field_names = []  # strings
+        # Set when header_audit=True and a unique layout wins.
+        self._audit_layout = None
+        self._contiguous_fields = True
 
         with open(self.filename, mode='rb') as infile:
             self._read_header(infile)
-            self._read_field_headers(infile)
+            if self.header_audit_enabled:
+                self._run_header_audit()
+            else:
+                self._read_field_headers(infile)
             self._check_headers()
 
             try:
@@ -219,6 +233,35 @@ class DBF(object):
                 self.encoding = guess_encoding(self.header.language_driver)
             except LookupError:
                 self.encoding = 'ascii'
+
+    def _run_header_audit(self):
+        """Audit the header against the declared format variants.
+
+        Raises AuditFailure when no layout is legal and AmbiguousHeader
+        when several layouts survive; in both cases the file on disk is
+        left untouched and no decoding is attempted.
+        """
+        auditor = HeaderAuditor(self.format_variants)
+        self.audit_report = auditor.audit(
+            self.filename,
+            known_rows=self.known_rows,
+            encoding=self.encoding or 'ascii')
+        self.audit_report.raise_if_ambiguous()
+
+        layout = self.audit_report.layout
+        self._audit_layout = layout
+        self.fields = list(layout.fields)
+        self.field_names = [field.name for field in layout.fields]
+        self._contiguous_fields = self._fields_are_contiguous(layout.fields)
+
+    @staticmethod
+    def _fields_are_contiguous(fields):
+        expected_offset = 1
+        for field in fields:
+            if field.offset != expected_offset:
+                return False
+            expected_offset += field.length
+        return True
 
     def _decode_text(self, data):
         return data.decode(self.encoding, errors=self.char_decode_errors)
@@ -319,10 +362,22 @@ class DBF(object):
                 sep = read(1)
 
                 if sep == record_type:
-                    items = [
-                        (field.name, parse(field, read(field.length)))
-                        for field in self.fields
-                    ]
+                    if self._contiguous_fields:
+                        items = [
+                            (field.name,
+                             parse(field, read(field.length)))
+                            for field in self.fields
+                        ]
+                    else:
+                        # Audited layout with gaps: read the whole record
+                        # body and slice each field at its audited offset.
+                        body = read(self.header.recordlen - 1)
+                        items = [
+                            (field.name,
+                             parse(field,
+                                   body[field.offset - 1:field.end - 1]))
+                            for field in self.fields
+                        ]
                     yield self.recfactory(items)
 
                 elif sep in (b'\x1a', b''):

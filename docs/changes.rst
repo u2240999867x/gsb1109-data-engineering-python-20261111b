@@ -7,6 +7,15 @@ Release History
 (Next Version)
 ^^^^^^^^^^^^^^^^^^
 
+* added a read-only header auditor (``HeaderAuditor``,
+  ``FormatVariant``, ``AuditReport``, ``AuditFailure`` and
+  ``AmbiguousHeader``). It checks headers whose stored field offsets and
+  cumulative field widths disagree against a declared set of format
+  variants, reports consensus columns plus disputed candidate layouts,
+  and gates ``DBF(header_audit=True)`` so records are only decoded once
+  a single legal layout is determined. The source file is never
+  rewritten.
+
 * records are now returned ``dict`` instead of ``collections.OrderedDict``
   in Python 3.7 and up (as well as CPython 3.6) since normal Python
   dictionaries are now ordered.

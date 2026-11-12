@@ -21,6 +21,14 @@ from .dbf import DBF
 from .deprecated_dbf import open, read
 from .exceptions import DBFNotFound, MissingMemoFile
 from .field_parser import FieldParser, InvalidValue
+from .header_audit import (
+    HeaderAuditor,
+    FormatVariant,
+    AuditReport,
+    AuditFailure,
+    AmbiguousHeader,
+    audit_header,
+)
 from .version import version_info, version as __version__
 
 # Prevent star import.

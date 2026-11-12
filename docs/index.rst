@@ -52,6 +52,7 @@ Contents
    installing
    introduction
    exporting_data
+   header_audit
    dbf_objects
    field_types
    api_changes

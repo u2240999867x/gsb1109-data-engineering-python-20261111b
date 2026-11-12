@@ -74,6 +74,23 @@ raw=False
   Returns all data values as byte strings. This can be used for
   debugging or for doing your own decoding.
 
+header_audit=False
+  Runs the read-only header audit before any record is decoded. Records
+  are only read when the audit returns exactly one legal layout. An
+  ambiguous header raises ``AmbiguousHeader`` (with the report attached)
+  and an impossible header raises ``AuditFailure``; the file is never
+  modified. See :doc:`header_audit`.
+
+format_variants=None
+  Custom iterable of ``FormatVariant`` objects used by the header
+  audit. Defaults to the built-in Visual FoxPro / FoxBASE / dBASE IV
+  variants.
+
+known_rows=None
+  A list of raw-byte expectations for the first records (one dict per
+  record, field name to exact bytes or a predicate). Layouts that fail
+  to reproduce them are rejected during the audit.
+
 
 Methods
 -------
