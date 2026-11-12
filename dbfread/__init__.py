@@ -21,6 +21,11 @@ from .dbf import DBF
 from .deprecated_dbf import open, read
 from .exceptions import DBFNotFound, MissingMemoFile
 from .field_parser import FieldParser, InvalidValue
+from .memo_claim import (
+    claim_memo_files,
+    MemoClaimError,
+    MemoClaimReport,
+)
 from .version import version_info, version as __version__
 
 # Prevent star import.

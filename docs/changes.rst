@@ -7,6 +7,13 @@ Release History
 (Next Version)
 ^^^^^^^^^^^^^^^^^^
 
+* added a read-only memo file claim preview (``dbfread.claim_memo_files``)
+  that rejects incompatible ``.FPT``/``.DBT`` candidates from the table
+  format, referenced block range, declared block lengths and caller supplied
+  fingerprints, compares surviving candidates row by row, groups byte
+  identical copies into equivalence classes, and selects the minimum set of
+  verifiable rows that distinguish the distinct candidate contents.
+
 * records are now returned ``dict`` instead of ``collections.OrderedDict``
   in Python 3.7 and up (as well as CPython 3.6) since normal Python
   dictionaries are now ordered.
