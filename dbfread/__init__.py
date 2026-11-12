@@ -18,6 +18,7 @@ __url__ = 'https://dbfread.readthedocs.io/'
 __license__ = 'MIT'
 
 from .dbf import DBF
+from .align import align, scan_physical
 from .deprecated_dbf import open, read
 from .exceptions import DBFNotFound, MissingMemoFile
 from .field_parser import FieldParser, InvalidValue

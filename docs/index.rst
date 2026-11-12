@@ -52,6 +52,7 @@ Contents
    installing
    introduction
    exporting_data
+   aligning
    dbf_objects
    field_types
    api_changes

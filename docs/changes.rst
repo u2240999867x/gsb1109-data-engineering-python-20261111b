@@ -7,6 +7,13 @@ Release History
 (Next Version)
 ^^^^^^^^^^^^^^^^^^
 
+* added ``dbfread.align()`` and ``dbfread.scan_physical()`` for
+  auditing two versions of a table: both files are scanned in
+  physical record order (including deleted records) and aligned by
+  caller declared witness columns, reporting continued, added,
+  deleted and ambiguous records as well as corrupted or truncated
+  tails.
+
 * records are now returned ``dict`` instead of ``collections.OrderedDict``
   in Python 3.7 and up (as well as CPython 3.6) since normal Python
   dictionaries are now ordered.
