@@ -12,6 +12,25 @@ The :mod:`sqlparse` module provides the following functions on module-level.
 
 .. autofunction:: sqlparse.parse
 
+.. autofunction:: sqlparse.split_script
+
+Script mode returns a :class:`~sqlparse.script.ScriptResult` carrying
+:class:`~sqlparse.script.ScriptBatch` objects (source range, delimiter
+policy, execution count) and separately collected
+:class:`~sqlparse.script.ClientCommand` objects.  A receiver may persist a
+:class:`~sqlparse.script.ScriptCheckpoint` and continue later with
+:meth:`~sqlparse.script.ScriptResult.resume` without losing a ``DELIMITER``
+switch or re-sending acknowledged executions.
+
+.. autoclass:: sqlparse.script.ScriptBatch
+
+.. autoclass:: sqlparse.script.ScriptCheckpoint
+
+.. autoclass:: sqlparse.script.ClientCommand
+
+.. autoclass:: sqlparse.script.ScriptResult
+   :members: checkpoint, resume
+
 In most cases there's no need to set the `encoding` parameter. If
 `encoding` is not set, sqlparse assumes that the given SQL statement
 is encoded either in utf-8 or latin-1.

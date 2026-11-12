@@ -1,3 +1,19 @@
+Unreleased
+----------
+
+Notable Changes
+
+* Added explicit script mode via `sqlparse.split_script()` for migration
+  tooling. It splits scripts into `ScriptBatch` objects that keep the
+  source range, the delimiter policy actually used and the execution
+  count, handling standalone `GO` lines, `GO` with a repeat count and
+  MySQL `DELIMITER` switches. Same-named text inside strings, procedure
+  bodies and comments stays part of the SQL, unknown client commands are
+  collected separately, and `ScriptResult.resume()` continues from a
+  checkpoint without losing delimiter switches or re-sending acknowledged
+  executions.
+
+
 Release 0.6.1 (Nov 01, 2026)
 ----------------------------
 
