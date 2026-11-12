@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+**New**:
+
+* Add `Assign` schema: treat the key matching of a whole mapping as a single column assignment. Literal, type and custom match rules may overlap; each required target takes exactly one source, the assignment is chosen by caller-given priority, equally prioritised swaps are reported as ambiguous with the original columns (independent of dict insertion order), value conversion runs once per submitted field after the assignment is fixed, and incomplete assignments report the group of targets contending for the same sources
+
 **Fixes**:
 
 * [#539](https://github.com/alecthomas/voluptuous/pull/539): Raise `Invalid` instead of leaking `TypeError`/`ValueError` for non-numeric input to the `Number` validator

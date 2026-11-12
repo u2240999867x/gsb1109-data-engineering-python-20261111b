@@ -218,6 +218,8 @@ class Schema(object):
             return schema.__voluptuous_compile__(self)
         if isinstance(schema, Object):
             return self._compile_object(schema)
+        if isinstance(schema, Assign):
+            return self._compile_assign(schema)
         if isinstance(schema, collections.abc.Mapping):
             return self._compile_dict(schema)
         elif isinstance(schema, list):
@@ -411,6 +413,180 @@ class Schema(object):
             return out
 
         return validate_mapping
+
+    def _compile_assign(self, schema):
+        """Create a validator that solves key matching as one assignment.
+
+        See :class:`Assign` for the semantics.
+        """
+        rules = []
+        extra_value_validator = None
+        for skey, svalue in schema.items():
+            if skey is Extra:
+                extra_value_validator = self._compile(svalue)
+                continue
+            rules.append(
+                _AssignRule(
+                    skey,
+                    self._compile(skey),
+                    self._compile(svalue),
+                    (
+                        self.required
+                        and not isinstance(skey, (Optional, Remove))
+                    )
+                    or isinstance(skey, Required),
+                )
+            )
+
+        default_rules = [
+            rule
+            for rule in rules
+            if isinstance(rule.skey, (Required, Optional))
+            and not isinstance(rule.skey.default, Undefined)
+        ]
+
+        priority = schema.priority
+
+        def edge_priority(skey, source_key):
+            if priority is None:
+                return _default_assign_priority(skey)
+            if callable(priority):
+                return priority(skey, source_key)
+            return priority.get(skey, _default_assign_priority(skey))
+
+        def validate_assign(path, data):
+            if not isinstance(data, dict):
+                raise er.DictInvalid('expected a dictionary', path)
+
+            # Build the list of submitted fields, inserting defaults for
+            # missing keys exactly like the regular mapping validator.
+            key_value_map = type(data)()
+            for key, value in data.items():
+                key_value_map[key] = value
+            for rule in default_rules:
+                if rule.skey.schema not in key_value_map:
+                    key_value_map[rule.skey.schema] = rule.skey.default()
+
+            sources = list(key_value_map.items())
+            num_rules = len(rules)
+
+            # Match every rule against every source key. Only key matching
+            # happens here; value conversion is deferred until the
+            # assignment is fixed so that each submitted field is converted
+            # exactly once.
+            edges = []
+            for rule in rules:
+                rule_edges = {}
+                for source_index, (key, _value) in enumerate(sources):
+                    key_path = path + [key]
+                    try:
+                        new_key = rule.ckey(key_path, key)
+                    except er.Invalid as e:
+                        if len(e.path) > len(key_path):
+                            raise
+                        continue
+                    rule_edges[source_index] = (
+                        new_key,
+                        edge_priority(rule.skey, key),
+                    )
+                edges.append(rule_edges)
+
+            optima = _solve_assignments(rules, edges, len(sources))
+
+            if not optima:
+                target_indexes, source_indexes = _assign_contention(
+                    rules, edges, len(sources)
+                )
+                targets = _sorted_by_repr(rules[i].skey for i in target_indexes)
+                source_keys = _sorted_by_repr(sources[i][0] for i in source_indexes)
+                if source_keys:
+                    msg = (
+                        'no complete column assignment: targets %r contend '
+                        'for the same sources %r' % (targets, source_keys)
+                    )
+                else:
+                    msg = (
+                        'no complete column assignment: targets %r have no '
+                        'matching sources' % (targets,)
+                    )
+                raise er.MultipleInvalid(
+                    [
+                        er.IncompleteAssignmentInvalid(
+                            msg, path, targets=targets, sources=source_keys
+                        )
+                    ]
+                )
+
+            if len(optima) > 1:
+                first, second = optima
+                differing = [
+                    i for i in range(num_rules) if first[i] != second[i]
+                ]
+                involved = set()
+                for i in differing:
+                    for source_index in (first[i], second[i]):
+                        if source_index >= 0:
+                            involved.add(source_index)
+                targets = _sorted_by_repr(rules[i].skey for i in differing)
+                source_keys = _sorted_by_repr(sources[i][0] for i in involved)
+                msg = (
+                    'ambiguous column assignment: targets %r can be swapped '
+                    'over sources %r with equal priority; provide explicit '
+                    'priorities to disambiguate' % (targets, source_keys)
+                )
+                raise er.MultipleInvalid(
+                    [
+                        er.AmbiguousAssignmentInvalid(
+                            msg, path, targets=targets, sources=source_keys
+                        )
+                    ]
+                )
+
+            chosen = optima[0]
+            source_to_rule = {}
+            for rule_index, source_index in enumerate(chosen):
+                if source_index >= 0:
+                    source_to_rule[source_index] = rule_index
+
+            out = type(data)()
+            errors = []
+            for source_index, (key, value) in enumerate(sources):
+                key_path = path + [key]
+                rule_index = source_to_rule.get(source_index)
+                if rule_index is None:
+                    if extra_value_validator is not None:
+                        try:
+                            out[key] = extra_value_validator(key_path, value)
+                        except er.MultipleInvalid as e:
+                            errors.extend(e.errors)
+                        except er.Invalid as e:
+                            errors.append(e)
+                    elif self.extra == ALLOW_EXTRA:
+                        out[key] = value
+                    elif self.extra == REMOVE_EXTRA:
+                        continue
+                    else:
+                        errors.append(
+                            er.Invalid('extra keys not allowed', key_path)
+                        )
+                    continue
+                rule = rules[rule_index]
+                if isinstance(rule.skey, Remove):
+                    continue
+                new_key = edges[rule_index][source_index][0]
+                try:
+                    out[new_key] = rule.cvalue(key_path, value)
+                except er.MultipleInvalid as e:
+                    errors.extend(e.errors)
+                except er.Invalid as e:
+                    if len(e.path) <= len(key_path):
+                        e.error_type = 'dictionary value'
+                    errors.append(e)
+            if errors:
+                raise er.MultipleInvalid(errors)
+            return out
+
+        return validate_assign
 
     def _compile_object(self, schema):
         """Validate an object.
@@ -910,6 +1086,152 @@ def _iterate_mapping_candidates(schema):
     return sorted(schema.items(), key=_sort_item)
 
 
+class _AssignRule(object):
+    """A single target column of an :class:`Assign` schema."""
+
+    __slots__ = ('skey', 'ckey', 'cvalue', 'required')
+
+    def __init__(self, skey, ckey, cvalue, required):
+        self.skey = skey
+        self.ckey = ckey
+        self.cvalue = cvalue
+        self.required = required
+
+
+def _default_assign_priority(skey):
+    """Default priority of a schema key in an :class:`Assign` schema.
+
+    Literal rules outrank custom match rules, which outrank type rules.
+    """
+    if isinstance(skey, Remove):
+        return 40
+    target = skey.schema if isinstance(skey, Marker) else skey
+    if type(target) in primitive_types:
+        return 30
+    if inspect.isclass(target):
+        return 10
+    if callable(target):
+        return 20
+    return 0
+
+
+def _sorted_by_repr(values):
+    """Sort values deterministically, independent of dictionary order."""
+    return sorted(values, key=repr)
+
+
+def _solve_assignments(rules, edges, num_sources):
+    """Return up to two optimal column assignments.
+
+    An assignment is a tuple mapping a rule index to a source index (or
+    ``-1`` when the rule takes no source). An assignment is *complete*
+    when every required rule takes exactly one source; only complete
+    assignments are returned. Assignments are compared lexicographically
+    on the total caller-given priority, then on the number of matched
+    rules. At most two optima are returned so the caller can detect
+    ambiguity without relying on dictionary insertion order.
+    """
+    num_rules = len(rules)
+    order = sorted(range(num_rules), key=lambda i: (len(edges[i]), i))
+    max_prio = [
+        max((prio for _key, prio in edges[i].values()), default=0)
+        for i in range(num_rules)
+    ]
+    suffix_bound = [0] * (num_rules + 1)
+    for pos in range(num_rules - 1, -1, -1):
+        suffix_bound[pos] = suffix_bound[pos + 1] + max(0, max_prio[order[pos]])
+
+    best_score = None
+    best = []
+    assignment = [-1] * num_rules
+    used = [False] * num_sources
+
+    def search(pos, cur_prio, cur_cnt):
+        nonlocal best_score
+        if best_score is not None:
+            bound = (cur_prio + suffix_bound[pos], cur_cnt + num_rules - pos)
+            if len(best) >= 2:
+                # Two optima are enough; only a strictly better
+                # assignment still matters.
+                if bound <= best_score:
+                    return
+            elif bound < best_score:
+                return
+        if pos == num_rules:
+            score = (cur_prio, cur_cnt)
+            if best_score is None or score > best_score:
+                best_score = score
+                best[:] = [tuple(assignment)]
+            elif score == best_score:
+                candidate = tuple(assignment)
+                if candidate not in best and len(best) < 2:
+                    best.append(candidate)
+            return
+        rule_index = order[pos]
+        for source_index, (_new_key, prio) in edges[rule_index].items():
+            if used[source_index]:
+                continue
+            used[source_index] = True
+            assignment[rule_index] = source_index
+            search(pos + 1, cur_prio + prio, cur_cnt + 1)
+            assignment[rule_index] = -1
+            used[source_index] = False
+        if not rules[rule_index].required:
+            search(pos + 1, cur_prio, cur_cnt)
+
+    search(0, 0, 0)
+    return best
+
+
+def _assign_contention(rules, edges, num_sources):
+    """Locate a group of targets contending for the same batch of sources.
+
+    Returns ``(target_indexes, source_indexes)`` forming a Hall
+    deficiency: the combined candidate sources of those targets are
+    exactly ``source_indexes``, and there are fewer of them than targets.
+    """
+    match_source = [-1] * num_sources
+
+    def augment(rule_index, seen):
+        for source_index in edges[rule_index]:
+            if source_index in seen:
+                continue
+            seen.add(source_index)
+            if match_source[source_index] == -1 or augment(
+                match_source[source_index], seen
+            ):
+                match_source[source_index] = rule_index
+                return True
+        return False
+
+    order = sorted(range(len(rules)), key=lambda i: (not rules[i].required, i))
+    for rule_index in order:
+        augment(rule_index, set())
+
+    # Alternating BFS from every unmatched required rule (rule -> candidate
+    # source -> matched rule) yields the contending group.
+    matched_rules = set(match_source)
+    seen_rules = set()
+    seen_sources = set()
+    queue = collections.deque(
+        rule_index
+        for rule_index in order
+        if rules[rule_index].required and rule_index not in matched_rules
+    )
+    while queue:
+        rule_index = queue.popleft()
+        if rule_index in seen_rules:
+            continue
+        seen_rules.add(rule_index)
+        for source_index in edges[rule_index]:
+            if source_index not in seen_sources:
+                seen_sources.add(source_index)
+                other = match_source[source_index]
+                if other != -1:
+                    queue.append(other)
+    return seen_rules, seen_sources
+
+
 def _iterate_object(obj):
     """Return iterator over object attributes. Respect objects with
     defined __slots__.
@@ -997,6 +1319,61 @@ class Object(dict):
     def __init__(self, schema: typing.Any, cls: object = UNDEFINED) -> None:
         self.cls = cls
         super(Object, self).__init__(schema)
+
+
+class Assign(dict):
+    """Treat the key matching of a whole mapping as a single column assignment.
+
+    When cleaned-up column names collide, several schema keys (literal
+    rules, type rules and custom match rules) may overlap on the same
+    submitted fields. Instead of matching each field greedily on its own,
+    the whole row is paired off at once: every schema key (target) takes
+    at most one submitted key (source), every source feeds at most one
+    target, and each required target takes exactly one source.
+
+    >>> from voluptuous import Any, Coerce
+    >>> schema = Schema(Assign({Required('qty'): Coerce(int), str: object}))
+    >>> schema({'qty': '5', 'unit': 'kg'})
+    {'qty': 5, 'unit': 'kg'}
+
+    Among the assignments that satisfy the contract, the one with the
+    highest caller-given priority wins. ``priority`` may be a mapping
+    from schema key to rank, or a callable taking ``(schema_key,
+    data_key)`` and returning a rank for that pairing. By default,
+    literal rules outrank custom match rules, which outrank type rules.
+
+    Value conversion only happens after the assignment is fixed, and
+    each submitted field is converted exactly once.
+
+    If equally prioritised assignments would swap two columns, the
+    ambiguity is reported together with the original columns instead of
+    being resolved by dictionary insertion order:
+
+    >>> schema = Schema(Assign({Required(Any('x', 'y')): int,
+    ...                         Required(Any('x', 'y')): int}))
+    >>> with raises(er.MultipleInvalid, "ambiguous column assignment: targets [Any('x', 'y', msg=None), Any('x', 'y', msg=None)] can be swapped over sources ['x', 'y'] with equal priority; provide explicit priorities to disambiguate"):
+    ...     schema({'x': 1, 'y': 2})
+
+    When no complete assignment exists, the error names the group of
+    targets contending for the same batch of sources:
+
+    >>> schema = Schema(Assign({Required('a'): int, Required('b'): int}))
+    >>> with raises(er.MultipleInvalid, "no complete column assignment: targets ['b'] have no matching sources"):
+    ...     schema({'a': 1})
+    """
+
+    def __init__(
+        self,
+        schema: typing.Any,
+        priority: typing.Optional[
+            typing.Union[
+                typing.Mapping[typing.Hashable, int],
+                typing.Callable[[typing.Hashable, typing.Hashable], int],
+            ]
+        ] = None,
+    ) -> None:
+        self.priority = priority
+        super(Assign, self).__init__(schema)
 
 
 class VirtualPathComponent(str):

@@ -12,7 +12,9 @@ from voluptuous import (
     REMOVE_EXTRA,
     All,
     AllInvalid,
+    AmbiguousAssignmentInvalid,
     Any,
+    Assign,
     Clamp,
     Coerce,
     Contains,
@@ -29,6 +31,7 @@ from voluptuous import (
     In,
     Inclusive,
     InInvalid,
+    IncompleteAssignmentInvalid,
     Invalid,
     IsDir,
     IsFile,
@@ -2375,3 +2378,207 @@ def test_complex_required_keys_with_specific_value_validation():
     error_msg = str(exc_info.value)
     assert "required" not in error_msg.lower()  # No "required field missing" error
     assert "value must be at most 100" in error_msg  # Range validation error
+
+
+def test_assign_basic_overlap():
+    """Literal and type rules may overlap; the row is paired off as one assignment."""
+    schema = Schema(Assign({Required('qty'): Coerce(int), str: object}))
+    assert schema({'qty': '5', 'unit': 'kg'}) == {'qty': 5, 'unit': 'kg'}
+
+
+def test_assign_custom_match_rule():
+    """Custom match rules participate in the assignment like literal rules."""
+
+    def cleaned(prefix):
+        def match(key):
+            if isinstance(key, str) and key.strip().lower().startswith(prefix):
+                return key.strip().lower()
+            raise Invalid('no match')
+
+        return match
+
+    schema = Schema(
+        Assign({Required(cleaned('qty')): Coerce(int), Required('unit'): str})
+    )
+    assert schema({' QTY ': '5', 'unit': 'kg'}) == {'qty': 5, 'unit': 'kg'}
+
+
+def test_assign_cleaned_columns_collide():
+    """Two original fields cleaning to the same target column: priority picks the source."""
+
+    def clean_key(key):
+        if isinstance(key, str) and key.strip().lower() == 'qty':
+            return 'qty'
+        raise Invalid('not qty')
+
+    schema = Schema(
+        Assign(
+            {Required(clean_key): Coerce(int)},
+            priority=lambda skey, key: 2 if key == 'qty' else 1,
+        ),
+        extra=REMOVE_EXTRA,
+    )
+    assert schema({'Qty ': '5', 'qty': '7'}) == {'qty': 7}
+
+    # Without caller priority the tie is reported as ambiguous, keeping
+    # the original columns, instead of relying on dict insertion order.
+    schema = Schema(Assign({Required(clean_key): Coerce(int)}), extra=REMOVE_EXTRA)
+    with pytest.raises(MultipleInvalid) as ctx:
+        schema({'Qty ': '5', 'qty': '7'})
+    (error,) = ctx.value.errors
+    assert isinstance(error, AmbiguousAssignmentInvalid)
+    assert error.sources == ['Qty ', 'qty']
+
+
+def test_assign_ambiguous_swap_is_reported():
+    schema = Schema(Assign({Required(Any('x', 'y')): int, Required(Any('x', 'y')): int}))
+    with pytest.raises(MultipleInvalid) as ctx:
+        schema({'x': 1, 'y': 2})
+    (error,) = ctx.value.errors
+    assert isinstance(error, AmbiguousAssignmentInvalid)
+    assert len(error.targets) == 2
+    assert error.sources == ['x', 'y']
+    assert 'ambiguous column assignment' in str(error)
+
+
+def test_assign_ambiguity_is_order_independent():
+    def make_schema(reverse):
+        rules = [Required(Any('x', 'y')), Required(Any('x', 'y'))]
+        if reverse:
+            rules.reverse()
+        return Schema(Assign({rule: int for rule in rules}))
+
+    messages = []
+    for reverse, data in ((False, {'x': 1, 'y': 2}), (True, {'y': 2, 'x': 1})):
+        with pytest.raises(MultipleInvalid) as ctx:
+            make_schema(reverse)(data)
+        messages.append(str(ctx.value.errors[0]))
+    assert messages[0] == messages[1]
+
+
+def test_assign_priority_mapping_selects_rule():
+    low, high = Optional(Any('x', 'y')), Optional(Any('x', 'y'))
+    schema = Schema(
+        Assign({low: Coerce(int), high: Coerce(str)}, priority={low: 1, high: 2})
+    )
+    assert schema({'x': '7'}) == {'x': '7'}
+
+    schema = Schema(
+        Assign({low: Coerce(int), high: Coerce(str)}, priority={low: 2, high: 1})
+    )
+    assert schema({'x': '7'}) == {'x': 7}
+
+
+def test_assign_priority_callable_selects_pairing():
+    first, second = Required(Any('x', 'y')), Required(Any('x', 'y'))
+    schema = Schema(
+        Assign(
+            {first: Coerce(int), second: Coerce(str)},
+            priority=lambda skey, key: 2 if (skey is first) == (key == 'x') else 1,
+        )
+    )
+    assert schema({'x': '1', 'y': '2'}) == {'x': 1, 'y': '2'}
+
+
+def test_assign_value_conversion_runs_once_per_field():
+    calls = []
+
+    def convert(value):
+        calls.append(value)
+        return int(value)
+
+    schema = Schema(Assign({Required('a'): convert, Required('b'): convert}))
+    assert schema({'a': '1', 'b': '2'}) == {'a': 1, 'b': 2}
+    assert calls == ['1', '2']
+
+
+def test_assign_no_conversion_without_complete_assignment():
+    calls = []
+
+    def convert(value):
+        calls.append(value)
+        return int(value)
+
+    schema = Schema(Assign({Required('a'): convert, Required('b'): convert}))
+    with pytest.raises(MultipleInvalid):
+        schema({'a': '1'})
+    assert calls == []
+
+
+def test_assign_incomplete_reports_contention():
+    schema = Schema(Assign({Required(Any('x', 'y')): int, Required(Any('x', 'y')): int}))
+    with pytest.raises(MultipleInvalid) as ctx:
+        schema({'x': 1})
+    (error,) = ctx.value.errors
+    assert isinstance(error, IncompleteAssignmentInvalid)
+    assert len(error.targets) == 2
+    assert error.sources == ['x']
+    assert "contend for the same sources ['x']" in str(error)
+
+
+def test_assign_missing_required_reports_targets():
+    schema = Schema(Assign({Required('a'): int, Required('b'): int}))
+    with pytest.raises(MultipleInvalid) as ctx:
+        schema({'a': 1})
+    (error,) = ctx.value.errors
+    assert isinstance(error, IncompleteAssignmentInvalid)
+    assert [str(target) for target in error.targets] == ['b']
+    assert error.sources == []
+
+
+def test_assign_contention_is_order_independent():
+    def make_schema(reverse):
+        keys = [Required('a'), Required('b'), Required('c')]
+        if reverse:
+            keys.reverse()
+        return Schema(Assign({key: int for key in keys}))
+
+    messages = []
+    for reverse in (False, True):
+        with pytest.raises(MultipleInvalid) as ctx:
+            make_schema(reverse)({'a': 1})
+        messages.append(str(ctx.value.errors[0]))
+    assert messages[0] == messages[1]
+
+
+def test_assign_defaults_and_extra_modes():
+    schema = Schema(Assign({Optional('a', default='3'): Coerce(int)}))
+    assert schema({}) == {'a': 3}
+
+    schema = Schema(Assign({Required('a'): int}), extra=ALLOW_EXTRA)
+    assert schema({'a': 1, 'b': 'x'}) == {'a': 1, 'b': 'x'}
+
+    schema = Schema(Assign({Required('a'): int}), extra=REMOVE_EXTRA)
+    assert schema({'a': 1, 'b': 'x'}) == {'a': 1}
+
+    schema = Schema(Assign({Required('a'): int, Extra: str}))
+    assert schema({'a': 1, 'b': 'x'}) == {'a': 1, 'b': 'x'}
+
+    schema = Schema(Assign({Required('a'): int}))
+    with pytest.raises(MultipleInvalid) as ctx:
+        schema({'a': 1, 'b': 'x'})
+    assert 'extra keys not allowed' in str(ctx.value)
+
+
+def test_assign_value_error_after_assignment():
+    schema = Schema(Assign({Required('a'): Coerce(int)}))
+    with pytest.raises(MultipleInvalid) as ctx:
+        schema({'a': 'not-a-number'})
+    assert 'expected int' in str(ctx.value)
+
+
+def test_assign_remove_marker():
+    schema = Schema(Assign({Remove('secret'): object, Required('a'): int}))
+    assert schema({'a': 1, 'secret': 'x'}) == {'a': 1}
+
+
+def test_assign_requires_dict():
+    schema = Schema(Assign({Required('a'): int}))
+    with pytest.raises(MultipleInvalid) as ctx:
+        schema(['a'])
+    assert 'expected a dictionary' in str(ctx.value)
+
+
+def test_assign_nested():
+    schema = Schema({'row': Assign({Required('a'): Coerce(int)})})
+    assert schema({'row': {'a': '1'}}) == {'row': {'a': 1}}

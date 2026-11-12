@@ -94,6 +94,34 @@ class RequiredFieldInvalid(Invalid):
     """Required field was missing."""
 
 
+class AssignmentInvalid(Invalid):
+    """Base class for whole-row column assignment failures.
+
+    :attr targets: The schema keys (target columns) involved in the failure.
+    :attr sources: The original data keys (source columns) involved in the
+        failure.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        path: typing.Optional[typing.List[typing.Hashable]] = None,
+        targets: typing.Optional[typing.List[typing.Hashable]] = None,
+        sources: typing.Optional[typing.List[typing.Hashable]] = None,
+    ) -> None:
+        super(AssignmentInvalid, self).__init__(message, path)
+        self.targets = targets or []
+        self.sources = sources or []
+
+
+class AmbiguousAssignmentInvalid(AssignmentInvalid):
+    """More than one equally prioritised column assignment exists."""
+
+
+class IncompleteAssignmentInvalid(AssignmentInvalid):
+    """No complete column assignment exists."""
+
+
 class ObjectInvalid(Invalid):
     """The value we found was not an object."""
 
