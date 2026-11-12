@@ -14,7 +14,13 @@ sys.path.insert(0, str(this_dir))
 sys.path.insert(0, str(this_dir.parent))
 
 from probables import CountingCuckooFilter, CuckooFilterFullError  # noqa: E402
-from tests.utilities import calc_file_md5  # noqa: E402
+from probables.cuckoo.countingcuckoo import CountingCuckooBin  # noqa: E402
+from tests.utilities import (  # noqa: E402
+    calc_file_md5,
+    find_unpaired_kicks,
+    reconcile_counting_cuckoo,
+    trace_cuckoo_writes,
+)
 
 DELETE_TEMP_FILES = True
 
@@ -464,6 +470,240 @@ class TestCuckooFilterErrorRate(unittest.TestCase):
         self.assertTrue(cko.check("this is a test"))
         self.assertFalse(cko.check("this is another test"))
         self.assertTrue(cko.check("this is yet another test"))
+
+
+class TestCountingCuckooFilterWriteRegression(unittest.TestCase):
+    """replayable write regression for the counting event dedup table
+
+    Every test replays a fixed event stream (each event arriving a fixed
+    number of times) into a tiny filter so that a new event is kicked
+    several times, wraps back to an already visited bucket, and still does
+    not fit; the three paths (expansion forbidden, expansion succeeds,
+    expansion interrupted) must each leave exactly the last committed state,
+    including the per-fingerprint arrival counts"""
+
+    SEED = 0
+    CAPACITY = 4
+    BUCKET_SIZE = 2
+    MAX_SWAPS = 5  # more swaps than buckets guarantees the kick path wraps around
+    FINGER_SIZE = 1
+
+    def setUp(self):
+        self.addCleanup(random.setstate, random.getstate())
+
+    def _new_filter(self, auto_expand):
+        return CountingCuckooFilter(
+            capacity=self.CAPACITY,
+            bucket_size=self.BUCKET_SIZE,
+            max_swaps=self.MAX_SWAPS,
+            auto_expand=auto_expand,
+            finger_size=self.FINGER_SIZE,
+        )
+
+    @staticmethod
+    def _arrivals(idx):
+        """deterministic arrival count for the idx-th event"""
+        return (idx + 1) % 3 + 1
+
+    def _fill_until_full(self):
+        """replay the fixed event stream until an insert fails
+
+        Returns the filter, the confirmed-event ledger (fingerprint ->
+        committed arrival count, where truly colliding keys merge into one
+        observation unit), the committed keys in arrival order, and the
+        event that did not fit"""
+        random.seed(self.SEED)
+        cko = self._new_filter(auto_expand=False)
+        ledger = {}
+        keys = []
+        idx = 0
+        while True:
+            key = f"event-{idx:04d}"
+            arrivals = self._arrivals(idx)
+            idx += 1
+            _, _, fingerprint = cko._generate_fingerprint_info(key)
+            try:
+                for _ in range(arrivals):
+                    cko.add(key)
+            except CuckooFilterFullError:
+                return cko, ledger, keys, key
+            ledger[fingerprint] = ledger.get(fingerprint, 0) + arrivals
+            keys.append(key)
+
+    def _replay_committed(self, keys, auto_expand):
+        """replay the confirmed event stream into a fresh filter"""
+        random.seed(self.SEED)
+        cko = self._new_filter(auto_expand=auto_expand)
+        for idx, key in enumerate(keys):
+            for _ in range(self._arrivals(idx)):
+                cko.add(key)
+        return cko
+
+    def _assert_ledger_committed(self, cko, ledger):
+        """every committed observation unit is present once, with its count"""
+        self.assertEqual(len(ledger), cko.unique_elements)
+        self.assertEqual(sum(ledger.values()), cko.elements_added)
+        anomalies = reconcile_counting_cuckoo(ledger, cko.buckets)
+        self.assertEqual({"missing": [], "foreign": [], "duplicate": [], "count_drift": []}, anomalies)
+
+    def test_failed_insert_multi_kick_wraparound_rolls_back(self):
+        """expansion forbidden: every kicked bin is rolled back, counts intact"""
+        cko, ledger, _, key = self._fill_until_full()
+        _, _, fingerprint = cko._generate_fingerprint_info(key)
+        self.assertNotIn(fingerprint, ledger)  # the new event is a new observation unit
+        snapshot = [[(b.finger, b.count) for b in bucket] for bucket in cko.buckets]
+        trace = trace_cuckoo_writes(cko)
+
+        self.assertRaises(CuckooFilterFullError, cko.add, key)
+
+        kicks = trace[: self.MAX_SWAPS]
+        self.assertEqual(self.MAX_SWAPS, len(kicks))  # multiple kicks happened
+        visited = [idx for idx, _, _, _ in kicks]
+        self.assertLess(len(set(visited)), len(visited))  # the path wrapped back to a bucket
+        self.assertEqual([], find_unpaired_kicks(trace, self.MAX_SWAPS))  # no kick rollback lost
+        after = [[(b.finger, b.count) for b in bucket] for bucket in cko.buckets]
+        self.assertEqual(snapshot, after)
+        self._assert_ledger_committed(cko, ledger)
+
+    def test_failed_insert_next_event_sees_committed_state(self):
+        """the event after a failure observes the last committed counts"""
+        cko, ledger, keys, key = self._fill_until_full()
+        self.assertRaises(CuckooFilterFullError, cko.add, key)
+
+        _, _, fingerprint = cko._generate_fingerprint_info(keys[0])
+        committed = ledger[fingerprint]
+        cko.add(keys[0])  # a repeat arrival increments exactly once
+        ledger[fingerprint] = committed + 1
+        self.assertEqual(committed + 1, cko.check(keys[0]))
+        self._assert_ledger_committed(cko, ledger)
+
+    def test_expand_success_commits_whole_ledger(self):
+        """expansion succeeds: all committed fingerprints migrate exactly once
+        and every arrival count is preserved"""
+        _, ledger, keys, key = self._fill_until_full()
+        cko = self._replay_committed(keys, auto_expand=True)
+        trace = trace_cuckoo_writes(cko)
+
+        cko.add(key)
+        self.assertEqual(self.CAPACITY * 2, cko.capacity)
+
+        kicks = trace[: self.MAX_SWAPS]
+        self.assertEqual(self.MAX_SWAPS, len(kicks))
+        visited = [idx for idx, _, _, _ in kicks]
+        self.assertLess(len(set(visited)), len(visited))  # wrapped around before expanding
+        self.assertEqual([], find_unpaired_kicks(trace, self.MAX_SWAPS))
+
+        _, _, fingerprint = cko._generate_fingerprint_info(key)
+        ledger[fingerprint] = 1
+        self._assert_ledger_committed(cko, ledger)
+
+    def test_interrupted_expand_restores_committed_state(self):
+        """expansion interrupted mid-migration: membership and counts roll
+        back to the last committed state and the next event still commits"""
+        _, ledger, keys, key = self._fill_until_full()
+        cko = self._replay_committed(keys, auto_expand=True)
+        snapshot = [[(b.finger, b.count) for b in bucket] for bucket in cko.buckets]
+        capacity = self.CAPACITY
+
+        original = CountingCuckooFilter._insert_fingerprint_alt
+        migrations = []
+
+        def flaky_insert(self, fingerprint, idx_1, idx_2, count=1):
+            if self.capacity > capacity:
+                migrations.append(fingerprint)
+                if len(migrations) == 3:  # interrupt mid-migration
+                    raise RuntimeError("simulated expansion interruption")
+            return original(self, fingerprint, idx_1, idx_2, count)
+
+        CountingCuckooFilter._insert_fingerprint_alt = flaky_insert
+        try:
+            with self.assertRaises(RuntimeError) as ctx:
+                cko.add(key)
+        finally:
+            CountingCuckooFilter._insert_fingerprint_alt = original
+        self.assertEqual("simulated expansion interruption", str(ctx.exception))
+        self.assertEqual(3, len(migrations))  # the expansion really started
+
+        self.assertEqual(capacity, cko.capacity)
+        after = [[(b.finger, b.count) for b in bucket] for bucket in cko.buckets]
+        self.assertEqual(snapshot, after)
+        self._assert_ledger_committed(cko, ledger)
+
+        cko.add(key)  # the next event sees the committed state, then commits
+        _, _, fingerprint = cko._generate_fingerprint_info(key)
+        ledger[fingerprint] = 1
+        self.assertEqual(capacity * 2, cko.capacity)
+        self._assert_ledger_committed(cko, ledger)
+
+    def test_true_collision_merges_observation_unit(self):
+        """keys that truly collide on a fingerprint share one arrival count"""
+        cko = CountingCuckooFilter(finger_size=1)
+        seen = {}
+        pair = None
+        fingerprint = None
+        for i in range(300):
+            candidate = f"collision-{i:04d}"
+            _, _, fingerprint = cko._generate_fingerprint_info(candidate)
+            if fingerprint in seen:
+                pair = (seen[fingerprint], candidate)
+                break
+            seen[fingerprint] = candidate
+        self.assertIsNotNone(pair)
+
+        cko.add(pair[0])
+        cko.add(pair[0])
+        cko.add(pair[1])  # same fingerprint: merged into the same unit
+        self.assertEqual(1, cko.unique_elements)
+        self.assertEqual(3, cko.elements_added)
+        self.assertEqual(3, cko.check(pair[0]))
+        self.assertEqual(3, cko.check(pair[1]))
+        ledger = {fingerprint: 3}
+        anomalies = reconcile_counting_cuckoo(ledger, cko.buckets)
+        self.assertEqual({"missing": [], "foreign": [], "duplicate": [], "count_drift": []}, anomalies)
+
+    def test_reconcile_distinguishes_failure_modes(self):
+        """the ledger reconciliation separates a lost kick rollback, a
+        duplicate migration, and an unchanged membership with an extra count"""
+        # a lost kick rollback: a bin ends up holding a fingerprint that was
+        # never committed while the committed occupant is gone
+        cko, ledger, _, _ = self._fill_until_full()
+        occupant = cko.buckets[0][0].finger
+        novel = max(b.finger for bucket in cko.buckets for b in bucket) + 1
+        cko.buckets[0][0] = CountingCuckooBin(novel, 1)
+        anomalies = reconcile_counting_cuckoo(ledger, cko.buckets)
+        self.assertEqual([occupant], anomalies["missing"])
+        self.assertEqual([novel], anomalies["foreign"])
+        self.assertEqual([], anomalies["duplicate"])
+        self.assertEqual([], anomalies["count_drift"])
+
+        # a duplicate migration: a committed fingerprint lands in the table twice
+        cko = self._new_filter(auto_expand=False)
+        ledger = {}
+        for i in range(3):
+            key = f"dup-{i:04d}"
+            _, _, fingerprint = cko._generate_fingerprint_info(key)
+            cko.add(key)
+            ledger[fingerprint] = ledger.get(fingerprint, 0) + 1
+        target = next(bucket for bucket in cko.buckets if len(bucket) < cko.bucket_size)
+        target.append(CountingCuckooBin(next(iter(ledger)), 1))
+        anomalies = reconcile_counting_cuckoo(ledger, cko.buckets)
+        self.assertEqual([], anomalies["missing"])
+        self.assertEqual([], anomalies["foreign"])
+        self.assertEqual(1, len(anomalies["duplicate"]))
+        self.assertEqual([], anomalies["count_drift"])
+
+        # membership unchanged but a count was incremented once too many
+        cko, ledger, _, _ = self._fill_until_full()
+        drifted = next(iter(ledger))
+        for bucket in cko.buckets:
+            for ccb in bucket:
+                if ccb.finger == drifted:
+                    ccb.increment()
+        anomalies = reconcile_counting_cuckoo(ledger, cko.buckets)
+        self.assertEqual([], anomalies["missing"])
+        self.assertEqual([], anomalies["foreign"])
+        self.assertEqual([], anomalies["duplicate"])
+        self.assertEqual([drifted], anomalies["count_drift"])
 
 
 if __name__ == "__main__":
