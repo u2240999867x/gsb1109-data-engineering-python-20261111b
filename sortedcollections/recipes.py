@@ -9,6 +9,8 @@ from itertools import count
 from sortedcontainers import SortedDict, SortedKeyList, SortedSet
 from sortedcontainers.sortedlist import recursive_repr
 
+from .columnreconcile import reconcile_columns
+
 
 class IndexableDict(SortedDict):
     """Dictionary that supports numerical indexing.
@@ -265,6 +267,20 @@ class OrderedSet(abc.MutableSet, abc.Sequence):
         return f'{type(self).__name__}({list(self)!r})'
 
     __str__ = __repr__
+
+    @classmethod
+    def reconcile_columns(cls, old_fields, new_fields, candidates,
+                          templates=()):
+        """Reconcile old and new column orders across partial templates.
+
+        Delegates to the reconcile_columns function in
+        sortedcollections.columnreconcile. A claimed interpretation can be
+        wrapped in an OrderedSet to inspect the surviving column order, for
+        example ``OrderedSet(result.consistent[old_column])``.
+
+        """
+        return reconcile_columns(old_fields, new_fields, candidates,
+                                 templates)
 
 
 class SegmentList(SortedKeyList):

@@ -14,6 +14,8 @@ Features
 - NearestDict - Dictionary with nearest-key lookup.
 - OrderedDict - Ordered dictionary with numeric indexing support.
 - OrderedSet - Ordered set with numeric indexing support.
+- Column reconciliation - Consistent column-order migration across partial
+  templates with rename and split candidates.
 - IndexableDict - Dictionary with numeric indexing support.
 - IndexableSet - Set with numeric indexing support.
 - SegmentList - List with fast random access insertion and deletion.
@@ -53,6 +55,7 @@ Recipes
 - `Nearest Dictionary Recipe`_
 - `Ordered Dictionary Recipe`_
 - `Ordered Set Recipe`_
+- `Column Reconciliation Recipe`_
 - `Indexable Dictionary Recipe`_
 - `Indexable Set Recipe`_
 - `Segment List Recipe`_
@@ -62,6 +65,7 @@ Recipes
 .. _`Nearest Dictionary Recipe`: http://www.grantjenks.com/docs/sortedcollections/nearestdict.html
 .. _`Ordered Dictionary Recipe`: http://www.grantjenks.com/docs/sortedcollections/ordereddict.html
 .. _`Ordered Set Recipe`: http://www.grantjenks.com/docs/sortedcollections/orderedset.html
+.. _`Column Reconciliation Recipe`: http://www.grantjenks.com/docs/sortedcollections/columnreconcile.html
 .. _`Indexable Dictionary Recipe`: http://www.grantjenks.com/docs/sortedcollections/indexabledict.html
 .. _`Indexable Set Recipe`: http://www.grantjenks.com/docs/sortedcollections/indexableset.html
 .. _`Segment List Recipe`: http://www.grantjenks.com/docs/sortedcollections/segmentlist.html

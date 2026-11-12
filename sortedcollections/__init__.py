@@ -19,6 +19,12 @@ from sortedcontainers import (
     SortedSet,
 )
 
+from .columnreconcile import (
+    ColumnReconcileError,
+    ReconcileResult,
+    TemplateOrder,
+    reconcile_columns,
+)
 from .nearestdict import NearestDict
 from .ordereddict import OrderedDict
 from .recipes import (
@@ -31,18 +37,22 @@ from .recipes import (
 )
 
 __all__ = [
+    'ColumnReconcileError',
     'IndexableDict',
     'IndexableSet',
     'ItemSortedDict',
     'NearestDict',
     'OrderedDict',
     'OrderedSet',
+    'ReconcileResult',
     'SegmentList',
     'SortedDict',
     'SortedList',
     'SortedListWithKey',
     'SortedSet',
+    'TemplateOrder',
     'ValueSortedDict',
+    'reconcile_columns',
 ]
 
 __version__ = '2.1.0'

@@ -8,6 +8,7 @@
    nearestdict
    ordereddict
    orderedset
+   columnreconcile
    indexabledict
    indexableset
    segmentlist
