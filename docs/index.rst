@@ -15,6 +15,7 @@
    sortedlist
    sorteddict
    sortedset
+   sortedmultiset
    pycon-2016-talk
    sf-python-2015-lightning-talk
    djangocon-2015-lightning-talk

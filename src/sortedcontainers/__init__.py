@@ -52,6 +52,11 @@ from .sorteddict import (
     SortedValuesView,
 )
 from .sortedlist import SortedKeyList, SortedList, SortedListWithKey
+from .sortedmultiset import (
+    NegativeCountError,
+    SortedMultiset,
+    SortedMultisetView,
+)
 from .sortedset import SortedSet
 
 __all__ = [
@@ -63,6 +68,9 @@ __all__ = [
     'SortedItemsView',
     'SortedValuesView',
     'SortedSet',
+    'SortedMultiset',
+    'SortedMultisetView',
+    'NegativeCountError',
 ]
 
 __title__ = 'sortedcontainers'
