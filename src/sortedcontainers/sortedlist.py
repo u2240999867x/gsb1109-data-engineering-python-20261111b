@@ -18,6 +18,7 @@ Sorted list implementations:
 import sys
 import traceback
 from bisect import bisect_left, bisect_right, insort
+from collections import deque, namedtuple
 from collections.abc import MutableSequence, Sequence
 from functools import reduce
 from itertools import chain, repeat, starmap
@@ -25,6 +26,98 @@ from math import log
 from operator import add, eq, ge, gt, iadd, le, lt, ne
 from reprlib import recursive_repr
 from textwrap import dedent
+
+
+class ShardInterval(namedtuple('ShardInterval', 'start stop lower upper')):
+    """Half-open row interval covered by one shard.
+
+    ``start`` and ``stop`` are positions in the sorted list (``stop`` is
+    exclusive). ``lower`` and ``upper`` are the first and last values in the
+    interval. Every shard covers at least one whole business-key group, so
+    ``start`` is always strictly less than ``stop``.
+
+    """
+
+    __slots__ = ()
+
+    def __bool__(self):
+        return self.start < self.stop
+
+
+class ShardMigration(namedtuple('ShardMigration', 'source target rows row_ids')):
+    """Group of pre-existing rows that must move between workers.
+
+    ``rows`` are the values, ``row_ids`` their stable row numbers, all of them
+    owned by ``source`` and reassigned to ``target``.
+
+    """
+
+    __slots__ = ()
+
+
+class ShardPlan:
+    """Result of :func:`SortedList.split_plan`.
+
+    Attributes:
+
+    * ``shards`` -- tuple of :class:`ShardInterval`, one per requested shard
+      (every shard covers a non-empty row interval).
+    * ``loads`` -- tuple of row counts, aligned with ``shards``.
+    * ``migrations`` -- tuple of :class:`ShardMigration` holding only the
+      pre-existing rows whose owning worker changes.
+    * ``moved_count`` -- total number of pre-existing rows moved.
+    * ``source_version`` -- list version the plan was computed against.
+
+    A plan becomes stale as soon as the source list is mutated; check
+    :func:`is_current` before acting on it.
+
+    """
+
+    __slots__ = (
+        'shards',
+        'loads',
+        'migrations',
+        'moved_count',
+        'source_version',
+        '_sorted_list',
+    )
+
+    def __init__(
+        self, shards, loads, migrations, moved_count, source_version, sorted_list
+    ):
+        self.shards = tuple(shards)
+        self.loads = tuple(loads)
+        self.migrations = tuple(migrations)
+        self.moved_count = moved_count
+        self.source_version = source_version
+        self._sorted_list = sorted_list
+
+    @property
+    def shard_count(self):
+        "Number of shards in the plan."
+        return len(self.shards)
+
+    @property
+    def cuts(self):
+        "Exclusive row position at which each shard ends."
+        return tuple(shard.stop for shard in self.shards)
+
+    def is_current(self):
+        "Return ``True`` if the source list has not changed since planning."
+        return self._sorted_list.version == self.source_version
+
+    def __len__(self):
+        return len(self.shards)
+
+    def __iter__(self):
+        return iter(self.shards)
+
+    def __repr__(self):
+        return (
+            f'{type(self).__name__}(shards={self.shards!r}, '
+            f'loads={self.loads!r}, moved_count={self.moved_count!r}, '
+            f'current={self.is_current()!r})'
+        )
 
 
 class SortedList(MutableSequence):
@@ -111,9 +204,24 @@ class SortedList(MutableSequence):
         self._maxes = []
         self._index = []
         self._offset = 0
+        self._version = 0
 
         if iterable is not None:
             self._update(iterable)
+
+    @property
+    def version(self):
+        """Monotonic counter incremented on every structural mutation.
+
+        Shard plans record the version they were planned against so they can
+        detect that late inserts or deletes have made them stale.
+
+        """
+        return self._version
+
+    def _bump_version(self):
+        "Mark the list as changed, invalidating any outstanding plans."
+        self._version += 1
 
     def __new__(cls, iterable=None, key=None):
         """Create new sorted list or sorted-key list instance.
@@ -187,6 +295,7 @@ class SortedList(MutableSequence):
         del self._maxes[:]
         del self._index[:]
         self._offset = 0
+        self._bump_version()
 
     _clear = clear
 
@@ -224,6 +333,7 @@ class SortedList(MutableSequence):
             _maxes.append(value)
 
         self._len += 1
+        self._bump_version()
 
     def _expand(self, pos):
         """Split sublists with length greater than double the load-factor.
@@ -294,6 +404,7 @@ class SortedList(MutableSequence):
         _maxes.extend(sublist[-1] for sublist in _lists)
         self._len = len(values)
         del self._index[:]
+        self._bump_version()
 
     _update = update
 
@@ -419,6 +530,7 @@ class SortedList(MutableSequence):
 
         del _lists_pos[idx]
         self._len -= 1
+        self._bump_version()
 
         len_lists_pos = len(_lists_pos)
 
@@ -1512,6 +1624,345 @@ class SortedList(MutableSequence):
         """
         return f'{type(self).__name__}({list(self)!r})'
 
+    def _shard_key_stream(self):
+        "Yield the business key of every row in sorted order."
+        if hasattr(self, '_keys'):
+            return chain.from_iterable(self._keys)
+        return chain.from_iterable(self._lists)
+
+    def _shard_group_spans(self):
+        "Return ``(start, stop)`` row spans of rows sharing one business key."
+        spans = []
+        keys = self._shard_key_stream()
+        start = 0
+        previous = next(keys)
+        for position, key in enumerate(keys, start=1):
+            if key != previous:
+                spans.append((start, position))
+                start = position
+                previous = key
+        spans.append((start, self._len))
+        return spans
+
+    @staticmethod
+    def _shard_worker_prefixes(spans, workers):
+        """Prefix counts of each worker and of ownerless rows over groups."""
+        counts = {}
+        prefixes = {}
+        unowned_prefix = [0] * (len(spans) + 1)
+        for group_index, (start, stop) in enumerate(spans):
+            unowned = 0
+            owners = {}
+            for position in range(start, stop):
+                owner = workers[position]
+                if owner is None:
+                    unowned += 1
+                else:
+                    owners[owner] = owners.get(owner, 0) + 1
+            unowned_prefix[group_index + 1] = unowned_prefix[group_index] + unowned
+            for owner, count in owners.items():
+                prefix = prefixes.get(owner)
+                if prefix is None:
+                    prefix = [0] * (len(spans) + 1)
+                    prefixes[owner] = prefix
+                    counts[owner] = 0
+                counts[owner] += count
+                prefix[group_index + 1] = counts[owner]
+        for prefix in prefixes.values():
+            previous = 0
+            for index, value in enumerate(prefix):
+                if value == 0 and index:
+                    prefix[index] = previous
+                else:
+                    previous = value
+        return prefixes, unowned_prefix
+
+    @staticmethod
+    def _shard_min_max_load(group_sizes, group_prefix, shard_count):
+        """Smallest cap L for which shard_count non-empty shards are feasible.
+
+        Feasibility for a cap: greedily pack the maximum number of whole
+        key-coherent groups into each shard; the groups fit into at most
+        shard_count shards exactly when the greedy shard count is <= the
+        requested count (extra shards are always splittable because each
+        feasible shard holds whole groups).
+
+        """
+        low = max(group_sizes)
+        high = group_prefix[-1]
+
+        def greedy_shards(cap):
+            used = 1
+            current = 0
+            for size in group_sizes:
+                if current + size > cap:
+                    used += 1
+                    current = size
+                else:
+                    current += size
+            return used
+
+        while low < high:
+            middle = (low + high) >> 1
+            if greedy_shards(middle) <= shard_count:
+                high = middle
+            else:
+                low = middle + 1
+        return low
+
+    @staticmethod
+    def _shard_min_movement_cuts(
+        group_prefix,
+        shard_count,
+        max_load,
+        worker_prefixes,
+        unowned_prefix,
+        target_labels,
+    ):
+        """Pick cuts minimizing moved rows under the optimal load cap.
+
+        A backward DP stores, for shard ``k`` starting at group ``j``, the
+        cheapest way to cover the remaining groups with shards ``k`` ...
+        ``shard_count``. Rows without a previous owner never move, so for a
+        shard spanning groups ``[j, i)``::
+
+            owned = (P[i] - P[j]) - (U[i] - U[j])
+            moved = owned - (T[i] - T[j])
+            F[k][j] = -P[j] + U[j] + T[j]
+                      + min_i (F[k+1][i] + P[i] - U[i] - T[i])
+
+        where ``U`` counts ownerless rows and ``T`` rows already owned by the
+        target worker. The feasible ``i`` form a sliding window whose bounds
+        both advance with ``j``; a monotonic deque keeps the minimum weight in
+        linear time per layer. Forward reconstruction takes the smallest
+        feasible boundary at each shard, yielding the lexicographically
+        smallest tuple of cut points among optimal plans.
+
+        """
+        group_count = len(group_prefix) - 1
+        infinity = None
+        zeros = [0] * (group_count + 1)
+        next_cost = [infinity] * (group_count + 1)
+        next_cost[group_count] = 0
+        layer_costs = [None] * (shard_count + 2)
+        layer_costs[shard_count + 1] = next_cost
+
+        for k in range(shard_count, 0, -1):
+            target = target_labels[k - 1]
+            if worker_prefixes is None:
+                target_prefix = zeros
+            else:
+                target_prefix = worker_prefixes.get(target, zeros)
+
+            current_cost = [infinity] * (group_count + 1)
+            candidates = deque()
+            upper = 0
+            last_start = group_count - (shard_count - k + 1)
+
+            for j in range(0, last_start + 1):
+                limit = group_prefix[j] + max_load
+                while upper < group_count and group_prefix[upper + 1] <= limit:
+                    upper += 1
+                    index = upper
+                    if (
+                        index > j
+                        and next_cost[index] is not infinity
+                        and group_count - index >= shard_count - k
+                    ):
+                        weight = (
+                            next_cost[index]
+                            + group_prefix[index]
+                            - unowned_prefix[index]
+                            - target_prefix[index]
+                        )
+                        while candidates:
+                            back = candidates[-1]
+                            back_weight = (
+                                next_cost[back]
+                                + group_prefix[back]
+                                - unowned_prefix[back]
+                                - target_prefix[back]
+                            )
+                            if back_weight > weight:
+                                candidates.pop()
+                            else:
+                                break
+                        candidates.append(index)
+
+                while candidates and candidates[0] <= j:
+                    candidates.popleft()
+
+                if not candidates:
+                    continue
+
+                best = candidates[0]
+                segment_rows = group_prefix[best] - group_prefix[j]
+                segment_unowned = unowned_prefix[best] - unowned_prefix[j]
+                staying = target_prefix[best] - target_prefix[j]
+                current_cost[j] = (
+                    next_cost[best] + segment_rows - segment_unowned - staying
+                )
+
+            next_cost = current_cost
+            layer_costs[k] = current_cost
+
+        if layer_costs[1][0] is infinity:
+            raise ValueError('no feasible shard plan respects the maximum shard load')
+
+        boundaries = [0] * (shard_count + 1)
+        start = 0
+        for k in range(1, shard_count + 1):
+            target = target_labels[k - 1]
+            if worker_prefixes is None:
+                target_prefix = zeros
+            else:
+                target_prefix = worker_prefixes.get(target, zeros)
+            costs = layer_costs[k + 1]
+            chosen = None
+            for index in range(start + 1, group_count + 1):
+                if group_prefix[index] - group_prefix[start] > max_load:
+                    break
+                if costs[index] is infinity:
+                    continue
+                segment_rows = group_prefix[index] - group_prefix[start]
+                segment_unowned = unowned_prefix[index] - unowned_prefix[start]
+                staying = target_prefix[index] - target_prefix[start]
+                total = costs[index] + segment_rows - segment_unowned - staying
+                if total == layer_costs[k][start]:
+                    chosen = index
+                    break
+            boundaries[k] = chosen
+            start = chosen
+        return boundaries
+
+    def split_plan(self, shard_count, workers=None, row_ids=None, target_workers=None):
+        """Plan ``shard_count`` non-empty, key-coherent row shards.
+
+        Cut points may only fall between rows with different business keys so
+        rows sharing a key always land on the same shard. Among every feasible
+        plan the optimizer chooses, in order:
+
+        1. the plan whose busiest shard holds the fewest rows (balanced load),
+        2. among equally balanced plans, the one moving the fewest pre-existing
+           rows between workers,
+        3. among remaining ties, the lexicographically smallest tuple of cut
+           points, i.e. the declared shard order decides.
+
+        :param int shard_count: number of non-empty shards, at most the number
+            of distinct business keys (and rows).
+        :param workers: optional per-row owner of each pre-existing row;
+            ``None`` entries mark rows without a previous owner (late inserts).
+        :param row_ids: optional stable per-row identifiers; defaults to the
+            row positions ``range(n)``.
+        :param target_workers: optional labels of the workers owning shard ``s``
+            in the new plan; defaults to the shard index ``s``.
+        :return: :class:`ShardPlan`
+        :raises ValueError: if ``shard_count`` is out of range or an input does
+            not match the list length.
+
+        """
+        if not isinstance(shard_count, int) or isinstance(shard_count, bool):
+            raise TypeError('shard_count must be an integer')
+
+        total = self._len
+        if shard_count < 1:
+            raise ValueError('shard_count must be at least 1')
+        if shard_count > total:
+            raise ValueError(
+                f'shard_count cannot exceed the number of rows: {shard_count} > {total}'
+            )
+        if workers is not None and len(workers) != total:
+            raise ValueError('workers must have one entry per row')
+        if row_ids is not None and len(row_ids) != total:
+            raise ValueError('row_ids must have one entry per row')
+        if target_workers is not None and len(target_workers) != shard_count:
+            raise ValueError('target_workers must have one label per shard')
+
+        spans = self._shard_group_spans()
+        group_count = len(spans)
+        if shard_count > group_count:
+            raise ValueError(
+                'shard_count cannot exceed the number of distinct business '
+                f'keys: {shard_count} > {group_count}'
+            )
+
+        group_sizes = [stop - start for start, stop in spans]
+        group_prefix = [0]
+        for size in group_sizes:
+            group_prefix.append(group_prefix[-1] + size)
+
+        if workers is None:
+            worker_prefixes = None
+            unowned_prefix = [0] * (group_count + 1)
+        else:
+            worker_prefixes, unowned_prefix = self._shard_worker_prefixes(
+                spans, workers
+            )
+
+        if target_workers is None:
+            target_labels = tuple(range(shard_count))
+        else:
+            target_labels = tuple(target_workers)
+
+        if shard_count == group_count:
+            boundaries = list(range(group_count + 1))
+        else:
+            max_load = self._shard_min_max_load(group_sizes, group_prefix, shard_count)
+            boundaries = self._shard_min_movement_cuts(
+                group_prefix,
+                shard_count,
+                max_load,
+                worker_prefixes,
+                unowned_prefix,
+                target_labels,
+            )
+
+        if row_ids is None:
+            row_ids = range(total)
+
+        shards = []
+        loads = []
+        migrations = []
+        moved_count = 0
+
+        for shard_index in range(shard_count):
+            first_group = boundaries[shard_index]
+            last_group = boundaries[shard_index + 1] - 1
+            start = spans[first_group][0]
+            stop = spans[last_group][1]
+            values = self[start:stop]
+            shards.append(ShardInterval(start, stop, values[0], values[-1]))
+            loads.append(stop - start)
+
+            if workers is None:
+                continue
+
+            target = target_labels[shard_index]
+            moving = {}
+            for offset in range(stop - start):
+                owner = workers[start + offset]
+                if owner is None or owner == target:
+                    continue
+                group = moving.get(owner)
+                if group is None:
+                    group = ([], [])
+                    moving[owner] = group
+                group[0].append(values[offset])
+                group[1].append(row_ids[start + offset])
+
+            for source, (rows, ids) in moving.items():
+                migrations.append(ShardMigration(source, target, rows, ids))
+                moved_count += len(rows)
+
+        return ShardPlan(
+            shards,
+            loads,
+            migrations,
+            moved_count,
+            self._version,
+            self,
+        )
+
     def _check(self):
         """Check invariants of sorted list.
 
@@ -1649,6 +2100,7 @@ class SortedKeyList(SortedList):
         self._maxes = []
         self._index = []
         self._offset = 0
+        self._version = 0
 
         if iterable is not None:
             self._update(iterable)
@@ -1672,6 +2124,7 @@ class SortedKeyList(SortedList):
         del self._keys[:]
         del self._maxes[:]
         del self._index[:]
+        self._bump_version()
 
     _clear = clear
 
@@ -1717,6 +2170,7 @@ class SortedKeyList(SortedList):
             _maxes.append(key)
 
         self._len += 1
+        self._bump_version()
 
     def _expand(self, pos):
         """Split sublists with length greater than double the load-factor.
@@ -1795,6 +2249,7 @@ class SortedKeyList(SortedList):
         _maxes.extend(sublist[-1] for sublist in _keys)
         self._len = len(values)
         del self._index[:]
+        self._bump_version()
 
     _update = update
 
@@ -1970,6 +2425,7 @@ class SortedKeyList(SortedList):
         del keys_pos[idx]
         del lists_pos[idx]
         self._len -= 1
+        self._bump_version()
 
         len_keys_pos = len(keys_pos)
 

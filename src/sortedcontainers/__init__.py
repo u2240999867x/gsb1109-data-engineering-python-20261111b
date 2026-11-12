@@ -51,7 +51,14 @@ from .sorteddict import (
     SortedKeysView,
     SortedValuesView,
 )
-from .sortedlist import SortedKeyList, SortedList, SortedListWithKey
+from .sortedlist import (
+    ShardInterval,
+    ShardMigration,
+    ShardPlan,
+    SortedKeyList,
+    SortedList,
+    SortedListWithKey,
+)
 from .sortedset import SortedSet
 
 __all__ = [
@@ -63,6 +70,9 @@ __all__ = [
     'SortedItemsView',
     'SortedValuesView',
     'SortedSet',
+    'ShardPlan',
+    'ShardInterval',
+    'ShardMigration',
 ]
 
 __title__ = 'sortedcontainers'

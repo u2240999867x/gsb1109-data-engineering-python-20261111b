@@ -37,6 +37,8 @@ SortedList
    .. automethod:: __gt__
    .. automethod:: __ge__
    .. automethod:: copy
+   .. automethod:: split_plan
+   .. autoattribute:: version
    .. automethod:: __len__
    .. automethod:: __repr__
    .. automethod:: _check
@@ -46,6 +48,19 @@ SortedList
    .. automethod:: insert
    .. automethod:: reverse
    .. automethod:: __setitem__
+
+
+Shard Plans
+...........
+
+.. autoclass:: sortedcontainers.ShardPlan
+   :members:
+
+.. autoclass:: sortedcontainers.ShardInterval
+   :members:
+
+.. autoclass:: sortedcontainers.ShardMigration
+   :members:
 
 
 SortedKeyList
