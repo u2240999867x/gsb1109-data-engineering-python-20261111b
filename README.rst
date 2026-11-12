@@ -111,6 +111,36 @@ Tables
     >>> table.all()
     [{'value': True}]
 
+Unique Constraints
+==================
+
+A table can declare unique constraints on one or more fields, e.g. an
+external identity composed of a source and a number. ``insert``,
+``insert_multiple``, ``update``, ``update_multiple`` and ``upsert`` all
+enforce them:
+
+.. code-block:: python
+
+    >>> table.declare_unique_constraint('source', 'number')
+    >>> table.insert({'source': 'erp', 'number': 'A-1'})
+    >>> table.insert({'source': 'erp', 'number': 'A-1'})
+    Traceback (most recent call last):
+    ...
+    tinydb.table.UniqueConstraintError: Unique constraint on fields \
+('source', 'number') violated: key ('erp', 'A-1') is already held by \
+document 1; rejected batch entry at position 0 (document ID 2)
+
+Constraints are checked against the final state of a write operation, so
+a single batch may swap the values of two documents as long as the end
+result is unique. If the final state violates a constraint, a
+``UniqueConstraintError`` is raised -- pointing at the existing document
+and the batch position of the rejected entry -- and the whole batch is
+aborted without anything being written.
+
+Note that enforcement happens in-process for a single, controlled
+writer. It is *not* a multi-process transaction mechanism: concurrent
+writers accessing the same database file can bypass the checks.
+
 Using Middlewares
 =================
 

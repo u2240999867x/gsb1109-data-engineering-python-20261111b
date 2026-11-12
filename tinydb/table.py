@@ -4,6 +4,7 @@ data in TinyDB.
 """
 
 from collections.abc import Callable, Iterable, Iterator, Mapping, MutableMapping
+from copy import deepcopy
 from typing import (
     NoReturn,
     Optional,
@@ -16,7 +17,54 @@ from .queries import QueryLike
 from .storages import Storage
 from .utils import LRUCache
 
-__all__ = ('Document', 'Table')
+__all__ = ('Document', 'Table', 'UniqueConstraintError')
+
+
+class UniqueConstraintError(ValueError):
+    """
+    Raised when a write operation would violate a declared unique constraint.
+
+    The error describes the conflict in detail:
+
+    - ``fields``: the field names of the violated constraint,
+    - ``key``: the conflicting field values,
+    - ``existing_doc_id`` / ``existing_document``: the document that is
+      already stored (or the earlier batch entry) holding the key,
+    - ``offending_doc_id``: the document ID of the rejected batch entry,
+    - ``batch_position``: the zero-based position of the rejected entry
+      within the current batch (``None`` if it was not part of a batch).
+
+    When this error is raised, the offending write operation has been
+    aborted as a whole: nothing from the batch was written to the storage.
+    """
+
+    def __init__(
+        self,
+        fields: tuple,
+        key: tuple,
+        existing_doc_id,
+        existing_document: Mapping,
+        offending_doc_id=None,
+        batch_position: Optional[int] = None,
+    ):
+        self.fields = fields
+        self.key = key
+        self.existing_doc_id = existing_doc_id
+        self.existing_document = existing_document
+        self.offending_doc_id = offending_doc_id
+        self.batch_position = batch_position
+
+        message = (
+            f'Unique constraint on fields {fields!r} violated: '
+            f'key {key!r} is already held by document '
+            f'{existing_doc_id!r}'
+        )
+        if batch_position is not None:
+            message += f'; rejected batch entry at position {batch_position}'
+        if offending_doc_id is not None:
+            message += f' (document ID {offending_doc_id!r})'
+
+        super().__init__(message)
 
 
 class Document(dict):
@@ -107,6 +155,8 @@ class Table:
         self._query_cache: LRUCache[QueryLike, list[Document]] \
             = self.query_cache_class(capacity=cache_size)
 
+        self._unique_constraints: list[tuple[str, ...]] = []
+
         self._next_id: Optional[int] = None
         # Only persist a brand-new empty table. Never clear existing documents
         # when reopen/construct with persist_empty=True (see issue #636).
@@ -135,6 +185,131 @@ class Table:
         Get the table storage instance.
         """
         return self._storage
+
+    @property
+    def unique_constraints(self) -> tuple[tuple[str, ...], ...]:
+        """
+        Get the unique constraints declared for this table.
+        """
+        return tuple(self._unique_constraints)
+
+    def declare_unique_constraint(self, *fields: str) -> None:
+        """
+        Declare a unique constraint on the given field(s).
+
+        Once declared, every write operation (``insert``,
+        ``insert_multiple``, ``update``, ``update_multiple`` and
+        ``upsert``) makes sure that no two documents share the same
+        combination of values for these fields. A constraint may span
+        multiple fields to model composite identities, e.g. an external
+        identity composed of ``source`` and ``number``::
+
+            table.declare_unique_constraint('source', 'number')
+
+        Constraints are validated against the *final* state of a write
+        operation, not after every single document. This means a batch
+        that swaps the values of two documents is accepted as long as the
+        end result is unique. If the final state violates a constraint,
+        a :class:`UniqueConstraintError` is raised and the whole batch is
+        aborted: nothing is written to the storage.
+
+        Documents that lack at least one of the constrained fields are
+        not subject to the constraint (similar to SQL ``NULL`` handling).
+
+        .. admonition:: Scope of the guarantee
+
+            Enforcement happens in this process, at the moment the table
+            data is written. It protects a single, controlled writer --
+            it is *not* a multi-process transaction mechanism. If
+            multiple processes or uncoordinated writers access the same
+            database file, constraints can be bypassed between a read
+            and the corresponding write.
+
+        :param fields: one or more field names that must be unique
+                       together
+        """
+        if not fields:
+            raise ValueError('A unique constraint needs at least one field')
+        if not all(isinstance(field, str) for field in fields):
+            raise ValueError('Unique constraint fields must be strings')
+        if len(set(fields)) != len(fields):
+            raise ValueError(
+                f'Duplicate field in unique constraint: {fields!r}'
+            )
+
+        constraint = tuple(fields)
+        if constraint in self._unique_constraints:
+            raise ValueError(
+                f'Unique constraint already declared: {constraint!r}'
+            )
+
+        self._unique_constraints.append(constraint)
+
+    def _check_unique_constraints(
+        self,
+        table: dict,
+        batch_order: Optional[list] = None,
+    ) -> None:
+        """
+        Validate the final state of a table against all unique constraints.
+
+        ``batch_order`` lists the document IDs touched by the current
+        write operation in batch order; it is used to report the batch
+        position of a rejected entry. Raises :class:`UniqueConstraintError`
+        on the first conflict found.
+        """
+        if not self._unique_constraints:
+            return
+
+        positions: dict = {}
+        if batch_order:
+            for index, doc_id in enumerate(batch_order):
+                positions.setdefault(doc_id, index)
+
+        for fields in self._unique_constraints:
+            seen: dict = {}
+            for doc_id, doc in table.items():
+                if any(field not in doc for field in fields):
+                    # Documents missing a constrained field are exempt
+                    continue
+
+                key = tuple(doc[field] for field in fields)
+                if key not in seen:
+                    seen[key] = doc_id
+                    continue
+
+                # Conflict between ``first_id`` (seen earlier) and
+                # ``doc_id``. Prefer blaming a batch entry so the error
+                # can point at the batch position; the other document is
+                # reported as the already-existing one.
+                first_id = seen[key]
+                first_pos = positions.get(first_id)
+                second_pos = positions.get(doc_id)
+
+                if first_pos is None and second_pos is None:
+                    existing_id, offending_id, batch_pos = \
+                        first_id, doc_id, None
+                elif first_pos is None:
+                    existing_id, offending_id, batch_pos = \
+                        first_id, doc_id, second_pos
+                elif second_pos is None:
+                    existing_id, offending_id, batch_pos = \
+                        doc_id, first_id, first_pos
+                elif first_pos <= second_pos:
+                    existing_id, offending_id, batch_pos = \
+                        first_id, doc_id, second_pos
+                else:
+                    existing_id, offending_id, batch_pos = \
+                        doc_id, first_id, first_pos
+
+                raise UniqueConstraintError(
+                    fields=fields,
+                    key=key,
+                    existing_doc_id=existing_id,
+                    existing_document=table[existing_id],
+                    offending_doc_id=offending_id,
+                    batch_position=batch_pos,
+                )
 
     def insert(self, document: Mapping) -> int:
         """
@@ -172,7 +347,7 @@ class Table:
             table[doc_id] = dict(document)
 
         # See below for details on ``Table._update``
-        self._update_table(updater)
+        self._update_table(updater, [doc_id])
 
         return doc_id
 
@@ -228,7 +403,7 @@ class Table:
                 table[doc_id] = dict(document)
 
         # See below for details on ``Table._update``
-        self._update_table(updater)
+        self._update_table(updater, doc_ids)
 
         return doc_ids
 
@@ -476,7 +651,7 @@ class Table:
                     perform_update(table, doc_id)
 
             # Perform the update operation (see _update_table for details)
-            self._update_table(updater)
+            self._update_table(updater, updated_ids)
 
             return updated_ids
 
@@ -505,7 +680,7 @@ class Table:
                         perform_update(table, doc_id)
 
             # Perform the update operation (see _update_table for details)
-            self._update_table(updater)
+            self._update_table(updater, updated_ids)
 
             return updated_ids
 
@@ -524,7 +699,7 @@ class Table:
                     perform_update(table, doc_id)
 
             # Perform the update operation (see _update_table for details)
-            self._update_table(updater)
+            self._update_table(updater, updated_ids)
 
             return updated_ids
 
@@ -576,7 +751,7 @@ class Table:
                         perform_update(fields, table, doc_id)
 
         # Perform the update operation (see _update_table for details)
-        self._update_table(updater)
+        self._update_table(updater, updated_ids)
 
         return updated_ids
 
@@ -801,7 +976,11 @@ class Table:
 
         return table
 
-    def _update_table(self, updater: Callable[[dict[int, Mapping]], None]):
+    def _update_table(
+        self,
+        updater: Callable[[dict[int, Mapping]], None],
+        batch_order: Optional[list] = None,
+    ):
         """
         Perform a table update operation.
 
@@ -813,6 +992,11 @@ class Table:
 
         As a further optimization, we don't convert the documents into the
         document class, as the table data will *not* be returned to the user.
+
+        ``batch_order`` lists the document IDs touched by this operation in
+        batch order. Before anything is written back, the final table state
+        is validated against the declared unique constraints; a violation
+        aborts the whole operation and nothing is written to the storage.
         """
 
         tables = self._storage.read()
@@ -831,13 +1015,32 @@ class Table:
         # This is required as the rest of TinyDB expects the document IDs
         # to be an instance of ``self.document_id_class`` but the storage
         # might convert dict keys to strings.
-        table = {
-            self.document_id_class(doc_id): doc
-            for doc_id, doc in raw_table.items()
-        }
+        if self._unique_constraints:
+            # Work on a deep copy of the documents: updaters may mutate
+            # documents in place, and if the unique constraint validation
+            # below fails, the storage must remain untouched so the whole
+            # batch is really aborted (some storages, e.g. MemoryStorage,
+            # hand out their internal data structures on read).
+            table = {
+                self.document_id_class(doc_id): deepcopy(doc)
+                for doc_id, doc in raw_table.items()
+            }
+        else:
+            table = {
+                self.document_id_class(doc_id): doc
+                for doc_id, doc in raw_table.items()
+            }
 
         # Perform the table update operation
         updater(table)
+
+        # Validate the *final* table state against the declared unique
+        # constraints. Checking only the end state (instead of every
+        # intermediate step) allows batches that temporarily violate a
+        # constraint, e.g. when two documents swap values. If validation
+        # fails, an exception is raised before anything is written back,
+        # so the whole batch is aborted atomically.
+        self._check_unique_constraints(table, batch_order)
 
         # Convert the document IDs back to strings.
         # This is required as some storages (most notably the JSON file format)
