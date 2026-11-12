@@ -461,6 +461,125 @@ This example attaches the ``books.db`` database under the alias ``books`` and th
 .. note::
     In Python: :ref:`db.attach() <python_api_attach>`
 
+.. _cli_export_readonly:
+
+Read-only, auditable exports
+============================
+
+The ``sqlite-utils export-readonly`` command runs a batch of report SQL and
+publishes the results together with a manifest of every source table column
+the reports actually read. It is designed for exporting traceable, read-only
+datasets from databases you do not control.
+
+Every statement is validated through a SQLite `authorizer callback
+<https://www.sqlite.org/c3ref/set_authorizer.html>`_ before any statement in
+the batch runs for real. The authorizer:
+
+- refuses write statements (``INSERT``, ``UPDATE``, ``DELETE``), DDL
+  (``CREATE``/``DROP``/``ALTER``), transaction control (``BEGIN``,
+  ``SAVEPOINT``) and ``ATTACH``/``DETACH``
+- only permits reads of tables and columns listed in the policy, including
+  columns reached through views and CTEs
+- only permits SQL functions explicitly registered as allowed pure functions
+- records the exact table, column and nesting view for every read, including
+  views nested two levels deep and same-named tables in attached databases
+
+If anything in the batch is refused, or an attached source cannot certify its
+required version, no output file is written - the batch is never published as
+a partial, pseudo-consistent result.
+
+Declaring the policy
+--------------------
+
+The policy is a JSON object. Columns are keyed by table, or by
+``schema.table`` for attached databases, and the version block tells the
+exporter how to prove which version each attached source is::
+
+    {
+      "allowed_columns": {
+        "orders": ["id", "customer_id", "amount"],
+        "v_orders": ["order_id", "customer", "amount"],
+        "dim.customers": ["id", "name", "tier"],
+        "dim.meta": ["key", "value"]
+      },
+      "allowed_functions": ["count", "tax"],
+      "versions": {
+        "dim": {
+          "expected": "2026-Q4",
+          "query": "SELECT value FROM dim.meta WHERE key = 'version'"
+        }
+      }
+    }
+
+The version ``query`` must return one row with one column: the actual version
+of that schema. The export is refused when that value does not equal
+``expected``. An attached database without a version block cannot be
+certified and fails closed.
+
+Custom pure functions are registered with ``--functions`` exactly as for
+``query``, and then named in ``allowed_functions``. Built-in functions such as
+``count`` must also be listed if the reports use them.
+
+Running an export
+-----------------
+
+.. code-block:: bash
+
+    sqlite-utils export-readonly reports.db \
+        --attach dim dim.db \
+        --policy policy.json \
+        --functions functions.py \
+        --sql-file reports.sql \
+        --manifest manifest.json \
+        -o export.json
+
+The SQL can also be passed directly as an argument, or as ``-`` to read it
+from standard input. ``--allow-column DATABASE TABLE COLUMN``,
+``--allow-function NAME`` and
+``--source-version SCHEMA EXPECTED VERSION_QUERY`` let you declare the policy
+on the command line instead of, or in addition to, a ``--policy`` file.
+
+The output envelope contains the rows and per-report manifest, while
+``--manifest`` writes the manifest on its own, without the rows::
+
+    {
+      "reports": [
+        {
+          "index": 1,
+          "sql": "SELECT * FROM v_orders",
+          "columns_read": [
+            {"database": "main", "table": "orders", "column": "amount",
+             "via": ["v_orders"]},
+            {"database": "dim", "table": "customers", "column": "name",
+             "via": ["v_orders", "v_customers"]}
+          ],
+          "tables_read": [
+            {"database": "main", "name": "orders", "kind": "table"},
+            {"database": "main", "name": "v_orders", "kind": "view"}
+          ],
+          "functions_used": [{"name": "count"}],
+          "pragmas_used": [],
+          "rows": [ ... ]
+        }
+      ],
+      "sources": [
+        {"database": "dim", "file": "dim.db", "expected": "2026-Q4",
+         "actual": "2026-Q4", "status": "verified"}
+      ],
+      "unauthenticated_tables": []
+    }
+
+The ``via`` list names the views a read passed through, outermost first, so a
+column read through ``v_orders`` -> ``v_customers`` is distinguishable from a
+direct read. Tables in attached databases keep their schema name, so two
+tables called ``customers`` in different attached databases are never merged.
+When a source cannot be certified, every table that belongs to it is listed in
+``unauthenticated_tables`` and the export is refused rather than joined into a
+single set of figures.
+
+The same machinery is available from Python through
+:class:`sqlite_utils.ReadOnlyExporter`; see :ref:`reference` for the full API.
+
 .. _cli_memory:
 
 Querying data directly using an in-memory database

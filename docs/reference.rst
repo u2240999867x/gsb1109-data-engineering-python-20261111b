@@ -115,3 +115,44 @@ sqlite_utils.utils.flatten
 --------------------------
 
 .. autofunction:: sqlite_utils.utils.flatten
+
+.. _reference_readonly_export:
+
+sqlite_utils.readonly_export
+============================
+
+Read-only, auditable dataset exports driven by a SQLite authorizer. See
+:ref:`cli_export_readonly` for the command-line interface and a worked
+example.
+
+.. autoclass:: sqlite_utils.readonly_export.ReadOnlyExporter
+    :members:
+    :undoc-members:
+
+.. autoclass:: sqlite_utils.readonly_export.ExportManifest
+    :members:
+    :undoc-members:
+
+.. autoclass:: sqlite_utils.readonly_export.ReportResult
+    :members:
+    :undoc-members:
+
+.. autoclass:: sqlite_utils.readonly_export.SourceColumn
+    :members:
+    :undoc-members:
+
+.. autoclass:: sqlite_utils.readonly_export.SourceTable
+    :members:
+    :undoc-members:
+
+.. autoclass:: sqlite_utils.readonly_export.SourceVersion
+    :members:
+    :undoc-members:
+
+.. autoclass:: sqlite_utils.readonly_export.FunctionUse
+    :members:
+    :undoc-members:
+
+.. autoclass:: sqlite_utils.readonly_export.ReadOnlyExportError
+    :members:
+    :undoc-members:

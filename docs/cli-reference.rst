@@ -1538,6 +1538,57 @@ See :ref:`cli_drop_view`.
       -h, --help             Show this message and exit.
 
 
+.. _cli_ref_export_readonly:
+
+export-readonly
+===============
+
+::
+
+    Usage: sqlite-utils export-readonly [OPTIONS] PATH [SQL]
+
+      Run reports read-only and export their rows with a read manifest.
+
+      Every statement is validated through a SQLite authorizer before any of them
+      run: writes, DDL, transaction control and ATTACH statements are refused, as
+      are reads of tables, columns or functions not declared in the policy. Attached
+      sources must certify their required version, otherwise their tables are
+      reported as unauthenticated and the batch is not published. Nothing is written
+      on failure.
+
+      Example:
+
+          sqlite-utils export-readonly data.db --policy policy.json \
+              --attach dim dim.db "select * from v_report"
+
+    Options:
+      --sql-file FILE                 File containing the report SQL statements (use
+                                      - for standard input)
+      --attach <TEXT FILE>...         Additional databases to attach - specify alias
+                                      and filepath
+      --policy FILE                   JSON policy file with allowed_columns,
+                                      allowed_functions and versions for the
+                                      declared sources
+      --allow-column <TEXT TEXT TEXT>...
+                                      Permit reads of a column: DATABASE TABLE
+                                      COLUMN, can be repeated
+      --allow-function TEXT           Name of a pure SQL function the reports are
+                                      allowed to call
+      --source-version <TEXT TEXT TEXT>...
+                                      Required source version: SCHEMA
+                                      EXPECTED_VERSION VERSION_QUERY
+      --manifest FILE                 Write the read manifest (sources, tables,
+                                      columns, functions) here
+      -o, --output FILE               Write the report rows envelope here instead of
+                                      standard output
+      -p, --param <TEXT TEXT>...      Named :parameters bound to every report query
+      --functions TEXT                Python code or a file path defining custom SQL
+                                      functions; can be used multiple times
+      --load-extension TEXT           Path to SQLite extension, with optional
+                                      :entrypoint
+      -h, --help                      Show this message and exit.
+
+
 .. _cli_ref_install:
 
 install

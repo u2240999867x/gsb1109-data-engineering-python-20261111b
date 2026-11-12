@@ -33,6 +33,7 @@ from sqlite_utils.db import (
     quote_identifier,
 )
 from sqlite_utils.plugins import ensure_plugins_loaded, get_plugins, pm
+from sqlite_utils.readonly_export import ReadOnlyExportError, ReadOnlyExporter
 from sqlite_utils.utils import maximize_csv_field_size_limit
 
 from .utils import (
@@ -2047,6 +2048,258 @@ def query(
         json_cols,
         ascii_,
     )
+
+
+def _split_policy_table(name: str) -> tuple[str, str]:
+    # "adb.shared" -> ("adb", "shared"); "shared" -> ("main", "shared")
+    if "." in name:
+        database, table = name.split(".", 1)
+        return database, table
+    return "main", name
+
+
+def _load_export_policy(path: str | None) -> dict[str, Any]:
+    if not path:
+        return {}
+    try:
+        policy = json.loads(pathlib.Path(path).read_text())
+    except FileNotFoundError:
+        raise click.ClickException(f"Policy file not found: {path}")
+    except json.JSONDecodeError as ex:
+        raise click.ClickException(f"Policy file is not valid JSON: {ex}")
+    if not isinstance(policy, dict):
+        raise click.ClickException("Policy file must contain a JSON object")
+    return policy
+
+
+def _build_export_policy(
+    policy: dict[str, Any],
+    allow_column: tuple[tuple[str, str, str], ...],
+    allow_function: tuple[str, ...],
+    source_version: tuple[tuple[str, str, str], ...],
+) -> tuple[
+    dict[tuple[str, str], list[str]],
+    list[str],
+    dict[str, str],
+    dict[str, str],
+]:
+    raw_columns = policy.get("allowed_columns") or {}
+    if not isinstance(raw_columns, dict):
+        raise click.ClickException("Policy allowed_columns must be an object")
+    allowed_columns: dict[tuple[str, str], list[str]] = {}
+    for table_name, columns in raw_columns.items():
+        if not isinstance(columns, list) or not all(
+            isinstance(column, str) for column in columns
+        ):
+            raise click.ClickException(
+                f"allowed_columns.{table_name} must be a list of column names"
+            )
+        allowed_columns.setdefault(_split_policy_table(str(table_name)), []).extend(
+            columns
+        )
+    for database, table, column in allow_column:
+        allowed_columns.setdefault((database, table), []).append(column)
+
+    raw_functions = policy.get("allowed_functions") or []
+    if not isinstance(raw_functions, list) or not all(
+        isinstance(name, str) for name in raw_functions
+    ):
+        raise click.ClickException("Policy allowed_functions must be a list of names")
+    allowed_functions = list(raw_functions)
+    allowed_functions.extend(allow_function)
+
+    expected_versions: dict[str, str] = {}
+    version_queries: dict[str, str] = {}
+    raw_versions = policy.get("versions") or {}
+    if not isinstance(raw_versions, dict):
+        raise click.ClickException("Policy versions must be an object")
+    for schema, spec in raw_versions.items():
+        if not isinstance(spec, dict) or "expected" not in spec or "query" not in spec:
+            raise click.ClickException(
+                f"versions.{schema} must be an object with 'expected' and 'query'"
+            )
+        schema_name = str(schema)
+        expected_versions[schema_name] = str(spec["expected"])
+        version_queries[schema_name] = str(spec["query"])
+    for schema, expected, version_query in source_version:
+        expected_versions[schema] = expected
+        version_queries[schema] = version_query
+    return allowed_columns, allowed_functions, expected_versions, version_queries
+
+
+@cli.command(name="export-readonly")
+@click.argument(
+    "path",
+    type=click.Path(file_okay=True, dir_okay=False, allow_dash=False),
+    required=True,
+)
+@click.argument("sql", required=False)
+@click.option(
+    "--sql-file",
+    type=click.Path(file_okay=True, dir_okay=False, allow_dash=True),
+    help="File containing the report SQL statements (use - for standard input)",
+)
+@click.option(
+    "--attach",
+    type=(str, click.Path(file_okay=True, dir_okay=False, allow_dash=False)),
+    multiple=True,
+    help="Additional databases to attach - specify alias and filepath",
+)
+@click.option(
+    "--policy",
+    "policy_path",
+    type=click.Path(file_okay=True, dir_okay=False, allow_dash=False),
+    help=(
+        "JSON policy file with allowed_columns, allowed_functions and "
+        "versions for the declared sources"
+    ),
+)
+@click.option(
+    "--allow-column",
+    type=(str, str, str),
+    multiple=True,
+    help="Permit reads of a column: DATABASE TABLE COLUMN, can be repeated",
+)
+@click.option(
+    "--allow-function",
+    multiple=True,
+    help="Name of a pure SQL function the reports are allowed to call",
+)
+@click.option(
+    "--source-version",
+    type=(str, str, str),
+    multiple=True,
+    help="Required source version: SCHEMA EXPECTED_VERSION VERSION_QUERY",
+)
+@click.option(
+    "--manifest",
+    type=click.Path(file_okay=True, dir_okay=False, allow_dash=False),
+    help="Write the read manifest (sources, tables, columns, functions) here",
+)
+@click.option(
+    "-o",
+    "--output",
+    "output_path",
+    type=click.Path(file_okay=True, dir_okay=False, allow_dash=False),
+    help="Write the report rows envelope here instead of standard output",
+)
+@click.option(
+    "-p",
+    "--param",
+    multiple=True,
+    type=(str, str),
+    help="Named :parameters bound to every report query",
+)
+@functions_option
+@load_extension_option
+def export_readonly(
+    path,
+    sql,
+    sql_file,
+    attach,
+    policy_path,
+    allow_column,
+    allow_function,
+    source_version,
+    manifest,
+    output_path,
+    param,
+    load_extension,
+    functions,
+):
+    """Run reports read-only and export their rows with a read manifest.
+
+    Every statement is validated through a SQLite authorizer before any of
+    them run: writes, DDL, transaction control and ATTACH statements are
+    refused, as are reads of tables, columns or functions not declared in the
+    policy. Attached sources must certify their required version, otherwise
+    their tables are reported as unauthenticated and the batch is not
+    published. Nothing is written on failure.
+
+    Example:
+
+    \b
+        sqlite-utils export-readonly data.db --policy policy.json \\
+            --attach dim dim.db "select * from v_report"
+    """
+    if sql_file:
+        if sql_file == "-":
+            sql_text = sys.stdin.read()
+        else:
+            try:
+                sql_text = pathlib.Path(sql_file).read_text()
+            except FileNotFoundError:
+                raise click.ClickException(f"SQL file not found: {sql_file}")
+    elif sql is not None:
+        sql_text = sys.stdin.read() if sql == "-" else sql
+    else:
+        raise click.ClickException(
+            "Provide report SQL as an argument or through --sql-file"
+        )
+    if not sql_text.strip():
+        raise click.ClickException("No SQL statements were provided")
+
+    policy = _load_export_policy(policy_path)
+    (
+        allowed_columns,
+        allowed_functions,
+        expected_versions,
+        version_queries,
+    ) = _build_export_policy(
+        policy, allow_column, allow_function, source_version
+    )
+
+    db = sqlite_utils.Database(path)
+    _register_db_for_cleanup(db)
+    for alias, attach_path in attach:
+        db.attach(alias, attach_path)
+    _load_extensions(db, load_extension)
+    db.register_fts4_bm25()
+    _maybe_register_functions(db, functions)
+
+    try:
+        with ReadOnlyExporter(
+            db,
+            allowed_columns=allowed_columns,
+            allowed_functions=allowed_functions,
+            expected_versions=expected_versions,
+            version_queries=version_queries,
+        ) as exporter:
+            export = exporter.export_batch(sql_text, dict(param) or None)
+    except ReadOnlyExportError as ex:
+        details = "\n".join(f"- {reason}" for reason in ex.reasons)
+        unauthenticated = ", ".join(
+            f"{table.database}.{table.name}"
+            for table in ex.unauthenticated_tables
+        )
+        message = "Read-only export refused:\n" + details
+        if unauthenticated:
+            message += f"\nUnauthenticated tables: {unauthenticated}"
+        raise click.ClickException(message)
+
+    envelope = {
+        "reports": [
+            {
+                **report.manifest_dict(),
+                "rows": report.rows,
+            }
+            for report in export.reports
+        ],
+        "sources": [source.to_dict() for source in export.sources],
+        "unauthenticated_tables": [
+            table.to_dict() for table in export.unauthenticated_tables
+        ],
+    }
+    # The whole envelope is serialized before any file is opened, so a
+    # serialization error cannot leave a half-written export behind.
+    rows_json = json.dumps(envelope, indent=2, default=json_binary)
+    manifest_json = export.to_json()
+    if output_path:
+        pathlib.Path(output_path).write_text(rows_json + "\n")
+    else:
+        click.echo(rows_json)
+    if manifest:
+        pathlib.Path(manifest).write_text(manifest_json + "\n")
 
 
 @cli.command()

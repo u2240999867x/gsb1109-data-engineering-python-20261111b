@@ -4,6 +4,13 @@
  Changelog
 ===========
 
+.. _v4_3:
+
+4.3 (unreleased)
+----------------
+
+- New ``sqlite-utils export-readonly`` command and :class:`~sqlite_utils.ReadOnlyExporter` Python API for read-only, auditable dataset exports. Reports run through a SQLite authorizer that refuses writes and unauthorized tables, columns and functions, records the source columns each statement actually read (including through views nested two levels deep and same-named tables in attached databases), and only publishes when every attached source certifies its required version.
+
 .. _v4_2_1:
 
 4.2.1 (2026-08-13)
