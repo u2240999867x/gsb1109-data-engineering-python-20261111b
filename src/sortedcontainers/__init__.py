@@ -45,6 +45,14 @@ testing has 100% coverage with unit tests and hours of stress.
 
 """
 
+from .checkout import (
+    STATUS_AVAILABLE,
+    STATUS_COMMITTED,
+    STATUS_PENDING,
+    Checkout,
+    CheckoutError,
+    CheckoutLedger,
+)
 from .sorteddict import (
     SortedDict,
     SortedItemsView,
@@ -63,6 +71,12 @@ __all__ = [
     'SortedItemsView',
     'SortedValuesView',
     'SortedSet',
+    'CheckoutLedger',
+    'Checkout',
+    'CheckoutError',
+    'STATUS_AVAILABLE',
+    'STATUS_PENDING',
+    'STATUS_COMMITTED',
 ]
 
 __title__ = 'sortedcontainers'
