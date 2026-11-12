@@ -86,6 +86,7 @@ from voluptuous.dataclasses_support import (
 from voluptuous.schema_builder import *
 from voluptuous.util import *
 from voluptuous.validators import *
+from voluptuous.ingest import *
 
 from voluptuous.error import *  # isort: skip
 
