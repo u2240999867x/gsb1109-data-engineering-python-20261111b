@@ -45,6 +45,7 @@ testing has 100% coverage with unit tests and hours of stress.
 
 """
 
+from .inventory import AccessCounts, InventoryEvent, InventoryRanking, RankChange
 from .sorteddict import (
     SortedDict,
     SortedItemsView,
@@ -63,6 +64,10 @@ __all__ = [
     'SortedItemsView',
     'SortedValuesView',
     'SortedSet',
+    'InventoryRanking',
+    'InventoryEvent',
+    'RankChange',
+    'AccessCounts',
 ]
 
 __title__ = 'sortedcontainers'
