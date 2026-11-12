@@ -121,3 +121,34 @@ of service (DoS) attacks:
    application vulnerable to DoS attacks when processing untrusted SQL input.
    Only modify these values if you are certain about the source and size of
    your SQL statements.
+
+
+Fixed-Width Projection Layout
+------------------------------
+
+.. module:: sqlparse.layout
+
+The :mod:`~sqlparse.layout` module renders the output fields of a simple
+``SELECT ... [FROM ...]`` statement onto a fixed-width grid and maps every
+display cell back to the projection it belongs to.  It is intended for
+fixed-width previews that need to jump from a clicked display column back to
+the corresponding expression in the original SQL text.
+
+Display widths follow terminal conventions: East-Asian wide and full-width
+characters occupy two cells, combining marks occupy no cell of their own,
+tabs expand against the column they are rendered on, and continuation lines
+are indented with ordinary spaces that never resolve to a field.
+
+.. autofunction:: layout_select
+
+.. autoclass:: ProjectionLayout
+   :members:
+
+.. autoclass:: Projection
+   :members:
+
+.. autoclass:: Cell
+   :members:
+
+.. autoclass:: Run
+   :members:
