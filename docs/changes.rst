@@ -7,6 +7,21 @@ Release History
 (Next Version)
 ^^^^^^^^^^^^^^^^^^
 
+* Visual FoxPro null value flags (``_NullFlags``) are now interpreted.
+  Nullable fields whose null flag is set are returned as ``None``, and
+  the ``_NullFlags`` system field no longer appears in records. Bit
+  positions are computed from the field declarations, so nullable
+  fixed length fields and varchar fields (which occupy an extra flag
+  bit) can be mixed freely, and column projection (the new
+  ``include_fields`` argument) never shifts the bits of the remaining
+  fields. The new ``DBF.iter_with_recno()`` and ``DBF.iter_with_meta()``
+  iterators expose the physical record number and the null flag
+  decisions of each record, and ``DBF.null_bit_positions`` maps field
+  names to their null flag bit positions. If the ``_NullFlags`` system
+  area is truncated, ``NullFlagsUnavailable`` is raised for fields
+  whose null status can no longer be determined instead of silently
+  treating them as not null.
+
 * records are now returned ``dict`` instead of ``collections.OrderedDict``
   in Python 3.7 and up (as well as CPython 3.6) since normal Python
   dictionaries are now ordered.

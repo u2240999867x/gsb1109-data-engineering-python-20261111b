@@ -74,6 +74,21 @@ raw=False
   Returns all data values as byte strings. This can be used for
   debugging or for doing your own decoding.
 
+  In raw mode no null flag interpretation happens, so the
+  ``_NullFlags`` field (if any) is returned like any other field.
+
+include_fields=None
+  Column projection. Pass a list of field names to read only those
+  columns, for example ``DBF('detail.dbf', include_fields=['AMOUNT'])``.
+  Other fields are skipped while reading and do not appear in
+  records. A ``ValueError`` is raised if a name is not a field in the
+  table.
+
+  Null flag bit positions are always computed from the full field
+  declarations in the file header, so skipping fields never shifts
+  the null flags of the remaining fields. Reading only some columns
+  gives exactly the same values as reading the full table.
+
 
 Methods
 -------
@@ -87,6 +102,21 @@ unload()
    Unload records from memory. The ``records`` and ``deleted``
    attributes will now be instances of ``RecordIterator``, which
    streams records from disk.
+
+iter_with_recno(record_type=b' ')
+   Iterate over ``(recno, record)`` pairs. ``recno`` is the physical
+   (1-based) record number in the file. Skipped records (for example
+   deleted ones) still count towards the record number. Pass
+   ``record_type=b'*'`` to iterate over deleted records.
+
+iter_with_meta(record_type=b' ')
+   Iterate over ``(recno, record, nulls)`` tuples. ``nulls`` maps the
+   name of each nullable field to a ``(bit, is_null)`` tuple: the
+   absolute position of the field's null flag in the ``_NullFlags``
+   bitmap, and whether the flag was set for this record. Since NULL
+   and empty (blank) values are both returned as ``None`` in records,
+   this is how you tell them apart, for example to write zero, blank
+   and NULL amounts to different targets.
 
 
 Attributes
@@ -123,6 +153,18 @@ field_names
   A list of field names in the order they appear in the file. This can
   for example be used to produce the header line in a CSV file.
 
+  The Visual FoxPro ``_NullFlags`` system field is not included, since
+  it is interpreted instead of being returned in records. If
+  ``include_fields`` was passed only those fields are listed.
+
+null_bit_positions
+  An ordered dictionary mapping each field name to the absolute
+  position of its null flag bit in the Visual FoxPro ``_NullFlags``
+  bitmap, or ``None`` if the field is not nullable. (Varchar fields
+  also occupy an extra flag bit, which is reflected in the positions
+  of the fields that follow them.) If the table has no ``_NullFlags``
+  field this is an empty dictionary.
+
 encoding
   Character encoding used in the file. This is determined by the
   ``language_driver`` byte in the header, and can be overriden with the
@@ -154,3 +196,8 @@ fields
       reserved4=b'\x00\x00\x00\x00\x00\x00\x00', index_field_flag=0)
 
   Only the ``name``, ``type`` and ``length`` attributes are used.
+
+  This is the full physical list of fields, including the Visual
+  FoxPro ``_NullFlags`` system field if the table has one. The
+  ``set_fields_flag`` attribute holds the Visual FoxPro field flags
+  (``0x01`` system, ``0x02`` nullable, ``0x04`` binary).

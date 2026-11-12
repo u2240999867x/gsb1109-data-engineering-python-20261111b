@@ -41,6 +41,41 @@ The '0' field type is used for '_NullFlags' in Visual FoxPro.  It was
 mistakenly though to always be one byte long and was interpreted as an
 integer. From 2.0.1 on it is returned as a byte string.
 
+Visual FoxPro Null Values
+-------------------------
+
+Visual FoxPro stores the null status of fields in a hidden system
+field called ``_NullFlags`` (field type ``'0'``) at the end of each
+record. The field is a bitmap with one bit per nullable field plus one
+extra bit per varchar field, assigned in field declaration order.
+
+dbfread interprets this bitmap for you:
+
+* the ``_NullFlags`` field does not appear in records
+
+* a field whose null flag is set is returned as ``None`` (its data
+  bytes are not parsed at all)
+
+* ``DBF.null_bit_positions`` tells you which bit position is used to
+  decide the null status of each field
+
+* ``DBF.iter_with_meta()`` yields ``(recno, record, nulls)`` tuples so
+  you can tell NULL apart from blank values (both are ``None`` in the
+  record) and get the physical record number
+
+Since the bit positions are computed from the field declarations in
+the file header, they stay correct when only some columns are read
+with ``include_fields``.
+
+If the ``_NullFlags`` system area at the end of a record is truncated
+(for example one byte short), fields whose null flag is still
+available are resolved normally, and fields that contain data are
+provably not null. If the null flag of an empty field is lost,
+``dbfread.exceptions.NullFlagsUnavailable`` (a subclass of
+``ValueError``) is raised instead of silently treating the field as
+not null. The exception carries the field name, the physical record
+number and the missing bit position.
+
 The 'V' field is an alternative character field used by Visual
 FoxPro. The binary version of this field is not yet supported. (See
 https://msdn.microsoft.com/en-us/library/st4a0s68%28VS.80%29.aspx for

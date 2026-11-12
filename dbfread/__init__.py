@@ -19,7 +19,7 @@ __license__ = 'MIT'
 
 from .dbf import DBF
 from .deprecated_dbf import open, read
-from .exceptions import DBFNotFound, MissingMemoFile
+from .exceptions import DBFNotFound, MissingMemoFile, NullFlagsUnavailable
 from .field_parser import FieldParser, InvalidValue
 from .version import version_info, version as __version__
 
