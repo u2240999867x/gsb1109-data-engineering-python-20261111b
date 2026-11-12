@@ -29,10 +29,14 @@ don't forget to call `mydict.commit()` when done with a transaction.
 import sqlite3
 import os
 import sys
+import json
 import tempfile
 import threading
 import logging
 import traceback
+import hashlib
+import uuid
+from contextlib import contextmanager
 from base64 import b64decode, b64encode
 import weakref
 
@@ -54,9 +58,10 @@ except ImportError:
 
 # some Python 3 vs 2 imports
 try:
-    from collections import UserDict as DictClass
+    from collections import UserDict as DictClass, namedtuple
 except ImportError:
     from UserDict import DictMixin as DictClass
+    from collections import namedtuple
 
 try:
     from queue import Queue
@@ -140,6 +145,174 @@ def decode_key(key):
 def identity(obj):
     """Identity f(x) = x function for encoding/decoding."""
     return obj
+
+
+class RenameRequest(namedtuple('RenameRequest', ['old_key', 'new_key', 'source_line'])):
+    """A single staged key rename.
+
+    `source_line` is the 1-based line number of the manifest the rename was
+    read from; it is used to attribute results back to the manifest.
+    """
+
+
+class RenameGroup(namedtuple('RenameGroup', ['requests', 'blocked', 'reasons', 'cyclic', 'collision'])):
+    """A connected component of the rename graph, as shown in a preview.
+
+    `requests` is the component's renames in manifest order. `blocked` means
+    the group cannot be applied on its own (an encoded-key collision, a
+    duplicate source/destination, a missing source key, or an already-occupied
+    destination). Cycles are valid and never block by themselves; `cyclic`
+    just reports that the component contains one. `reasons` explains any block.
+    """
+
+
+class RenameResult(namedtuple('RenameResult', ['group', 'applied', 'already_applied', 'blocked', 'reasons', 'line_results'])):
+    """Outcome of applying one connected component.
+
+    `line_results` maps each manifest source line to the rowid that now owns
+    the corresponding value. Re-applying an already committed manifest returns
+    the same line-to-rowid attribution (`already_applied=True`) without
+    touching any data.
+    """
+
+
+class RenameConflict(Exception):
+    """Raised when a whole apply() call cannot be planned from the manifest."""
+
+
+def _build_rename_groups(requests, live_keys, encode_key):
+    """Split rename requests into connected components and classify them.
+
+    Edges go from old key to new key; cycles (including self-loops) and
+    "release then occupy" chains are both valid graph shapes. Two requests
+    collide only when their *encoded* keys are equal, so custom key codecs are
+    handled correctly. `live_keys` is the set of encoded keys currently in the
+    table, used to flag renames whose source row is gone.
+    """
+    requests = list(requests)
+    encoded = []
+    for request in requests:
+        old_enc = encode_key(request.old_key)
+        new_enc = encode_key(request.new_key)
+        encoded.append((request, old_enc, new_enc))
+
+    # Union-find over request indices; requests touching the same physical
+    # (encoded) key belong to one connected component.
+    parents = list(range(len(requests)))
+
+    def find(index):
+        root = index
+        while parents[root] != root:
+            root = parents[root]
+        while parents[index] != index:
+            parents[index], index = root, parents[index]
+        return root
+
+    def union(left, right):
+        parents[find(left)] = find(right)
+
+    endpoint_owner = {}
+    for index, (request, old_enc, new_enc) in enumerate(encoded):
+        for endpoint in (old_enc, new_enc):
+            owner = endpoint_owner.get(endpoint)
+            if owner is None:
+                endpoint_owner[endpoint] = index
+            else:
+                union(index, owner)
+
+    groups = {}
+    for index in range(len(encoded)):
+        groups.setdefault(find(index), []).append(index)
+
+    result = []
+    for indices in groups.values():
+        members = [encoded[i] for i in indices]
+        reasons = []
+
+        old_counts = {}
+        new_counts = {}
+        for request, old_enc, new_enc in members:
+            old_counts[old_enc] = old_counts.get(old_enc, 0) + 1
+            new_counts[new_enc] = new_counts.get(new_enc, 0) + 1
+
+        duplicate_sources = sorted(
+            key for key, count in old_counts.items() if count > 1
+        )
+        if duplicate_sources:
+            reasons.append(
+                'duplicate source encoded key(s): %s'
+                % ', '.join(repr(key) for key in duplicate_sources)
+            )
+
+        duplicate_destinations = sorted(
+            key for key, count in new_counts.items() if count > 1
+        )
+        if duplicate_destinations:
+            reasons.append(
+                'duplicate destination encoded key(s): %s'
+                % ', '.join(repr(key) for key in duplicate_destinations)
+            )
+
+        # Distinct logical keys that the key codec maps onto one stored key
+        # would silently alias each other's rows.
+        codec_collisions = [
+            request for request, old_enc, new_enc in members
+            if old_enc == new_enc and request.old_key != request.new_key
+        ]
+        if codec_collisions:
+            reasons.append(
+                'key codec collision on line(s): %s'
+                % ', '.join(str(request.source_line) for request in codec_collisions)
+            )
+
+        missing = [
+            request for request, old_enc, new_enc in members
+            if old_enc not in live_keys
+        ]
+        if missing:
+            reasons.append(
+                'missing source key(s) from line(s): %s'
+                % ', '.join(str(request.source_line) for request in missing)
+            )
+
+        # A destination occupied by an unrelated live row cannot be taken.
+        group_sources = set(old_counts)
+        occupied = [
+            request for request, old_enc, new_enc in members
+            if new_enc not in group_sources and new_enc in live_keys
+        ]
+        if occupied:
+            reasons.append(
+                'destination key(s) already occupied from line(s): %s'
+                % ', '.join(str(request.source_line) for request in occupied)
+            )
+
+        # Cycle detection on the directed encoded-key graph.
+        edges = {old_enc: new_enc for request, old_enc, new_enc in members}
+        cyclic = False
+        for start in edges:
+            seen = set()
+            node = start
+            while node in edges and node not in seen:
+                seen.add(node)
+                node = edges[node]
+            if node in seen:
+                cyclic = True
+                break
+
+        collision = bool(duplicate_sources or duplicate_destinations or codec_collisions)
+        blocked = bool(reasons)
+        result.append(RenameGroup(
+            requests=[request for request, old_enc, new_enc in members],
+            blocked=blocked,
+            reasons=tuple(reasons),
+            cyclic=cyclic,
+            collision=collision,
+        ))
+
+    # Stable, manifest-order presentation of the groups.
+    result.sort(key=lambda group: min(request.source_line for request in group.requests))
+    return result
 
 
 class SqliteDict(DictClass):
@@ -412,6 +585,260 @@ class SqliteDict(DictClass):
                 os.remove(self.filename)
         except (OSError, IOError):
             logger.exception("failed to delete %s" % (self.filename))
+
+    # ------------------------------------------------------------------
+    # Staged key renames
+    # ------------------------------------------------------------------
+
+    _RENAME_LEDGER_TABLE = 'sqlitedict_rename_ledger'
+
+    @property
+    def _ledger_table(self):
+        return '%s_%s' % (self._RENAME_LEDGER_TABLE, self.tablename)
+
+    def _ensure_rename_ledger(self, conn):
+        conn.execute(
+            'CREATE TABLE IF NOT EXISTS "%s" ('
+            'manifest_id TEXT NOT NULL, group_id INTEGER NOT NULL, '
+            'manifest TEXT NOT NULL, line_results TEXT NOT NULL, '
+            'PRIMARY KEY (manifest_id, group_id))' % self._ledger_table
+        )
+
+    @staticmethod
+    def _manifest_id(requests):
+        payload = json.dumps(
+            [(request.old_key, request.new_key, request.source_line)
+             for request in requests],
+            sort_keys=True, default=repr,
+        )
+        return hashlib.sha256(payload.encode('utf-8')).hexdigest()
+
+    @contextmanager
+    def _direct_transaction(self):
+        """Open a short-lived sqlite connection for one atomic rename group.
+
+        The background-thread connection only speaks queued SQL and cannot run
+        a multi-statement transaction with our own revalidation logic, so we
+        open a separate connection, do everything in one transaction, then
+        flush the background connection so later reads see the committed data.
+        """
+        if self.flag == 'r':
+            raise RuntimeError('Refusing to rename keys in a read-only SqliteDict')
+        if self.filename == ':memory:':
+            raise RenameConflict('staged renames require a file-backed database')
+
+        # Flush pending writes and end any read transaction the worker thread
+        # still holds, so it does not keep a SHARED lock that blocks our commit.
+        self.commit(blocking=True)
+        conn = sqlite3.connect(self.filename, timeout=30)
+        try:
+            conn.execute('BEGIN IMMEDIATE')
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+        # Drop any stale read snapshot in the worker thread.
+        self.commit(blocking=True)
+
+    def preview_renames(self, requests):
+        """Plan staged renames without modifying anything.
+
+        Accepts an iterable of `RenameRequest` (old key, new key, source line).
+        Returns `RenameGroup` objects, one per connected component of the
+        rename graph, in manifest order. A group with `blocked=False` can be
+        committed together; blocked groups explain why they cannot run alone.
+        """
+        requests = [self._coerce_rename_request(request) for request in requests]
+        self._check_rename_manifest(requests)
+        live_keys = self._live_encoded_keys()
+        return _build_rename_groups(requests, live_keys, self.encode_key)
+
+    def apply_renames(self, requests):
+        """Apply staged renames group by group.
+
+        Each connected component is validated and committed independently. If
+        another connection has changed some keys in the meantime, only groups
+        whose read/write preconditions no longer hold are rejected; unrelated
+        groups still succeed. Value bytes move with their rows (the value
+        codec is never re-run). Re-applying a previously committed manifest
+        returns the original line-to-rowid attribution.
+        """
+        requests = [self._coerce_rename_request(request) for request in requests]
+        self._check_rename_manifest(requests)
+        manifest_id = self._manifest_id(requests)
+        groups = _build_rename_groups(
+            requests, self._live_encoded_keys(), self.encode_key
+        )
+
+        results = []
+        for group in groups:
+            result = self._apply_rename_group(group, manifest_id)
+            results.append(result)
+        return results
+
+    @staticmethod
+    def _coerce_rename_request(request):
+        if isinstance(request, RenameRequest):
+            return request
+        if isinstance(request, dict):
+            return RenameRequest(
+                request['old_key'], request['new_key'], request['source_line']
+            )
+        return RenameRequest(*request)
+
+    def _check_rename_manifest(self, requests):
+        if not requests:
+            raise RenameConflict('rename manifest is empty')
+        lines = [request.source_line for request in requests]
+        if len(set(lines)) != len(lines):
+            raise RenameConflict('duplicate source_line values in rename manifest')
+        if any(not isinstance(line, int) or isinstance(line, bool) or line < 1
+               for line in lines):
+            raise RenameConflict('source_line must be a positive integer')
+
+    def _live_encoded_keys(self):
+        query = 'SELECT key FROM "%s"' % self.tablename
+        return {row[0] for row in self.conn.select(query)}
+
+    def _apply_rename_group(self, group, manifest_id):
+        group_id = min(request.source_line for request in group.requests)
+        encoded = [
+            (request, self.encode_key(request.old_key), self.encode_key(request.new_key))
+            for request in group.requests
+        ]
+
+        with self._direct_transaction() as conn:
+            self._ensure_rename_ledger(conn)
+            stored = conn.execute(
+                'SELECT line_results FROM "%s" '
+                'WHERE manifest_id = ? AND group_id = ?' % self._ledger_table,
+                (manifest_id, group_id),
+            ).fetchone()
+            if stored is not None:
+                line_results = {
+                    int(line): rowid
+                    for line, rowid in json.loads(stored[0]).items()
+                }
+                return RenameResult(
+                    group=group, applied=False, already_applied=True,
+                    blocked=False, reasons=(), line_results=line_results,
+                )
+
+            reasons = self._revalidate_group(conn, encoded)
+            if reasons:
+                return RenameResult(
+                    group=group, applied=False, already_applied=False,
+                    blocked=True, reasons=tuple(reasons), line_results={},
+                )
+
+            line_results = self._execute_group(conn, encoded)
+            conn.execute(
+                'INSERT OR REPLACE INTO "%s" '
+                '(manifest_id, group_id, manifest, line_results) '
+                'VALUES (?, ?, ?, ?)' % self._ledger_table,
+                (manifest_id, group_id,
+                 json.dumps([list(request) for request in group.requests], default=repr),
+                 json.dumps(
+                     {str(line): rowid for line, rowid in line_results.items()},
+                     sort_keys=True,
+                 )),
+            )
+
+        return RenameResult(
+            group=group, applied=True, already_applied=False,
+            blocked=False, reasons=(), line_results=line_results,
+        )
+
+    def _revalidate_group(self, conn, encoded):
+        """Check structural and live preconditions for one component.
+
+        A group is only rejected when its own read or write precondition no
+        longer holds; groups touching unrelated keys are unaffected.
+        """
+        reasons = []
+        table = self.tablename
+
+        old_counts = {}
+        new_counts = {}
+        for request, old_enc, new_enc in encoded:
+            old_counts[old_enc] = old_counts.get(old_enc, 0) + 1
+            new_counts[new_enc] = new_counts.get(new_enc, 0) + 1
+
+        if any(count > 1 for count in old_counts.values()):
+            reasons.append('two renames in the group share an encoded source key')
+        if any(count > 1 for count in new_counts.values()):
+            reasons.append('two renames in the group share an encoded destination key')
+        for request, old_enc, new_enc in encoded:
+            if old_enc == new_enc and request.old_key != request.new_key:
+                reasons.append(
+                    'line %d: key codec maps both names to the same stored key'
+                    % request.source_line
+                )
+
+        # Read precondition: every source row must still exist.
+        source_keys = set(old_counts)
+        for request, old_enc, new_enc in encoded:
+            row = conn.execute(
+                'SELECT rowid FROM "%s" WHERE key = ?' % table, (old_enc,)
+            ).fetchone()
+            if row is None:
+                reasons.append(
+                    'line %d: source key no longer exists' % request.source_line
+                )
+
+        # Write precondition: destinations outside the group must still be
+        # free, otherwise the rename would overwrite an unrelated row.
+        for request, old_enc, new_enc in encoded:
+            if new_enc in source_keys:
+                continue
+            clash = conn.execute(
+                'SELECT 1 FROM "%s" WHERE key = ?' % table, (new_enc,)
+            ).fetchone()
+            if clash is not None:
+                reasons.append(
+                    'line %d: destination key is already taken' % request.source_line
+                )
+        return reasons
+
+    def _execute_group(self, conn, encoded):
+        """Perform the renames inside the open transaction.
+
+        Every participating row first moves onto a unique placeholder key,
+        releasing all source names at once; rows then move to their final
+        encoded keys. This handles cycles and release-then-occupy chains in a
+        fixed number of statements regardless of graph shape. Updates target
+        rowids, so the stored value bytes travel with the row and never pass
+        through the value codec.
+        """
+        table = self.tablename
+        token = uuid.uuid4().hex
+        line_results = {}
+        staged = []
+
+        # Phase 1: detach all source rows onto placeholder keys.
+        for index, (request, old_enc, new_enc) in enumerate(encoded):
+            placeholder = '\x00sqlitedict-rename-%s-%d\x00' % (token, index)
+            row = conn.execute(
+                'SELECT rowid FROM "%s" WHERE key = ?' % table, (old_enc,)
+            ).fetchone()
+            conn.execute(
+                'UPDATE "%s" SET key = ? WHERE rowid = ?' % table,
+                (placeholder, row[0]),
+            )
+            staged.append((request, new_enc, placeholder, row[0]))
+
+        # Phase 2: occupy the final keys, reusing the same rows.
+        for request, new_enc, placeholder, rowid in staged:
+            conn.execute(
+                'UPDATE "%s" SET key = ? WHERE key = ?' % table,
+                (new_enc, placeholder),
+            )
+            line_results[request.source_line] = rowid
+
+        return line_results
 
     def __del__(self):
         # like close(), but assume globals are gone by now (do not log!)
