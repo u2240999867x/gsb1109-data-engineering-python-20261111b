@@ -2,6 +2,9 @@
 
 ### Version 0.7.1
 
+* `CountSketch`
+  * Signed Count-Sketch supporting negative updates (refunds/revisions), per-key net estimates, and inner-product estimation between two sketches without retaining the original keys
+  * Inner-product results expose per-row estimates, caller-declared independent hash-row groups, and the aggregated median estimate
 * `Cuckoo Filter`
   * Implement rewind for both regular and counting; see [#149](https://github.com/barrust/pyprobables/pull/149); thanks [mayur-dhavan](https://github.com/mayur-dhavan)
   * `CountingCuckooFilter`: Increment Elements Added by number of elements inserted

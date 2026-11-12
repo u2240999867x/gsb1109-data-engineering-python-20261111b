@@ -7,5 +7,14 @@ from probables.countminsketch.countminsketch import (
     HeavyHitters,
     StreamThreshold,
 )
+from probables.countminsketch.countsketch import CountSketch, CountSketchInnerProduct
 
-__all__ = ["CountMinSketch", "HeavyHitters", "StreamThreshold", "CountMeanSketch", "CountMeanMinSketch"]
+__all__ = [
+    "CountMinSketch",
+    "HeavyHitters",
+    "StreamThreshold",
+    "CountMeanSketch",
+    "CountMeanMinSketch",
+    "CountSketch",
+    "CountSketchInnerProduct",
+]

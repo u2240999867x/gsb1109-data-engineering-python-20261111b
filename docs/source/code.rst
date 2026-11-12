@@ -140,6 +140,16 @@ StreamThreshold
 
 For more information of all methods and properties, see `CountMinSketch`_.
 
+
+CountSketch
++++++++++++++++++++++++++++++++
+
+.. autoclass:: probables.CountSketch
+    :members:
+
+.. autoclass:: probables.CountSketchInnerProduct
+    :members:
+
 QuotientFilter
 ------------------
 
