@@ -54,6 +54,7 @@ This page lists the ``--help`` for every ``sqlite-utils`` CLI sub-command.
         "create-database": "cli_create_database",
         "create-table": "cli_create_table",
         "drop-table": "cli_drop_table",
+        "dedupe": "cli_dedupe_table",
         "create-view": "cli_create_view",
         "drop-view": "cli_drop_view",
         "search": "cli_search",
@@ -1488,6 +1489,46 @@ See :ref:`cli_drop_table`.
       --ignore               If table does not exist, do nothing
       --load-extension TEXT  Path to SQLite extension, with optional :entrypoint
       -h, --help             Show this message and exit.
+
+
+.. _cli_ref_dedupe:
+
+dedupe
+======
+
+See :ref:`cli_dedupe_table`.
+
+::
+
+    Usage: sqlite-utils dedupe [OPTIONS] PATH TABLE
+
+      Preview and remove duplicate rows, repointing foreign keys at the rows that
+      the business chose to keep.
+
+      Rows matching on the --column values form duplicate groups. Every group
+      needs an explicit --winner naming the primary key of the row to keep - this
+      command never chooses one for you. By default it only prints the rows it
+      would delete and the foreign keys it would repoint; use --apply (or -y) to
+      actually run the plan. The whole change is transactional, so a failure rolls
+      every repoint and delete back.
+
+      Example:
+
+          sqlite-utils dedupe companies.db companies --column name \
+              --winner "Acme" 1 --apply
+
+    Options:
+      --column TEXT            Column defining a duplicate; repeat for a compound
+                               key. Defaults to every non-primary-key column
+      --winner <TEXT TEXT>...  Winner for a duplicate group, as DEDUPE_VALUES
+                               WINNER_PK, with comma-separated values for compound
+                               keys. Repeat once per group
+      --apply                  Apply the plan after the preview; otherwise only
+                               prints the preview
+      -y, --yes                Apply without prompting for confirmation (implies
+                               --apply)
+      --load-extension TEXT    Path to SQLite extension, with optional :entrypoint
+      -h, --help               Show this message and exit.
 
 
 .. _cli_ref_create_view:

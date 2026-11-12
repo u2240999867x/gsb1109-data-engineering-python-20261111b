@@ -1065,6 +1065,36 @@ This method raises ``sqlite_utils.db.NoTable`` if the table does not exist.
 .. note::
     In the CLI: :ref:`sqlite-utils duplicate <cli_duplicate_table>`
 
+.. _python_api_dedupe:
+
+Deduplicating tables
+====================
+
+When a table already contains duplicate rows, ``table.dedupe_plan()`` builds a plan for removing the extra rows while repointing any foreign keys that reference them at the row the business chose to keep. Pass a ``winners`` mapping of duplicate-key values to the winning row's primary key - a scalar for a single column or primary key, otherwise a tuple. The method never picks a winner on its behalf: every duplicate group must be named explicitly or it raises ``DedupeError``.
+
+.. code-block:: python
+
+    plan = db["companies"].dedupe_plan(
+        {("Acme", "London"): 1},
+        columns=("name", "city"),
+    )
+    plan.rows_to_delete  # full rows that will be deleted
+    plan.repoints        # foreign key columns that will be repointed
+    plan.unique_conflicts  # constraints that would block the operation
+
+Compound dedupe keys compare every column, not just the first one, and compound and circular (including self-referential) foreign keys are repointed on every key column. ``plan.can_apply`` is ``False`` if repointing would make two rows collide on a unique index or primary key; partial unique indexes cannot be evaluated statically but are still enforced by SQLite when the plan runs.
+
+The plan is a point-in-time snapshot. ``table.dedupe_apply(plan)`` rebuilds it from the current database and rejects a stale plan, then runs every repoint and delete inside one transaction, so a failure rolls everything back rather than leaving rows deleted with their references unmigrated:
+
+.. code-block:: python
+
+    db["companies"].dedupe_apply(plan)
+
+Use ``table.duplicate_groups()`` to list the duplicate groups (and their candidate primary keys) before deciding on the winners, and ``table.dedupe(winners, columns=...)`` as a shortcut that builds and applies the plan in one call.
+
+.. note::
+    In the CLI: :ref:`sqlite-utils dedupe <cli_dedupe_table>`
+
 .. _python_api_bulk_inserts:
 
 Bulk inserts

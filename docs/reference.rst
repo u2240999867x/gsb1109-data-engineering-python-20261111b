@@ -77,6 +77,37 @@ sqlite_utils.db.ForeignKey
 
 .. autoclass:: sqlite_utils.db.ForeignKey
 
+.. _reference_db_other_dedupe:
+
+sqlite_utils.db.DedupePlan
+--------------------------
+
+.. autoclass:: sqlite_utils.db.DedupePlan
+    :members:
+
+sqlite_utils.db.DedupeGroup
+---------------------------
+
+.. autoclass:: sqlite_utils.db.DedupeGroup
+    :members:
+
+sqlite_utils.db.ForeignKeyRepoint
+---------------------------------
+
+.. autoclass:: sqlite_utils.db.ForeignKeyRepoint
+    :members:
+
+sqlite_utils.db.DedupeUniqueConflict
+------------------------------------
+
+.. autoclass:: sqlite_utils.db.DedupeUniqueConflict
+    :members:
+
+sqlite_utils.db.DedupeError
+---------------------------
+
+.. autoclass:: sqlite_utils.db.DedupeError
+
 sqlite_utils.utils
 ==================
 

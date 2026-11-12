@@ -25,6 +25,7 @@ from sqlite_utils.db import (
     DEFAULT,
     AlterError,
     BadMultiValues,
+    DedupeError,
     DescIndex,
     InvalidColumns,
     NoTable,
@@ -41,6 +42,7 @@ from .utils import (
     TypeTracker,
     _compile_code,
     chunks,
+    column_affinity,
     decode_base64_values,
     dedupe_keys,
     file_progress,
@@ -1882,6 +1884,242 @@ def drop_table(path, table, ignore, load_extension):
                 f'"{table}" is a view, not a table - use drop-view to drop it'
             )
     except OperationalError:
+        raise click.ClickException(f'Table "{table}" does not exist')
+
+
+def _dedupe_coerce_value(value: str, affinity: type) -> Any:
+    if value == "NULL":
+        return None
+    if affinity is int:
+        try:
+            return int(value)
+        except ValueError:
+            return value
+    if affinity is float:
+        try:
+            return float(value)
+        except ValueError:
+            return value
+    return value
+
+
+def _dedupe_format_values(values: tuple[Any, ...]) -> str:
+    return ", ".join("NULL" if value is None else str(value) for value in values)
+
+
+@cli.command(name="dedupe")
+@click.argument(
+    "path",
+    type=click.Path(file_okay=True, dir_okay=False, allow_dash=False),
+    required=True,
+)
+@click.argument("table")
+@click.option(
+    "--column",
+    multiple=True,
+    help="Column defining a duplicate; repeat for a compound key. "
+    "Defaults to every non-primary-key column",
+)
+@click.option(
+    "--winner",
+    "winners",
+    type=(str, str),
+    multiple=True,
+    help="Winner for a duplicate group, as DEDUPE_VALUES WINNER_PK, with "
+    "comma-separated values for compound keys. Repeat once per group",
+)
+@click.option(
+    "--apply",
+    "apply_changes",
+    is_flag=True,
+    help="Apply the plan after the preview; otherwise only prints the preview",
+)
+@click.option(
+    "-y",
+    "--yes",
+    is_flag=True,
+    help="Apply without prompting for confirmation (implies --apply)",
+)
+@load_extension_option
+def dedupe(path, table, column, winners, apply_changes, yes, load_extension):
+    """
+    Preview and remove duplicate rows, repointing foreign keys at the rows
+    that the business chose to keep.
+
+    Rows matching on the --column values form duplicate groups. Every group
+    needs an explicit --winner naming the primary key of the row to keep -
+    this command never chooses one for you. By default it only prints the
+    rows it would delete and the foreign keys it would repoint; use --apply
+    (or -y) to actually run the plan. The whole change is transactional, so a
+    failure rolls every repoint and delete back.
+
+    Example:
+
+    \b
+        sqlite-utils dedupe companies.db companies --column name \\
+            --winner "Acme" 1 --apply
+    """
+    db = sqlite_utils.Database(path)
+    _register_db_for_cleanup(db)
+    _load_extensions(db, load_extension)
+    try:
+        target = db.table(table)
+        if not target.exists():
+            raise click.ClickException(f'Table "{table}" does not exist')
+        dedupe_columns = tuple(column) if column else None
+        resolved_columns = (
+            dedupe_columns
+            if dedupe_columns
+            else tuple(
+                col.name
+                for col in target.columns
+                if col.name not in set(target.pks)
+            )
+        )
+        if not winners:
+            click.echo(
+                "No --winner supplied - listing duplicate groups so the "
+                "surviving row for each can be chosen first:"
+            )
+            try:
+                groups = target.duplicate_groups(columns=dedupe_columns)
+            except (DedupeError, InvalidColumns) as ex:
+                raise click.ClickException(str(ex))
+            if not groups:
+                click.echo("No duplicate rows found.")
+                return
+            rows = []
+            for key, member_pks in groups:
+                rows.append(
+                    (
+                        _dedupe_format_values(key),
+                        ", ".join(str(pk) for pk in member_pks),
+                    )
+                )
+            click.echo(
+                tabulate.tabulate(
+                    rows, headers=("duplicate values", "candidate primary keys")
+                )
+            )
+            click.echo(
+                "\nRe-run with one --winner DEDUPE_VALUES WINNER_PK per "
+                "group to preview the full plan."
+            )
+            return
+        affinity = {
+            col.name: column_affinity(col.type) for col in target.columns
+        }
+        # A rowid table's implicit primary key is not among table_info columns
+        for pk_name in target.pks:
+            affinity.setdefault(pk_name, int)
+        pk_columns = tuple(target.pks)
+        parsed_winners: dict[tuple[Any, ...], tuple[Any, ...]] = {}
+        for raw_key, raw_pk in winners:
+            key_parts = tuple(raw_key.split(","))
+            pk_parts = tuple(raw_pk.split(","))
+            if len(key_parts) != len(resolved_columns):
+                raise click.ClickException(
+                    f"--winner key {raw_key!r} has {len(key_parts)} value(s) "
+                    f"but expected {len(resolved_columns)} for columns "
+                    f"{resolved_columns}"
+                )
+            if len(pk_parts) != len(pk_columns):
+                raise click.ClickException(
+                    f"--winner primary key {raw_pk!r} has {len(pk_parts)} "
+                    f"value(s) but expected {len(pk_columns)} for primary "
+                    f"key {pk_columns}"
+                )
+            key_coerced = tuple(
+                _dedupe_coerce_value(part, affinity[name])
+                for part, name in zip(key_parts, resolved_columns)
+            )
+            pk_coerced = tuple(
+                _dedupe_coerce_value(part, affinity[name])
+                for part, name in zip(pk_parts, pk_columns)
+            )
+            parsed_winners[key_coerced] = pk_coerced
+        try:
+            plan = target.dedupe_plan(parsed_winners, columns=list(resolved_columns))
+        except (DedupeError, InvalidColumns) as ex:
+            raise click.ClickException(str(ex))
+
+        click.echo(
+            f"Table {table}: {plan.delete_count} row(s) to delete, "
+            f"{plan.repoint_count} foreign key column(s) to repoint"
+        )
+        if plan.rows_to_delete:
+            headers = list(plan.rows_to_delete[0].keys())
+            click.echo(
+                tabulate.tabulate(
+                    [list(row.values()) for row in plan.rows_to_delete],
+                    headers=headers,
+                )
+            )
+        if plan.repoints:
+            click.echo("\nForeign keys to repoint:")
+            click.echo(
+                tabulate.tabulate(
+                    [
+                        (
+                            repoint.table,
+                            ", ".join(repoint.columns),
+                            _dedupe_format_values(repoint.old_value),
+                            _dedupe_format_values(repoint.new_value),
+                            len(repoint.affected_rows),
+                        )
+                        for repoint in plan.repoints
+                    ],
+                    headers=(
+                        "table",
+                        "foreign key",
+                        "old value",
+                        "new value",
+                        "rows",
+                    ),
+                )
+            )
+        if plan.unique_conflicts:
+            click.echo("\nUnique conflicts that block application:")
+            click.echo(
+                tabulate.tabulate(
+                    [
+                        (
+                            conflict.table,
+                            conflict.constraint,
+                            _dedupe_format_values(conflict.old_value),
+                            _dedupe_format_values(conflict.new_value),
+                        )
+                        for conflict in plan.unique_conflicts
+                    ],
+                    headers=("table", "constraint", "old value", "new value"),
+                )
+            )
+            raise click.ClickException(
+                "Repointing foreign keys would violate a unique constraint - "
+                "resolve the conflicts before applying"
+            )
+        if not (apply_changes or yes):
+            click.echo(
+                "\nPreview only - re-run with --apply to make these changes."
+            )
+            return
+        if not yes:
+            click.confirm(
+                f"Delete {plan.delete_count} row(s) and repoint "
+                f"{plan.repoint_count} foreign key column(s)?",
+                abort=True,
+            )
+        try:
+            target.dedupe_apply(plan)
+        except (DedupeError, InvalidColumns, sqlite3.Error) as ex:
+            raise click.ClickException(
+                f"Applied nothing - the transaction was rolled back: {ex}"
+            )
+        click.echo(
+            f"Done: deleted {plan.delete_count} row(s), repointed "
+            f"{plan.repoint_count} foreign key column(s)."
+        )
+    except NoTable:
         raise click.ClickException(f'Table "{table}" does not exist')
 
 

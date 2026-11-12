@@ -2220,6 +2220,40 @@ Use ``--ignore`` to ignore the error if the table does not exist.
 .. note::
     In Python: :ref:`table.drop() <python_api_drop>`  CLI reference: :ref:`sqlite-utils drop-table <cli_ref_drop_table>`
 
+.. _cli_dedupe_table:
+
+Deduplicating tables
+====================
+
+The ``dedupe`` command removes duplicate rows from a table while keeping foreign key references valid. Rows are grouped by the values of the ``--column`` options (repeat the option for a compound key; every non-primary-key column is used if none are given). Because the tool must never guess which row the business wants to keep, each duplicate group needs an explicit ``--winner`` giving the primary key of the surviving row.
+
+Running it without ``--winner`` first lists the duplicate groups and the candidate primary keys so the winners can be decided:
+
+.. code-block:: bash
+
+    sqlite-utils dedupe companies.db companies --column name --column city
+
+Supply one ``--winner DEDUPE_VALUES WINNER_PK`` per duplicate group to preview the full plan - the rows that would be deleted, every foreign key column that would be repointed at the losers, and any unique constraints that repointing would violate. Comma-separate the values for compound keys:
+
+.. code-block:: bash
+
+    sqlite-utils dedupe companies.db companies \
+        --column name --column city \
+        --winner "Acme,London" 1
+
+The default run only prints the preview and changes nothing. Add ``--apply`` to confirm interactively, or ``-y`` to apply without prompting:
+
+.. code-block:: bash
+
+    sqlite-utils dedupe companies.db companies \
+        --column name --column city \
+        --winner "Acme,London" 1 --apply
+
+All repoints and deletes run in a single transaction, so a failure - including a unique constraint or foreign key violation - rolls the whole operation back.
+
+.. note::
+    In Python: :ref:`table.dedupe_plan() <python_api_dedupe>`  CLI reference: :ref:`sqlite-utils dedupe <cli_ref_dedupe>`
+
 .. _cli_transform_table:
 
 Transforming tables

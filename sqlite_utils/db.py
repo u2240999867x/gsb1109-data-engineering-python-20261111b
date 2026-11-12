@@ -326,6 +326,96 @@ class TransformError(Exception):
     pass
 
 
+@dataclass(frozen=True)
+class DedupeGroup:
+    """
+    One group of rows that compare equal on the dedupe columns.
+
+    ``winner`` is the primary key of the row the business chose to keep; every
+    primary key in ``losers`` will be deleted when the plan is applied.
+    ``key`` holds the matching column values for every column in the dedupe
+    order (with ``None`` for SQL ``NULL``).
+    """
+
+    key: tuple[Any, ...]
+    winner: tuple[Any, ...]
+    losers: tuple[tuple[Any, ...], ...]
+
+
+@dataclass(frozen=True)
+class ForeignKeyRepoint:
+    """
+    A single foreign key column that must be repointed before a loser row is
+    deleted.
+
+    For a single-column foreign key ``old_value``/``new_value`` are one-item
+    tuples; for a compound foreign key they hold one value per key column, in
+    the foreign key's column order. ``affected_rows`` are the primary keys of
+    the rows in the referencing table whose key currently equals ``old_value``.
+    """
+
+    table: str
+    columns: tuple[str, ...]
+    other_columns: tuple[str, ...]
+    old_value: tuple[Any, ...]
+    new_value: tuple[Any, ...]
+    affected_rows: tuple[tuple[Any, ...], ...]
+    is_compound: bool
+
+
+@dataclass(frozen=True)
+class DedupeUniqueConflict:
+    """
+    A unique constraint that repointing a foreign key would violate.
+
+    Repointing ``table.columns`` from ``old_value`` to ``new_value`` would make
+    two rows of ``table`` compare equal on the unique index or primary key
+    ``constraint``, whose columns are listed in ``constraint_columns``.
+    """
+
+    table: str
+    columns: tuple[str, ...]
+    old_value: tuple[Any, ...]
+    new_value: tuple[Any, ...]
+    constraint: str
+    constraint_columns: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class DedupePlan:
+    """
+    The complete, validated plan produced by :meth:`Table.dedupe_plan`.
+
+    Everything needed to apply the operation is captured here, including the
+    full rows that will be deleted, every foreign key repoint required to keep
+    references valid, and any unique conflicts that block application. A plan
+    is a point-in-time snapshot: :meth:`Table.dedupe_apply` rejects a stale
+    plan rather than acting on a database that has since changed.
+    """
+
+    table: str
+    columns: tuple[str, ...]
+    groups: tuple[DedupeGroup, ...]
+    rows_to_delete: tuple[dict[str, Any], ...]
+    repoints: tuple[ForeignKeyRepoint, ...]
+    unique_conflicts: tuple[DedupeUniqueConflict, ...]
+
+    @property
+    def can_apply(self) -> bool:
+        "``True`` if no unique constraint blocks the planned repoints."
+        return not self.unique_conflicts
+
+    @property
+    def delete_count(self) -> int:
+        "Number of rows that will be deleted."
+        return len(self.rows_to_delete)
+
+    @property
+    def repoint_count(self) -> int:
+        "Number of foreign key columns that will be updated."
+        return len(self.repoints)
+
+
 # A single column name, or a tuple of columns for a compound foreign key
 ForeignKeyColumns = str | tuple[str, ...] | list[str]
 
@@ -466,6 +556,15 @@ class InvalidColumns(Exception):
 
 class TransactionError(Exception):
     "Operation cannot be performed while a transaction is open"
+
+
+class DedupeError(Exception):
+    """
+    A :meth:`Table.dedupe` plan cannot be built or applied safely - for
+    example a chosen winner does not exist, a duplicate group has no winner,
+    the preview is stale, or repointing a foreign key would violate a unique
+    constraint.
+    """
 
 
 class DescIndex(str):
@@ -2639,6 +2738,476 @@ class Table(Queryable):
             sql = f"CREATE TABLE {quote_identifier(new_name)} AS SELECT * FROM {quote_identifier(self.name)};"
             self.db.execute(sql)
         return self.db.table(new_name)
+
+    def _resolve_dedupe_columns(
+        self, columns: "PrimaryKey | None"
+    ) -> tuple[str, ...]:
+        available = {column.name for column in self.columns}
+        if columns is None:
+            pk_columns = set(self.pks)
+            resolved = tuple(
+                column.name
+                for column in self.columns
+                if column.name not in pk_columns
+            )
+            if not resolved:
+                raise DedupeError(
+                    f"Table {self.name} has no non-primary-key columns to "
+                    "dedupe on - pass columns= explicitly"
+                )
+            return resolved
+        if isinstance(columns, str):
+            resolved = (columns,)
+        else:
+            resolved = tuple(columns)
+        if not resolved:
+            raise DedupeError("At least one dedupe column is required")
+        for column in resolved:
+            if column not in available:
+                raise InvalidColumns(
+                    f"Column {column} does not exist on table {self.name}"
+                )
+        return resolved
+
+    @staticmethod
+    def _normalize_dedupe_winners(
+        winners: Mapping[Any, Any] | None,
+        dedupe_columns: tuple[str, ...],
+        pk_columns: tuple[str, ...],
+    ) -> dict[tuple[Any, ...], tuple[Any, ...]]:
+        normalized: dict[tuple[Any, ...], tuple[Any, ...]] = {}
+        for key, winner_pk in (winners or {}).items():
+            key_tuple = key if isinstance(key, tuple) else (key,)
+            pk_tuple = (
+                tuple(winner_pk)
+                if isinstance(winner_pk, (tuple, list))
+                else (winner_pk,)
+            )
+            if len(key_tuple) != len(dedupe_columns):
+                raise DedupeError(
+                    f"Winner key {key_tuple!r} has {len(key_tuple)} value(s) "
+                    f"but the dedupe columns {dedupe_columns} have "
+                    f"{len(dedupe_columns)}"
+                )
+            if len(pk_tuple) != len(pk_columns):
+                raise DedupeError(
+                    f"Winner primary key {pk_tuple!r} has {len(pk_tuple)} "
+                    f"value(s) but table primary key {pk_columns} has "
+                    f"{len(pk_columns)}"
+                )
+            normalized[key_tuple] = pk_tuple
+        return normalized
+
+    def _dedupe_members(
+        self, dedupe_columns: tuple[str, ...]
+    ) -> dict[tuple[Any, ...], list[tuple[tuple[Any, ...], dict[str, Any]]]]:
+        pk_columns = tuple(self.pks)
+        order_by = ", ".join(quote_identifier(column) for column in pk_columns)
+        members_by_key: dict[
+            tuple[Any, ...], list[tuple[tuple[Any, ...], dict[str, Any]]]
+        ] = {}
+        for row_pk, row in self.pks_and_rows_where(order_by=order_by):
+            pk_tuple = row_pk if isinstance(row_pk, tuple) else (row_pk,)
+            key = tuple(row[column] for column in dedupe_columns)
+            members_by_key.setdefault(key, []).append((pk_tuple, row))
+        return members_by_key
+
+    def duplicate_groups(
+        self, *, columns: "PrimaryKey | None" = None
+    ) -> list[tuple[tuple[Any, ...], tuple[tuple[Any, ...], ...]]]:
+        """
+        Return every group of rows that compare equal on the dedupe columns.
+
+        The result is a list of ``(key, primary_keys)`` pairs, where ``key``
+        holds the matching column values (one per dedupe column) and
+        ``primary_keys`` lists every member row's primary key (a tuple, even
+        for single-column primary keys). Groups with only one row are not
+        included. This is read-only and chooses no winner, so it can be used
+        to prepare the ``winners`` mapping required by :meth:`dedupe_plan`.
+
+        :param columns: Column(s) defining a duplicate; defaults to all non-primary-key columns
+        """
+        if not self.exists():
+            raise NoTable(f"Table {self.name} does not exist")
+        dedupe_columns = self._resolve_dedupe_columns(columns)
+        members_by_key = self._dedupe_members(dedupe_columns)
+        return [
+            (
+                key,
+                tuple(member_pk for member_pk, _ in members),
+            )
+            for key, members in members_by_key.items()
+            if len(members) > 1
+        ]
+
+    def dedupe_plan(
+        self,
+        winners: Mapping[Any, Any] | None = None,
+        *,
+        columns: "PrimaryKey | None" = None,
+    ) -> "DedupePlan":
+        """
+        Build (but do not apply) a plan for removing duplicate rows.
+
+        Rows are grouped by the values of ``columns`` (every non-primary-key
+        column by default); compound dedupe keys compare every column, not
+        just the first one. Each duplicate group must have its surviving row
+        named explicitly in ``winners`` - the method never picks a winner on
+        the caller's behalf. ``winners`` maps the matching column values (a
+        scalar for one column, otherwise a tuple) to the winner's primary key
+        (a scalar for a single-column primary key, otherwise a tuple).
+
+        The returned :class:`DedupePlan` previews the full rows that will be
+        deleted, every foreign key that must be repointed at the losers
+        (compound and circular foreign keys included), and any unique
+        constraints that repointing would violate. Apply it with
+        :meth:`dedupe_apply`.
+
+        :param winners: Mapping of duplicate-key values to the winner's primary key
+        :param columns: Column(s) defining a duplicate; defaults to all non-primary-key columns
+        """
+        if not self.exists():
+            raise NoTable(f"Table {self.name} does not exist")
+        dedupe_columns = self._resolve_dedupe_columns(columns)
+        pk_columns = tuple(self.pks)
+        members_by_key = self._dedupe_members(dedupe_columns)
+
+        normalized_winners = self._normalize_dedupe_winners(
+            winners, dedupe_columns, pk_columns
+        )
+
+        groups: list[DedupeGroup] = []
+        loser_pks: set[tuple[Any, ...]] = set()
+        loser_rows: list[dict[str, Any]] = []
+        for key, members in members_by_key.items():
+            if len(members) == 1:
+                if key in normalized_winners:
+                    raise DedupeError(
+                        f"Winner specified for key {key!r} but that group has "
+                        "no duplicate rows"
+                    )
+                continue
+            if key not in normalized_winners:
+                raise DedupeError(
+                    f"Duplicate group {key!r} on columns {dedupe_columns} has "
+                    "no winner - specify which row to keep in winners"
+                )
+            winner_pk = normalized_winners[key]
+            member_pks = {member_pk for member_pk, _ in members}
+            if winner_pk not in member_pks:
+                raise DedupeError(
+                    f"Winner primary key {winner_pk!r} is not one of the rows "
+                    f"in duplicate group {key!r}"
+                )
+            group_losers = tuple(
+                member_pk for member_pk in member_pks if member_pk != winner_pk
+            )
+            groups.append(DedupeGroup(key, winner_pk, group_losers))
+            for member_pk, row in members:
+                if member_pk != winner_pk:
+                    loser_pks.add(member_pk)
+                    loser_rows.append(row)
+
+        unknown_winner_keys = set(normalized_winners) - set(members_by_key)
+        if unknown_winner_keys:
+            raise DedupeError(
+                "Winner keys do not match any rows: "
+                + ", ".join(repr(key) for key in sorted(unknown_winner_keys, key=repr))
+            )
+
+        repoints, conflicts = self._dedupe_foreign_key_plan(
+            pk_columns, groups, loser_pks
+        )
+        return DedupePlan(
+            table=self.name,
+            columns=dedupe_columns,
+            groups=tuple(groups),
+            rows_to_delete=tuple(loser_rows),
+            repoints=tuple(repoints),
+            unique_conflicts=tuple(conflicts),
+        )
+
+    def _dedupe_foreign_key_plan(
+        self,
+        pk_columns: tuple[str, ...],
+        groups: list["DedupeGroup"],
+        loser_pks: set[tuple[Any, ...]],
+    ) -> tuple[list["ForeignKeyRepoint"], list["DedupeUniqueConflict"]]:
+        winner_by_loser: dict[tuple[Any, ...], tuple[Any, ...]] = {}
+        for group in groups:
+            for loser_pk in group.losers:
+                winner_by_loser[loser_pk] = group.winner
+        repoints: list[ForeignKeyRepoint] = []
+        pk_index = {column: i for i, column in enumerate(pk_columns)}
+        # Every table's foreign keys are inspected, including this table's
+        # own, so self-references and circular references are handled fully.
+        for referencing_table in self.db.tables:
+            for fk in referencing_table.foreign_keys:
+                if fk.other_table != self.name:
+                    continue
+                other_columns = tuple(fk.other_columns)
+                unresolvable = set(other_columns) - set(pk_columns)
+                if unresolvable:
+                    raise DedupeError(
+                        f"Foreign key {fk.table}.{tuple(fk.columns)} references "
+                        f"non-primary-key column(s) {sorted(unresolvable)} of "
+                        f"{self.name}; dedupe can only repoint foreign keys "
+                        "that reference the primary key"
+                    )
+                column_order = [pk_index[column] for column in other_columns]
+                ref_pk_columns = tuple(referencing_table.pks)
+                for loser_pk in sorted(loser_pks, key=repr):
+                    old_value = tuple(loser_pk[i] for i in column_order)
+                    new_value = tuple(
+                        winner_by_loser[loser_pk][i] for i in column_order
+                    )
+                    where = " AND ".join(
+                        f"{quote_identifier(column)} IS ?" for column in fk.columns
+                    )
+                    affected = tuple(
+                        row_pk if isinstance(row_pk, tuple) else (row_pk,)
+                        for row_pk, _ in referencing_table.pks_and_rows_where(
+                            where=where,
+                            where_args=list(old_value),
+                            order_by=", ".join(
+                                quote_identifier(column)
+                                for column in ref_pk_columns
+                            ),
+                        )
+                    )
+                    if not affected:
+                        continue
+                    repoints.append(
+                        ForeignKeyRepoint(
+                            table=referencing_table.name,
+                            columns=tuple(fk.columns),
+                            other_columns=other_columns,
+                            old_value=old_value,
+                            new_value=new_value,
+                            affected_rows=affected,
+                            is_compound=fk.is_compound,
+                        )
+                    )
+        conflicts = self._dedupe_unique_conflicts(repoints)
+        return repoints, conflicts
+
+    def _dedupe_unique_conflicts(
+        self, repoints: list["ForeignKeyRepoint"]
+    ) -> list["DedupeUniqueConflict"]:
+        # Simulate the value every referencing row will hold once every
+        # repoint has run, then check it against each unique constraint. This
+        # catches conflicts that only appear after several repoints (when two
+        # losers are both repointed at the same winner) and conflicts on
+        # compound unique constraints that merely contain the foreign key
+        # columns.
+        maps_by_table: dict[
+            str,
+            list[
+                tuple[
+                    tuple[str, ...],
+                    dict[tuple[Any, ...], tuple[Any, ...]],
+                ]
+            ],
+        ] = {}
+        tables: set[str] = set()
+        for repoint in repoints:
+            tables.add(repoint.table)
+            table_maps = maps_by_table.setdefault(repoint.table, [])
+            existing = next(
+                (entry for entry in table_maps if entry[0] == repoint.columns),
+                None,
+            )
+            if existing is None:
+                value_map: dict[tuple[Any, ...], tuple[Any, ...]] = {}
+                table_maps.append((repoint.columns, value_map))
+            else:
+                value_map = existing[1]
+            value_map[repoint.old_value] = repoint.new_value
+        conflicts: list[DedupeUniqueConflict] = []
+        for table_name in sorted(tables):
+            table = self.db.table(table_name)
+            ref_pk_columns = tuple(table.pks)
+            repoint_maps = maps_by_table[table_name]
+            for constraint_name, constraint_columns in (
+                self._dedupe_unique_column_sets(table, ref_pk_columns)
+            ):
+                seen: dict[tuple[Any, ...], tuple[Any, ...]] = {}
+                for row_pk, row in table.pks_and_rows_where():
+                    pk_tuple = (
+                        row_pk if isinstance(row_pk, tuple) else (row_pk,)
+                    )
+                    final_value = self._dedupe_final_row_value(
+                        row, constraint_columns, repoint_maps
+                    )
+                    # A unique index treats NULLs as distinct, so values
+                    # containing NULL can never collide.
+                    if any(value is None for value in final_value):
+                        continue
+                    if final_value in seen:
+                        conflicts.append(
+                            DedupeUniqueConflict(
+                                table=table_name,
+                                columns=tuple(constraint_columns),
+                                old_value=tuple(
+                                    row[column] for column in constraint_columns
+                                ),
+                                new_value=final_value,
+                                constraint=constraint_name,
+                                constraint_columns=tuple(constraint_columns),
+                            )
+                        )
+                    else:
+                        seen[final_value] = pk_tuple
+        return conflicts
+
+    @staticmethod
+    def _dedupe_final_row_value(
+        row: dict[str, Any],
+        constraint_columns: tuple[str, ...],
+        repoint_maps: list[
+            tuple[
+                tuple[str, ...],
+                dict[tuple[Any, ...], tuple[Any, ...]],
+            ]
+        ],
+    ) -> tuple[Any, ...]:
+        final = [row[column] for column in constraint_columns]
+        for fk_columns, value_map in repoint_maps:
+            if not set(fk_columns) & set(constraint_columns):
+                continue
+            old_key = tuple(row[column] for column in fk_columns)
+            new_key = value_map.get(old_key)
+            if new_key is None:
+                continue
+            for fk_index, fk_column in enumerate(fk_columns):
+                if fk_column in constraint_columns:
+                    final[constraint_columns.index(fk_column)] = new_key[
+                        fk_index
+                    ]
+        return tuple(final)
+
+    @staticmethod
+    def _dedupe_unique_column_sets(
+        table: "Table", pk_columns: tuple[str, ...]
+    ) -> list[tuple[str, tuple[str, ...]]]:
+        # Partial unique indexes enforce uniqueness only over rows matching
+        # their WHERE clause, which this static check cannot evaluate - they
+        # are still enforced by SQLite when the plan is applied.
+        sets: list[tuple[str, tuple[str, ...]]] = [
+            ("PRIMARY KEY", pk_columns)
+        ]
+        for index in table.indexes:
+            if index.unique and not index.partial:
+                sets.append((index.name, tuple(index.columns)))
+        return sets
+
+    def dedupe_apply(self, plan: "DedupePlan") -> "DedupePlan":
+        """
+        Apply a :class:`DedupePlan` produced by :meth:`dedupe_plan`.
+
+        The plan is first rebuilt from the current database contents and
+        compared against ``plan``, so a stale preview (rows changed after it
+        was generated) is rejected. All foreign key repoints and row deletes
+        then run inside a single transaction: if anything fails, including a
+        unique constraint or foreign key check, every change is rolled back
+        and the database is left exactly as it was before the call.
+
+        :param plan: The plan to apply
+        """
+        if not self.exists():
+            raise NoTable(f"Table {self.name} does not exist")
+        if not isinstance(plan, DedupePlan):
+            raise DedupeError("dedupe_apply() requires a DedupePlan from dedupe_plan()")
+        if plan.table != self.name:
+            raise DedupeError(
+                f"Plan was built for table {plan.table!r}, not {self.name!r}"
+            )
+        if plan.unique_conflicts:
+            raise DedupeError(
+                "Refusing to apply: repointing foreign keys would violate "
+                f"{len(plan.unique_conflicts)} unique constraint(s)"
+            )
+        winners = {group.key: group.winner for group in plan.groups}
+        try:
+            current = self.dedupe_plan(winners, columns=list(plan.columns))
+        except DedupeError:
+            raise DedupeError(
+                "The table has changed since this plan was built - call "
+                "dedupe_plan() again and review the new preview"
+            )
+        if current != plan:
+            raise DedupeError(
+                "The table has changed since this plan was built - call "
+                "dedupe_plan() again and review the new preview"
+            )
+        pragma_foreign_keys_was_on = bool(
+            self.db.execute("PRAGMA foreign_keys").fetchone()[0]
+        )
+        with self.db.atomic():
+            for repoint in plan.repoints:
+                referencing_table = self.db.table(repoint.table)
+                sets = ", ".join(
+                    f"{quote_identifier(column)} = ?"
+                    for column in repoint.columns
+                )
+                wheres = " AND ".join(
+                    f"{quote_identifier(column)} IS ?"
+                    for column in repoint.columns
+                )
+                cursor = self.db.execute(
+                    f"UPDATE {quote_identifier(repoint.table)} SET {sets} "
+                    f"WHERE {wheres}",
+                    [*repoint.new_value, *repoint.old_value],
+                )
+                if cursor.rowcount != len(repoint.affected_rows):
+                    raise DedupeError(
+                        f"Expected to repoint {len(repoint.affected_rows)} "
+                        f"row(s) in {repoint.table}.{tuple(repoint.columns)} "
+                        f"but updated {cursor.rowcount}"
+                    )
+            for group in plan.groups:
+                for loser_pk in group.losers:
+                    wheres = " AND ".join(
+                        f"{quote_identifier(column)} IS ?"
+                        for column in self.pks
+                    )
+                    cursor = self.db.execute(
+                        f"DELETE FROM {quote_identifier(self.name)} WHERE {wheres}",
+                        list(loser_pk),
+                    )
+                    if cursor.rowcount != 1:
+                        raise DedupeError(
+                            f"Expected to delete one row with primary key "
+                            f"{loser_pk!r} but deleted {cursor.rowcount}"
+                        )
+            if pragma_foreign_keys_was_on:
+                violations = self.db.execute(
+                    "PRAGMA foreign_key_check;"
+                ).fetchall()
+                if violations:
+                    raise sqlite3.IntegrityError("FOREIGN KEY constraint failed")
+        return plan
+
+    def dedupe(
+        self,
+        winners: Mapping[Any, Any] | None = None,
+        *,
+        columns: "PrimaryKey | None" = None,
+    ) -> "DedupePlan":
+        """
+        Preview and apply duplicate-row removal in one call.
+
+        This is equivalent to :meth:`dedupe_plan` followed by
+        :meth:`dedupe_apply`; use those two methods separately when you want
+        to inspect the preview before confirming. The same safety rules apply:
+        winners are never chosen automatically, unique conflicts block the
+        operation, and the whole change is atomic.
+
+        :param winners: Mapping of duplicate-key values to the winner's primary key
+        :param columns: Column(s) defining a duplicate; defaults to all non-primary-key columns
+        """
+        plan = self.dedupe_plan(winners, columns=columns)
+        return self.dedupe_apply(plan)
 
     def transform(
         self,

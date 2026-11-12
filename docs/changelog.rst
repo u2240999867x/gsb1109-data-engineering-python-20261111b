@@ -4,6 +4,13 @@
  Changelog
 ===========
 
+.. _v4_3:
+
+4.3 (unreleased)
+----------------
+
+- New ``table.dedupe_plan()``, ``table.dedupe_apply()``, ``table.dedupe()`` and ``table.duplicate_groups()`` methods, plus a ``sqlite-utils dedupe`` command, for removing duplicate rows from a table while repointing the foreign keys that reference them. Winners are supplied explicitly and never chosen automatically; compound dedupe keys, compound foreign keys and circular/self-referential foreign keys are handled on every key column. The plan previews the rows to delete, the required foreign key repoints and any unique conflicts they would cause, and is applied atomically so a failure never leaves rows deleted with their references unmigrated.
+
 .. _v4_2_1:
 
 4.2.1 (2026-08-13)
