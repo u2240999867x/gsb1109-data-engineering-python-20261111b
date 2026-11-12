@@ -6,6 +6,12 @@ Changelog
 Unreleased
 ----------
 
+- Add ``pydash.sorting`` module with ``SortPolicy``, ``ColumnSortSpec``, ``MergeStore``,
+  ``KeyedRecord``, and ``Page`` for partition-merge sorting: per-column type zones, direction,
+  and null placement; persistable sort keys that merge across processes using only the key and
+  the global ingestion sequence number; cursor-based paging that reports the segment of emitted
+  results to redo when late records arrive; and ``StaleCursorError`` for cursors issued under a
+  changed policy.
 - Stop ``partial`` and ``partial_right`` wrappers from accepting a positional iteratee argument in
   a slot that a keyword argument already binds, so ``map_`` passes the element instead of an index
   into the bound parameter.

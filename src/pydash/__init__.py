@@ -113,7 +113,7 @@ from .collections import (
     some,
     sort_by,
 )
-from .exceptions import InvalidMethod
+from .exceptions import InvalidMethod, StaleCursorError
 from .functions import (
     after,
     ary,
@@ -274,6 +274,13 @@ from .predicates import (
     lt_cmp,
     lte,
     lte_cmp,
+)
+from .sorting import (
+    ColumnSortSpec,
+    KeyedRecord,
+    MergeStore,
+    Page,
+    SortPolicy,
 )
 from .strings import (
     camel_case,
@@ -498,6 +505,7 @@ __all__ = (
     "some",
     "sort_by",
     "InvalidMethod",
+    "StaleCursorError",
     "after",
     "ary",
     "before",
@@ -651,6 +659,11 @@ __all__ = (
     "lt_cmp",
     "lte",
     "lte_cmp",
+    "ColumnSortSpec",
+    "KeyedRecord",
+    "MergeStore",
+    "Page",
+    "SortPolicy",
     "camel_case",
     "capitalize",
     "chars",

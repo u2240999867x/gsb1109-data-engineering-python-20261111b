@@ -135,6 +135,13 @@ Predicates
     :members:
 
 
+Sorting
+=======
+
+.. automodule:: pydash.sorting
+    :members:
+
+
 Strings
 =======
 
