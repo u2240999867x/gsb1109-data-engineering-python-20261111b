@@ -92,6 +92,15 @@ details.
     :exclude-members: __weakref__
     :member-order: bysource
 
+``tinydb.cleanup``
+------------------
+
+.. automodule:: tinydb.cleanup
+    :members: Cleanup, CleanupResult
+    :special-members:
+    :exclude-members: __weakref__
+    :member-order: bysource
+
 ``tinydb.operations``
 ---------------------
 

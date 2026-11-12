@@ -532,6 +532,41 @@ Let's sum up the way TinyDB supports working with IDs:
 +-------------------------------------+------------------------------------------------------------+
 
 
+Resumable batch cleanup
+-----------------------
+
+When a cleanup job has to delete many documents -- possibly with duplicated
+IDs -- the :class:`~tinydb.cleanup.Cleanup` helper runs the deletions in
+small batches and records the result of every source position so the job can
+be interrupted after any committed batch and resumed later.
+
+.. code-block:: python
+
+    from tinydb import TinyDB, Cleanup
+
+    db = TinyDB('db.json')
+    cleanup = Cleanup(db, doc_ids=[1, 1, 2, 99],
+                      batch_size=100, cleanup_id='partition-42')
+    result = cleanup.run()
+
+Each entry in ``result.results`` maps a source position to one of the
+statuses ``removed``, ``missing`` or ``skipped``. A duplicated ID is
+associated with the first request's verdict instead of being evaluated
+again after the document is gone, so an already deleted document is never
+reported as "never existed".
+
+To process one batch at a time, call :meth:`~tinydb.cleanup.Cleanup.run_batch`
+repeatedly; it returns ``None`` once the cleanup is finished. Retrying the
+same cleanup means constructing a new ``Cleanup`` with the same
+``cleanup_id`` and calling ``run()`` again -- the persisted recovery state
+is stored inside the database in the same storage write as the deletions,
+keeping state and data consistent within each storage's commit boundary.
+
+If a document ID is explicitly re-created as a new version after an earlier
+batch deleted the old one, the resumed cleanup records the position as
+``skipped`` and leaves the rebuilt document untouched.
+
+
 Tables
 ------
 

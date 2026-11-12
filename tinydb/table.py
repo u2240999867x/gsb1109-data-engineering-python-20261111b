@@ -651,10 +651,15 @@ class Table:
             def updater(table: dict):
                 # Filter to IDs that exist *before* performing any removals,
                 # so the operation is atomic: either every existing target is
-                # removed, or none is.
-                removed_ids.extend(
-                    doc_id for doc_id in requested_ids if doc_id in table
-                )
+                # removed, or none is. Repeated IDs are collapsed here:
+                # otherwise a duplicate would pass the existence check twice
+                # but only survive the first ``del``, making the second
+                # deletion fail with ``KeyError``.
+                seen: set = set()
+                for doc_id in requested_ids:
+                    if doc_id in table and doc_id not in seen:
+                        seen.add(doc_id)
+                        removed_ids.append(doc_id)
                 for doc_id in removed_ids:
                     del table[doc_id]
 
