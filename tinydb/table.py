@@ -12,6 +12,7 @@ from typing import (
     overload
 )
 
+from .drafts import DocumentDraft
 from .queries import QueryLike
 from .storages import Storage
 from .utils import LRUCache
@@ -721,6 +722,31 @@ class Table:
         """
 
         self._query_cache.clear()
+
+    def draft(
+        self,
+        doc_id: int,
+        list_keys: Optional[Mapping[str, str]] = None
+    ) -> DocumentDraft:
+        """
+        Create an isolated draft for editing the document with ``doc_id``.
+
+        The draft holds a deep copy of the document; edits made to it are
+        not visible to queries, the query cache or the storage.  On
+        :meth:`DocumentDraft.save` only the fields that were actually
+        touched are committed, three-way merged against the currently
+        stored document.  See :mod:`tinydb.drafts` for details.
+
+        :param doc_id: the ID of the document to edit
+        :param list_keys: mapping of dotted paths of nested lists to the
+                          name of a stable business key used to align items
+                          (e.g. ``{'items': 'sku'}``)
+        :returns: a draft for the document
+        """
+
+        return DocumentDraft(
+            self, self.document_id_class(doc_id), list_keys=list_keys
+        )
 
     def __len__(self):
         """
