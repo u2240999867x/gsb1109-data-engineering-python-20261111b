@@ -17,6 +17,26 @@ In most cases there's no need to set the `encoding` parameter. If
 is encoded either in utf-8 or latin-1.
 
 
+Incremental Transaction Batches
+-------------------------------
+
+The :mod:`sqlparse.transactions` module reads a SQL import stream
+incrementally and yields one batch per complete transaction as soon as
+it has been read, without waiting for the end of the stream.
+
+.. currentmodule:: sqlparse.transactions
+
+.. autofunction:: sqlparse.transactions.iter_transaction_batches
+
+.. autoclass:: sqlparse.transactions.TransactionStreamReader
+   :members: pending_offset
+
+.. autoclass:: sqlparse.transactions.TransactionBatch
+   :members:
+
+.. currentmodule:: sqlparse
+
+
 .. _formatting:
 
 Formatting of SQL Statements

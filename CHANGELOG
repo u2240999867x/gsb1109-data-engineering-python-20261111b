@@ -1,3 +1,17 @@
+Unreleased
+----------
+
+* Add ``sqlparse.transactions`` module with incremental, transaction-aware
+  batching of SQL import streams. ``iter_transaction_batches()`` reads a
+  stream chunk by chunk and yields each complete committed transaction (or
+  each standalone DML statement) as a ``TransactionBatch`` as soon as it has
+  been read. Statement splitting is aware of quotes, comments and
+  dollar-quoted strings spanning chunk boundaries; statements rolled back to
+  a savepoint are excluded from the emitted batch; and an unclosed
+  transaction at end of stream is reported via
+  ``TransactionStreamReader.pending_offset``.
+
+
 Release 0.6.1 (Nov 01, 2026)
 ----------------------------
 
