@@ -156,6 +156,61 @@ It's also possible to use a custom (de)serializer for keys to allow non-string k
     >>> with SqliteDict("example.sqlite", encode_key=encode_key, decode_key=decode_key) as mydict:
     ...     pass
 
+Migrating legacy text keys to typed keys
+----------------------------------------
+
+A database created before key encoding stores raw, human-readable text keys.
+Switching an existing table to the typed key codec introduces keys (ints,
+tuples, ...) whose on-disk representation is different, so a legacy text key
+``"12"`` and a new integer key ``12`` can coexist.  Use the resumable, batched
+``migrate_typed_keys`` to move legacy rows onto the typed key space.
+
+Open the table with the typed codec, then run the migration.  A legacy key with
+more than one plausible typed interpretation (for example text ``"12"`` vs
+integer ``12``) is *held* rather than guessed: no new key can read the old
+value until a caller-supplied claim settles its identity.
+
+.. code-block:: python
+
+    >>> import os
+    >>> from sqlitedict import SqliteDict, encode_key, decode_key
+    >>> from sqlitedict import MigrationClaim, KeyMigration
+    >>> path = "migration_example.sqlite"
+    >>> if os.path.exists(path):
+    ...     os.unlink(path)
+    >>> # A legacy table written with the default text-only key codec.
+    >>> legacy = SqliteDict(path, tablename="items")
+    >>> legacy["12"] = "twelve"
+    >>> legacy.commit()
+    >>> legacy.close()
+    >>> # Open the same table with the typed codec and migrate, in batches.
+    >>> db = SqliteDict(path, tablename="items",
+    ...                 encode_key=encode_key, decode_key=decode_key)
+    >>> report = db.migrate_typed_keys(batch_size=500)
+    >>> report.ambiguous          # legacy keys waiting for an explicit claim
+    ['12']
+    >>> (12 in db, "12" in db)    # no new key may read the held old value
+    (False, False)
+    >>> # A source manifest claim settles the legacy key's typed identity.
+    >>> _ = db.migrate_typed_keys(claims=[MigrationClaim("12", 12)])
+    >>> db[12]                   # the legacy value now lives under the integer key
+    'twelve'
+
+The migration is interruption-safe.  Every run is pinned to a persisted
+*generation id*; its pending, held and tombstone tables keep all queries,
+deletes and background writes aligned to one mapping, so resuming never
+resurrects a value already removed from the old key space.  For keys with an
+explicit claim, ``KeyMigration.reconcile`` compares the original value bytes
+held in the tombstone against the bytes now stored under the typed key, item by
+item.
+
+.. code-block:: python
+
+    >>> KeyMigration(db, claims={"12": 12}).reconcile()
+    [('12', 12, 'ok')]
+    >>> db.close()
+    >>> os.unlink(path)
+
 More
 ----
 

@@ -33,8 +33,15 @@ import tempfile
 import threading
 import logging
 import traceback
+import uuid
+import hashlib
 from base64 import b64decode, b64encode
 import weakref
+
+try:
+    from collections.abc import Mapping
+except ImportError:  # pragma: no cover - Python 2 fallback
+    from collections import Mapping
 
 __version__ = '2.1.0'
 
@@ -140,6 +147,553 @@ def decode_key(key):
 def identity(obj):
     """Identity f(x) = x function for encoding/decoding."""
     return obj
+
+
+#
+# Typed-key migration
+# -------------------
+#
+# A legacy table only ever stored raw, human-readable text keys (the default
+# ``identity`` key codec).  Switching to ``encode_key``/``decode_key`` introduces
+# typed keys (ints, tuples, ...) whose on-disk representations live in a
+# *different* text space, so a legacy row with the text key "12" and a new row
+# with the integer key 12 can both exist at once.
+#
+# The migration first *splits* the live table: every legacy row is moved into a
+# generation-scoped ``pending`` table, leaving only typed rows reachable through
+# the dict.  Pending rows are then processed in batches, each ending in a durable
+# commit: an unambiguous row is published under its typed key and recorded
+# (exact original bytes) in a generation-scoped ``tombstone`` table, while an
+# ambiguous row is moved into a generation-scoped ``held`` table.
+#
+# Every migration run is pinned to a single, persisted "generation id" used in
+# all its work-table names.  Queries, deletes and background writes of one run
+# therefore target one mapping and can never see another generation's rows.  A
+# resume adopts the persisted id, and because a moved/deleted value no longer
+# lives in the live table, it cannot be read from or resurrected via the old key
+# space.
+#
+
+# The on-disk key codec this migration produces (kept as constants so the
+# migration is always self-contained, regardless of the instance's codecs).
+_MIGRATION_ENCODE_KEY = encode_key
+_MIGRATION_DECODE_KEY = decode_key
+_MIGRATION_META_TABLE = 'sqlitedict_key_migration'
+
+
+def looks_like_encoded_key(stored_key):
+    """Return True when a stored key already belongs to the typed-key space.
+
+    Legacy rows store raw, human-readable text keys; typed rows store the
+    pickle+base64 output of :func:`encode_key`.  A stored key belongs to the
+    typed space only if it round-trips exactly through the typed codec, which
+    a coincidentally base64-looking legacy text key cannot do.  This is what
+    stops a migration from re-processing the typed rows it just wrote into the
+    same table.
+    """
+    try:
+        return _MIGRATION_ENCODE_KEY(_MIGRATION_DECODE_KEY(stored_key)) == stored_key
+    except Exception:
+        return False
+
+
+class MigrationClaim(object):
+    """An explicit caller-provided interpretation of a legacy key.
+
+    A claim maps a legacy *text* key (as stored in the old table) to a typed
+    Python key that the new, typed source uses.  Callers build these from their
+    own source manifests; they are what lets a migration decide which typed key
+    should inherit a legacy value when several interpretations are possible.
+    """
+
+    __slots__ = ('legacy', 'typed')
+
+    def __init__(self, legacy, typed):
+        if not isinstance(legacy, str):
+            raise TypeError('legacy claim key must be a text string, got %r' % type(legacy))
+        self.legacy = legacy
+        self.typed = typed
+
+    def __eq__(self, other):
+        if not isinstance(other, MigrationClaim):
+            return NotImplemented
+        return self.legacy == other.legacy and self.typed == other.typed
+
+    def __ne__(self, other):
+        result = self.__eq__(other)
+        if result is NotImplemented:
+            return result
+        return not result
+
+    def __hash__(self):
+        try:
+            return hash((self.legacy, self.typed))
+        except TypeError:
+            return hash(self.legacy)
+
+    def __repr__(self):
+        return 'MigrationClaim(legacy=%r, typed=%r)' % (self.legacy, self.typed)
+
+
+class MigrationReport(object):
+    """Summary of one ``migrate_typed_keys`` invocation."""
+
+    __slots__ = ('generation', 'migrated', 'tombstoned',
+                 'ambiguous', 'resumed', 'complete')
+
+    def __init__(self, generation, migrated=0, tombstoned=0,
+                 ambiguous=(), resumed=False, complete=False):
+        self.generation = generation
+        self.migrated = migrated
+        self.tombstoned = tombstoned
+        self.ambiguous = list(ambiguous)
+        self.resumed = resumed
+        self.complete = complete
+
+    def __repr__(self):
+        return (
+            'MigrationReport(generation=%r, migrated=%d, tombstoned=%d, '
+            'ambiguous=%r, resumed=%r, complete=%r)'
+            % (self.generation, self.migrated, self.tombstoned,
+               self.ambiguous, self.resumed, self.complete)
+        )
+
+
+def _claims_to_map(claims):
+    """Turn a claim iterable/mapping into a {legacy_text: typed_key} dict."""
+    if claims is None:
+        return {}
+    if isinstance(claims, Mapping):
+        items = claims.items()
+    else:
+        items = ((claim.legacy, claim.typed) for claim in claims)
+    result = {}
+    for legacy, typed in items:
+        if not isinstance(legacy, str):
+            raise TypeError(
+                'legacy claim key must be a text string, got %r' % type(legacy))
+        result[legacy] = typed
+    return result
+
+
+class KeyMigration(object):
+    """Batch, resumable migration of legacy text keys to typed keys.
+
+    Construct one with a :class:`SqliteDict` opened using the typed key codec
+    (``encode_key``/``decode_key``) and drive it with :meth:`run`, or call
+    :meth:`SqliteDict.migrate_typed_keys` directly.
+
+    The live table starts out holding only legacy, raw-text rows.  The first
+    run *splits* it: every legacy row is moved into a generation-scoped
+    ``pending`` table, leaving the live table containing typed rows only.  The
+    pending rows are then processed in batches:
+
+    * a row with one defensible interpretation is written to the live table
+      under its typed key, recorded with its exact original bytes in a
+      generation-scoped ``tombstone`` table, and removed from ``pending``;
+    * a row with several plausible interpretations (text "12" vs integer 12)
+      that no caller claim settles is moved into a generation-scoped ``held``
+      table.  Its bytes are preserved, but it is no longer reachable through
+      the dict, so neither typed key can read the old value away.  Supplying a
+      claim and re-running moves it back into ``pending`` for another pass.
+
+    Concurrency / consistency model:
+
+    * A migration owns a unique ``generation_id``, persisted in a sidecar
+      metadata table.  The pending, held and tombstone tables are all named
+      with that id, so every query, delete and background write of one run
+      targets the same mapping and can never be confused with another
+      generation's.  Re-opening a migration for the table adopts the persisted
+      generation instead of forking.
+    * Every batch and every split step is durably committed, so an
+      interruption only loses un-started work.  On resume the anti-join against
+      ``pending`` and the tombstones make every move idempotent: a value that
+      was already deleted from the live table is never copied back, i.e. it
+      cannot be resurrected from the old key space.
+    """
+
+    def __init__(self, db, claims=None, batch_size=500, generation_id=None):
+        if not isinstance(db, SqliteDict):
+            raise TypeError('KeyMigration expects a SqliteDict instance')
+        if db.flag == 'r':
+            raise RuntimeError('Refusing to migrate a read-only SqliteDict')
+        if db.encode_key is not _MIGRATION_ENCODE_KEY or \
+                db.decode_key is not _MIGRATION_DECODE_KEY:
+            raise RuntimeError(
+                'Typed-key migration requires the SqliteDict to be opened with '
+                'encode_key=sqlitedict.encode_key and '
+                'decode_key=sqlitedict.decode_key')
+        if batch_size < 1:
+            raise ValueError('batch_size must be a positive integer')
+
+        self.db = db
+        self.claims = _claims_to_map(claims)
+        self.batch_size = int(batch_size)
+        self._generation = generation_id or uuid.uuid4().hex
+        self.table = db.tablename
+        # Generation-scoped work tables.  ``pending`` holds legacy rows waiting
+        # to be classified, ``held`` rows parked until a claim arrives, and
+        # ``tombstone`` the exact original bytes of every migrated row.
+        self.pending_table = '"_km_pending_%s_%s"' % (self.table, self._generation)
+        self.held_table = '"_km_held_%s_%s"' % (self.table, self._generation)
+        self.tomb_table = '"_km_tomb_%s_%s"' % (self.table, self._generation)
+        # Encoded typed keys already produced by the current run, used to catch
+        # two legacy rows resolving to the same typed key inside one batch.
+        self._claimed_targets = set()
+
+    def _claims_signature(self):
+        """Stable hash of the current claims, used to detect manifest changes."""
+        items = sorted(self.claims.items(), key=lambda kv: kv[0])
+        payload = dumps(
+            [(legacy, dumps(typed, protocol=PICKLE_PROTOCOL))
+             for legacy, typed in items],
+            protocol=PICKLE_PROTOCOL)
+        return hashlib.sha256(payload).hexdigest()
+
+    # ------------------------------------------------------------------ #
+    # Metadata / schema
+    # ------------------------------------------------------------------ #
+
+    def _ensure_meta(self):
+        self.db.conn.execute(
+            'CREATE TABLE IF NOT EXISTS "%s" ('
+            'tablename TEXT PRIMARY KEY, generation TEXT NOT NULL, '
+            'complete INTEGER NOT NULL DEFAULT 0, claims_sig TEXT, '
+            'split_done INTEGER NOT NULL DEFAULT 0)'
+            % _MIGRATION_META_TABLE)
+        # Add columns introduced after the original schema.  Inspect via a
+        # blocking PRAGMA rather than issuing ALTER blindly: worker-thread
+        # errors only surface on the next call, so a plain try/except around
+        # execute() cannot swallow a duplicate-column error.
+        columns = {row[1] for row in self.db.conn.select(
+            'PRAGMA table_info("%s")' % _MIGRATION_META_TABLE)}
+        if 'claims_sig' not in columns:
+            self.db.conn.execute(
+                'ALTER TABLE "%s" ADD COLUMN claims_sig TEXT'
+                % _MIGRATION_META_TABLE)
+        if 'split_done' not in columns:
+            self.db.conn.execute(
+                'ALTER TABLE "%s" ADD COLUMN split_done INTEGER NOT NULL DEFAULT 0'
+                % _MIGRATION_META_TABLE)
+
+    def _split_already_done(self):
+        row = self.db.conn.select_one(
+            'SELECT split_done FROM "%s" WHERE tablename = ?'
+            % _MIGRATION_META_TABLE, (self.table,))
+        return bool(row and row[0])
+
+    def _mark_split_done(self):
+        self.db.conn.execute(
+            'UPDATE "%s" SET split_done = 1 WHERE tablename = ?'
+            % _MIGRATION_META_TABLE, (self.table,))
+
+    def _open_state(self):
+        """Return (generation, complete, created), creating state if new."""
+        self._ensure_meta()
+        row = self.db.conn.select_one(
+            'SELECT generation, complete FROM "%s" WHERE tablename = ?'
+            % _MIGRATION_META_TABLE, (self.table,))
+        if row is None:
+            self.db.conn.execute(
+                'INSERT INTO "%s" (tablename, generation, complete) '
+                'VALUES (?, ?, 0)'
+                % _MIGRATION_META_TABLE, (self.table, self._generation))
+            self.db.commit(blocking=True)
+            return self._generation, False, True
+        generation, complete = row
+        return generation, bool(complete), False
+
+    def _bind_persisted_generation(self):
+        """Point this instance at the table's persisted migration state."""
+        self._ensure_meta()
+        row = self.db.conn.select_one(
+            'SELECT generation FROM "%s" WHERE tablename = ?'
+            % _MIGRATION_META_TABLE, (self.table,))
+        if row is None:
+            raise RuntimeError(
+                'No typed-key migration state exists for table %r yet'
+                % self.table)
+        self._set_generation(row[0])
+        self._ensure_work_tables()
+
+    def _set_generation(self, generation):
+        self._generation = generation
+        self.pending_table = '"_km_pending_%s_%s"' % (self.table, generation)
+        self.held_table = '"_km_held_%s_%s"' % (self.table, generation)
+        self.tomb_table = '"_km_tomb_%s_%s"' % (self.table, generation)
+
+    def _ensure_work_tables(self):
+        legacy_schema = 'legacy_key TEXT PRIMARY KEY, value BLOB NOT NULL'
+        # Rows still waiting to be classified.
+        self.db.conn.execute(
+            'CREATE TABLE IF NOT EXISTS %s (%s) WITHOUT ROWID'
+            % (self.pending_table, legacy_schema))
+        # Rows parked because they cannot be settled without a claim.  Their
+        # exact value bytes are preserved for a later, claim-driven pass.
+        self.db.conn.execute(
+            'CREATE TABLE IF NOT EXISTS %s (%s) WITHOUT ROWID'
+            % (self.held_table, legacy_schema))
+        # The exact original bytes of every migrated row, for reconciliation
+        # and to make resume idempotent.
+        self.db.conn.execute(
+            'CREATE TABLE IF NOT EXISTS %s (%s) WITHOUT ROWID'
+            % (self.tomb_table, legacy_schema))
+
+    def _release_held_if_claims_changed(self):
+        """Move held rows back to pending when the claims manifest changes.
+
+        Held rows are only re-evaluated when the caller supplies new claims;
+        otherwise the same ambiguous rows would be re-classified on every run.
+        """
+        sig = self._claims_signature()
+        row = self.db.conn.select_one(
+            'SELECT claims_sig FROM "%s" WHERE tablename = ?'
+            % _MIGRATION_META_TABLE, (self.table,))
+        stored_sig = row[0] if row is not None else None
+        if stored_sig != sig:
+            self.db.conn.execute(
+                'INSERT OR IGNORE INTO %s (legacy_key, value) '
+                'SELECT legacy_key, value FROM %s'
+                % (self.pending_table, self.held_table))
+            self.db.conn.execute('DELETE FROM %s' % self.held_table)
+            self.db.conn.execute(
+                'UPDATE "%s" SET claims_sig = ? WHERE tablename = ?'
+                % _MIGRATION_META_TABLE, (sig, self.table))
+
+    def _mark_complete(self, complete):
+        self.db.conn.execute(
+            'UPDATE "%s" SET complete = ? WHERE tablename = ?'
+            % _MIGRATION_META_TABLE, (1 if complete else 0, self.table))
+
+    # ------------------------------------------------------------------ #
+    # Key interpretation
+    # ------------------------------------------------------------------ #
+
+    def _candidate_typed_keys(self, legacy_key):
+        """All typed keys whose legacy text form equals ``legacy_key``."""
+        candidates = []
+        # An explicit caller claim always takes precedence.
+        if legacy_key in self.claims:
+            candidates.append(self.claims[legacy_key])
+
+        # The plain string interpretation is always viable because the new
+        # source may keep using text keys.
+        if legacy_key not in candidates:
+            candidates.append(legacy_key)
+
+        # A numeric-looking legacy text could equally be a new integer key.
+        integer_value = self._as_int(legacy_key)
+        if integer_value is not None and integer_value not in candidates:
+            candidates.append(integer_value)
+        return candidates
+
+    @staticmethod
+    def _as_int(text):
+        try:
+            return int(text)
+        except (TypeError, ValueError):
+            return None
+
+    def _resolve(self, legacy_key):
+        """Decide the destination typed key for a legacy row.
+
+        Returns ``(typed_key, ambiguous)``.  ``ambiguous`` is True when no
+        single interpretation can be justified; the caller then parks the row
+        in the held table rather than assigning it to any typed key.
+        """
+        candidates = self._candidate_typed_keys(legacy_key)
+        if len(candidates) == 1:
+            return candidates[0], False
+        # Multiple viable interpretations: a caller claim is the only
+        # authoritative tie-breaker for the legacy key's identity.
+        if legacy_key in self.claims:
+            return self.claims[legacy_key], False
+        return None, True
+
+    # ------------------------------------------------------------------ #
+    # Main entry point
+    # ------------------------------------------------------------------ #
+
+    def run(self, max_batches=None):
+        """Run (or resume) the migration, one batch at a time.
+
+        ``max_batches`` optionally caps the batches processed in this call,
+        useful for interleaving work or for testing interruption/resumption.
+        Returns a :class:`MigrationReport`.
+        """
+        generation, already_complete, created = self._open_state()
+        # A run "resumes" only when prior migration state already existed and
+        # the work is not finished yet.
+        resumed = not created and not already_complete
+        # Adopt the persisted generation so every operation continues the same
+        # key mapping instead of forking a parallel one.
+        self._set_generation(generation)
+        self._ensure_work_tables()
+        self._release_held_if_claims_changed()
+
+        report = MigrationReport(generation=generation, resumed=resumed)
+        if already_complete:
+            report.complete = True
+            return report
+
+        # One-time, idempotent split: move every legacy raw-text row out of the
+        # live table into this generation's pending table.  Typed rows already
+        # written by the new source stay in the live table.  The persisted flag
+        # lets later runs skip this O(n) scan entirely.
+        if not self._split_already_done():
+            self._split_legacy_rows()
+            self._mark_split_done()
+            self.db.commit(blocking=True)
+
+        batches_done = 0
+        while max_batches is None or batches_done < max_batches:
+            batch = self._next_batch()
+            if not batch:
+                break
+            self._process_batch(batch, report)
+            batches_done += 1
+            # Each batch is durably committed before the next begins, so an
+            # interruption only ever loses un-started work.
+            self.db.commit(blocking=True)
+
+        # Complete once nothing is pending and nothing remains held awaiting a
+        # claim.  Held rows keep complete=False so a later, claim-driven run
+        # can settle them.
+        if self._count(self.pending_table) == 0 and \
+                self._count(self.held_table) == 0:
+            self._mark_complete(True)
+            self.db.commit(blocking=True)
+            report.complete = True
+        return report
+
+    def _split_legacy_rows(self):
+        """Move all legacy raw-text rows from the live table into ``pending``.
+
+        Idempotent and resumable: rows already moved are absent from the live
+        table, and ``INSERT OR IGNORE`` makes re-splitting a no-op.  Typed rows
+        (detected via the key codec) are left alone.  Moving a row out means a
+        deleted legacy value can never be read from the old key space again.
+        """
+        watermark = -1
+        while True:
+            rows = list(self.db.conn.select(
+                'SELECT rowid, key, value FROM "%s" WHERE rowid > ? '
+                'ORDER BY rowid LIMIT ?' % self.table,
+                (watermark, self.batch_size)))
+            if not rows:
+                break
+            for rowid, stored_key, value in rows:
+                watermark = max(watermark, rowid)
+                if looks_like_encoded_key(stored_key):
+                    # Already a typed row from the new source; leave it in place.
+                    continue
+                self.db.conn.execute(
+                    'INSERT OR IGNORE INTO %s (legacy_key, value) VALUES (?, ?)'
+                    % self.pending_table,
+                    (stored_key, sqlite3.Binary(bytes(value))))
+                self.db.conn.execute(
+                    'DELETE FROM "%s" WHERE key = ?' % self.table, (stored_key,))
+            # Commit each chunk so an interruption never has to redo a big move.
+            self.db.commit(blocking=True)
+
+    def _next_batch(self):
+        """Return the next batch of pending legacy rows, in a stable order."""
+        return list(self.db.conn.select(
+            'SELECT legacy_key, value FROM %s ORDER BY legacy_key LIMIT ?'
+            % self.pending_table, (self.batch_size,)))
+
+    def _count(self, table):
+        return self.db.conn.select_one('SELECT COUNT(*) FROM %s' % table)[0]
+
+    def _process_batch(self, batch, report):
+        for legacy_key, value in batch:
+            typed_key, ambiguous = self._resolve(legacy_key)
+            if ambiguous:
+                self._hold(legacy_key, value)
+                report.ambiguous.append(legacy_key)
+                continue
+            self._migrate_one(legacy_key, value, typed_key, report)
+
+    def _hold(self, legacy_key, value):
+        """Park a row that cannot be settled yet, preserving its exact bytes."""
+        self.db.conn.execute(
+            'INSERT OR IGNORE INTO %s (legacy_key, value) VALUES (?, ?)'
+            % self.held_table,
+            (legacy_key, sqlite3.Binary(bytes(value))))
+        self.db.conn.execute(
+            'DELETE FROM %s WHERE legacy_key = ?' % self.pending_table,
+            (legacy_key,))
+
+    def _migrate_one(self, legacy_key, value, typed_key, report):
+        value_bytes = bytes(value)
+        encoded = _MIGRATION_ENCODE_KEY(typed_key)
+
+        # A typed row already written by the new source, or already produced
+        # earlier in this run, owns that target.  Hold the contested row instead
+        # of overwriting new data or letting one typed key read both values.
+        if encoded in self._claimed_targets:
+            self._hold(legacy_key, value)
+            report.ambiguous.append(legacy_key)
+            return
+        existing = self.db.conn.select_one(
+            'SELECT 1 FROM "%s" WHERE key = ?' % self.table, (encoded,))
+        if existing is not None:
+            self._hold(legacy_key, value)
+            report.ambiguous.append(legacy_key)
+            return
+
+        # Publish the typed row into the live table, record the exact original
+        # bytes for reconciliation, and remove the row from the pending space.
+        self.db.conn.execute(
+            'INSERT INTO "%s" (key, value) VALUES (?, ?)' % self.table,
+            (encoded, sqlite3.Binary(value_bytes)))
+        self.db.conn.execute(
+            'INSERT INTO %s (legacy_key, value) VALUES (?, ?)'
+            % self.tomb_table,
+            (legacy_key, sqlite3.Binary(value_bytes)))
+        self.db.conn.execute(
+            'DELETE FROM %s WHERE legacy_key = ?' % self.pending_table,
+            (legacy_key,))
+        self._claimed_targets.add(encoded)
+        report.migrated += 1
+        report.tombstoned += 1
+
+    # ------------------------------------------------------------------ #
+    # Reconciliation
+    # ------------------------------------------------------------------ #
+
+    def reconcile(self, claims=None):
+        """Compare value bytes before and after migration for claimed keys.
+
+        For every explicitly claimed legacy key, the exact original value bytes
+        held in the generation's tombstone are compared, item by item, with the
+        bytes now stored under the typed key.  Returns a list of
+        ``(legacy_key, typed_key, status)`` tuples where status is one of
+        ``'ok'``, ``'mismatch'``, ``'missing-typed'`` (the typed row is absent)
+        or ``'not-migrated'`` (no tombstone exists for the legacy key).
+        """
+        claim_map = _claims_to_map(claims) if claims is not None else self.claims
+        # Bind to whatever generation the table actually migrated under, so a
+        # brand new KeyMigration instance can still reconcile a prior run.
+        self._bind_persisted_generation()
+        results = []
+        for legacy_key, typed_key in claim_map.items():
+            tomb = self.db.conn.select_one(
+                'SELECT value FROM %s WHERE legacy_key = ?'
+                % self.tomb_table, (legacy_key,))
+            if tomb is None:
+                results.append((legacy_key, typed_key, 'not-migrated'))
+                continue
+            live = self.db.conn.select_one(
+                'SELECT value FROM "%s" WHERE key = ?' % self.table,
+                (_MIGRATION_ENCODE_KEY(typed_key),))
+            if live is None:
+                results.append((legacy_key, typed_key, 'missing-typed'))
+            elif bytes(live[0]) == bytes(tomb[0]):
+                results.append((legacy_key, typed_key, 'ok'))
+            else:
+                results.append((legacy_key, typed_key, 'mismatch'))
+        return results
 
 
 class SqliteDict(DictClass):
@@ -366,6 +920,25 @@ class SqliteDict(DictClass):
             res = cursor.fetchall()
 
         return [name[0] for name in res]
+
+    def migrate_typed_keys(self, claims=None, batch_size=500, max_batches=None,
+                           generation_id=None):
+        """Migrate legacy text-key rows of this table to typed keys.
+
+        Runs the resumable, batched migration implemented by
+        :class:`KeyMigration`.  The dict must be opened with the typed key
+        codec (``encode_key=sqlitedict.encode_key`` /
+        ``decode_key=sqlitedict.decode_key``) and be writable.
+
+        ``claims`` is an optional mapping of ``{legacy_text: typed_key}`` or an
+        iterable of :class:`MigrationClaim` objects built from the caller's
+        source manifest.  ``max_batches`` caps the work per call; call again to
+        resume.  Returns a :class:`MigrationReport`.
+        """
+        migration = KeyMigration(
+            self, claims=claims, batch_size=batch_size,
+            generation_id=generation_id)
+        return migration.run(max_batches=max_batches)
 
     def commit(self, blocking=True):
         """

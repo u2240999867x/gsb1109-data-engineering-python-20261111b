@@ -1,5 +1,16 @@
 # Changes
 
+## Unreleased
+
+- Added `SqliteDict.migrate_typed_keys` / `KeyMigration` for resumable,
+  batched migration of legacy raw-text keys to the typed pickle+base64 key
+  space.  Each run is pinned to a persisted generation id whose pending, held
+  and tombstone tables keep all queries, deletes and background writes aligned
+  to one mapping.  Ambiguous keys (e.g. text "12" vs integer 12) are parked for
+  caller-supplied `MigrationClaim` manifests instead of letting a new key read
+  the old value, interrupted runs resume without resurrecting deleted values,
+  and `KeyMigration.reconcile` verifies the original value bytes item by item.
+
 ## 2.1.0, 2022-12-03
 
 - Introduced weak references (PR [#165](https://github.com/RaRe-Technologies/sqlitedict/pull/165), [@mpenkov](https://github.com/mpenkov))
