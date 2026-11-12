@@ -249,6 +249,45 @@ object with None entries in order to make it big enough:
 
 Handy!
 
+Example: Applying a Whole Flat Row
+==================================
+
+When several columns of one flat row map into nested detail, their
+targets often share parent nodes that do not exist yet.
+``dpath.apply_row`` plans the shape of every shared node across *all*
+columns before writing anything. Each column is a
+``(source, path, value)`` triple and every path element declares its
+role explicitly:
+
+* ``dpath.row.Text("0")`` forces a dictionary key, so the string
+  ``"0"`` never becomes an array index.
+* ``dpath.row.Index(0)`` forces a sequence subscript.
+* ``dpath.row.Auto("0")`` leaves both readings open until another
+  column (or the live document) decides.
+* ``dpath.row.Sparse(n)`` allows holes in the array while
+  ``dpath.row.Dense(n)`` requires the final indices to be contiguous.
+
+The row is written only when exactly one shape remains feasible. If
+several shapes remain, ``AmbiguousShapeError`` lists the distinct
+target structures; if none remain, ``InfeasibleShapeError`` names the
+columns that cannot be satisfied together. The write is transactional:
+each adopted node is created at most once through the creator and any
+failure restores the document exactly.
+
+.. code-block:: pycon
+
+    >>> from dpath.row import Text, Index, Auto, Sparse, Dense
+    >>> target = {}
+    >>> dpath.apply_row(target, [
+    ...     ("name",  [Text("a"), Auto("0"), Text("x")], 1),
+    ...     ("count", [Text("a"), Index(0), Text("y")], 2),
+    ... ])
+    >>> target
+    {'a': [{'x': 1, 'y': 2}]}
+
+Use ``dpath.plan_row`` for a dry run that returns the feasible preview
+trees without touching the target.
+
 Example: Deleting Existing Keys
 ===============================
 

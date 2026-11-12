@@ -9,8 +9,11 @@ __all__ = [
     "values",
     "search",
     "merge",
+    "apply_row",
+    "plan_row",
     "exceptions",
     "options",
+    "row",
     "segments",
     "types",
     "version",
@@ -26,7 +29,7 @@ __all__ = [
 from collections.abc import MutableMapping, MutableSequence
 from typing import Union, List, Any, Callable, Optional
 
-from dpath import segments, options
+from dpath import segments, options, row
 from dpath.exceptions import InvalidKeyName, PathNotFound
 from dpath.types import MergeType, PathSegment, Creator, Filter, Glob, Path, Hints
 
@@ -362,3 +365,35 @@ def merge(
     merger(dst, filtered_src)
 
     return dst
+
+
+def plan_row(
+        obj: MutableMapping,
+        columns,
+):
+    """Plan the feasible target structures of one flat row without writing.
+
+    Each column is a ``(source, path, value)`` triple where ``path`` is a
+    sequence of :class:`dpath.row.Segment` declarations (plain strings
+    and ints are accepted as shorthand). The return value is a list of
+    preview trees, one per distinct feasible shape.
+    """
+    return row.plan(obj, columns)
+
+
+def apply_row(
+        obj: MutableMapping,
+        columns,
+        creator: Creator | None = None,
+) -> MutableMapping:
+    """Materialize one flat row of columns into nested detail.
+
+    The shape shared by the columns is planned first: the row is written
+    only when all columns agree on exactly one feasible shape.
+    Ambiguity raises :class:`dpath.exceptions.AmbiguousShapeError` and
+    contradiction raises :class:`dpath.exceptions.InfeasibleShapeError`;
+    in both cases ``obj`` is left untouched. Every adopted intermediate
+    node is created at most once via ``creator`` (or the default
+    creator), and any failure during the write rolls the whole row back.
+    """
+    return row.apply_row(obj, columns, creator=creator)
