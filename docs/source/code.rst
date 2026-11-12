@@ -164,6 +164,34 @@ QuotientFilter
     :members:
 
 
+Partition-Aware Merging
+-----------------------
+
+Nightly per-partition rollups can be merged while keeping their provenance
+(partition id, generation, coverage intervals and optional, caller-bound
+legacy hash conventions). Only payloads whose buckets share the same meaning
+are combined; re-deliveries are idempotent, disjoint coverage is stitched
+together and partial overlaps are reported as explicit gaps.
+
+.. autoclass:: probables.CoverageInterval
+    :members:
+
+.. autoclass:: probables.PartitionRecord
+    :members:
+
+.. autoclass:: probables.MergeGap
+    :members:
+
+.. autoclass:: probables.MergeResult
+    :members:
+
+.. autofunction:: probables.merge_partitions
+
+.. autofunction:: probables.merge_results
+
+.. autofunction:: probables.register_legacy_hash_convention
+
+
 Utilities
 ------------------
 

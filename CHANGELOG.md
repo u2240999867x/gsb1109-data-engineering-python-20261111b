@@ -2,6 +2,11 @@
 
 ### Version 0.7.1
 
+* Partition-aware merging (`probables.merging`)
+  * Merge per-partition `BloomFilter`, `CountingBloomFilter` and `CountMinSketch` payloads with partition id, generation and inclusive coverage intervals
+  * Only dimension- and hash-compatible buckets share a result; legacy hash conventions must be explicitly registered and bound by the caller
+  * Same-partition re-deliveries are idempotent, disjoint coverage is stitched and partial overlaps produce explicit gap records instead of inflating frequencies
+  * Finished merge results can be merged again while retaining the original-partition ledger and undetermined-total gap accounting
 * `Cuckoo Filter`
   * Implement rewind for both regular and counting; see [#149](https://github.com/barrust/pyprobables/pull/149); thanks [mayur-dhavan](https://github.com/mayur-dhavan)
   * `CountingCuckooFilter`: Increment Elements Added by number of elements inserted

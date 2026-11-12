@@ -17,6 +17,15 @@ from probables.exceptions import (
     RotatingBloomFilterError,
     SimilarityError,
 )
+from probables.merging import (
+    CoverageInterval,
+    MergeGap,
+    MergeResult,
+    PartitionRecord,
+    merge_partitions,
+    merge_results,
+    register_legacy_hash_convention,
+)
 from probables.quotientfilter import QuotientFilter
 from probables.utilities import Bitarray
 
@@ -50,4 +59,11 @@ __all__ = [
     "QuotientFilter",
     "Bitarray",
     "SimilarityError",
+    "CoverageInterval",
+    "MergeGap",
+    "MergeResult",
+    "PartitionRecord",
+    "merge_partitions",
+    "merge_results",
+    "register_legacy_hash_convention",
 ]
