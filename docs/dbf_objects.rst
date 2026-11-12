@@ -88,6 +88,18 @@ unload()
    attributes will now be instances of ``RecordIterator``, which
    streams records from disk.
 
+plan_sparse_reads(record_numbers, startup_cost=0.0, byte_cost=0.0, max_length=None)
+   Plan the cheapest byte ranges that cover the given physical record
+   numbers (1-based; deleted rows still occupy their slot).  Each read
+   costs ``startup_cost`` plus ``byte_cost`` per transferred byte and
+   may not exceed ``max_length`` bytes.  Returns a ``SparseReadPlan``;
+   see :ref:`sparse-reads`.
+
+read_sparse(record_numbers, startup_cost=0.0, byte_cost=0.0, max_length=None)
+   Plan and immediately execute a sparse read.  Returns a
+   ``SparseReadResult`` with the decoded records in request order and
+   any short reads; see :ref:`sparse-reads`.
+
 
 Attributes
 ----------

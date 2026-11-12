@@ -14,6 +14,7 @@ from .memo import find_memofile, open_memofile, FakeMemoFile
 from .codepages import guess_encoding
 from .dbversions import get_dbversion_string
 from .exceptions import DBFNotFound, MissingMemoFile
+from .sparse import plan_sparse_reads, execute_sparse_plan
 
 _py_version = (sys.version_info.major, sys.version_info.minor)
 _py_impl = platform.python_implementation()
@@ -189,6 +190,32 @@ class DBF(object):
         """
         self._records = None
         self._deleted = None
+
+    def plan_sparse_reads(self, record_numbers, startup_cost=0.0,
+                          byte_cost=0.0, max_length=None):
+        """Plan the cheapest byte ranges for sparse record reads.
+
+        ``record_numbers`` are 1-based physical record numbers (deleted
+        rows still occupy their slot).  The plan minimizes the total of
+        the per-request ``startup_cost`` and the per-byte
+        ``byte_cost`` while keeping every read at or below
+        ``max_length`` bytes.  See :mod:`dbfread.sparse`.
+        """
+        return plan_sparse_reads(self, record_numbers, startup_cost,
+                                 byte_cost, max_length)
+
+    def read_sparse(self, record_numbers, startup_cost=0.0,
+                    byte_cost=0.0, max_length=None):
+        """Read only the given physical records, one read per planned range.
+
+        Rows crossed by a range but not requested are transferred but
+        never decoded.  Short reads leave the affected records in the
+        result's ``short_reads`` list together with the byte ranges
+        needed to continue.  See :mod:`dbfread.sparse`.
+        """
+        plan = plan_sparse_reads(self, record_numbers, startup_cost,
+                                 byte_cost, max_length)
+        return execute_sparse_plan(self, plan)
 
     @property
     def records(self):

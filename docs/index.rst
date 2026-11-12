@@ -53,6 +53,7 @@ Contents
    introduction
    exporting_data
    dbf_objects
+   sparse_reads
    field_types
    api_changes
    resources
