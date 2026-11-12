@@ -264,6 +264,61 @@ To delete keys in an object, use dpath.delete, which accepts the same globbing s
         Returns the number of deleted objects. Raises PathNotFound if
         no paths are found to delete.
 
+Example: Batch Column Operations
+================================
+
+dpath.set() applies one glob at a time, so applying a revision list of
+several rules in sequence lets earlier writes shift the rows that later
+rules point at. dpath.batch_apply() takes the whole manifest at once: every
+rule is parsed and resolved against the original document first, and the
+values are only written afterwards. Writes never insert or delete
+containers, so list positions cannot move between rules.
+
+A rule is a ``(glob, value)`` pair, or a mapping with ``glob``, ``value``
+and an optional ``literal`` flag. Literal rules treat glob characters (and
+``**``) as ordinary key characters, which addresses columns that are
+literally named ``a*b`` or ``**`` while ordinary rules keep globbing:
+
+.. code-block:: pycon
+
+    >>> doc = {"metadata": {"a*b": 1, "**": 2, "acb": 3}}
+    >>> manifest = [
+    ...     {"glob": ["metadata", "a*b"], "value": 10, "literal": True},
+    ...     ("metadata/a*b", 10),
+    ... ]
+    >>> result = dpath.batch_apply(doc, manifest)
+    >>> result.changed
+    2
+    >>> doc["metadata"] == {"a*b": 10, "**": 2, "acb": 10}
+    True
+
+When two rules resolve to the same original field with different values,
+only the conflicting records are isolated: the field is left untouched and
+each disagreeing rule is reported (with its own authored glob and original
+target path) in ``result.conflicts``, instead of aborting the batch or
+poisoning unrelated records.
+
+.. code-block:: pycon
+
+    >>> doc = {"rows": [{"v": 1}, {"v": 2}]}
+    >>> result = dpath.batch_apply(doc, [("rows/*/v", "X"), ("rows/1/v", "Y")])
+    >>> doc["rows"][0]["v"], doc["rows"][1]["v"]
+    ('X', 2)
+    >>> sorted({change.path for change in result.conflicts})
+    ['rows/1/v']
+
+Reported targets keep their segment types: dictionary keys stay strings and
+list indices become ints, so a string key ``'0'`` and a list index ``0``
+remain distinct targets even though their rendered paths are identical. Use
+an integer path segment, or a literal rule, to address exactly one kind.
+
+dpath.batch_plan() performs the same resolution without writing anything,
+which previews applied changes and isolated conflicts. The hits yielded by
+dpath.search() can be replayed with dpath.batch_replay() onto a document of
+the same shape; the returned changes reconcile one to one with those
+reported by batch_apply(), and the same path arriving with different values
+is isolated as a conflict.
+
 Example: Merging
 ================
 

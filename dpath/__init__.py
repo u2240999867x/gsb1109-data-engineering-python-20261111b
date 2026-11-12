@@ -9,9 +9,13 @@ __all__ = [
     "values",
     "search",
     "merge",
+    "batch_apply",
+    "batch_plan",
+    "batch_replay",
     "exceptions",
     "options",
     "segments",
+    "batch",
     "types",
     "version",
     "MergeType",
@@ -27,6 +31,7 @@ from collections.abc import MutableMapping, MutableSequence
 from typing import Union, List, Any, Callable, Optional
 
 from dpath import segments, options
+from dpath.batch import apply as batch_apply, plan as batch_plan, replay as batch_replay
 from dpath.exceptions import InvalidKeyName, PathNotFound
 from dpath.types import MergeType, PathSegment, Creator, Filter, Glob, Path, Hints
 
