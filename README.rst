@@ -11,6 +11,8 @@ Features
   <http://www.grantjenks.com/docs/sortedcontainers/>`_ module.
 - ValueSortedDict - Dictionary with (key, value) item pairs sorted by value.
 - ItemSortedDict - Dictionary with key-function support for item pairs.
+- Atomic revision orders that add, change or withdraw several rows in one
+  commit, rolling every change back when a sort key cannot be compared.
 - NearestDict - Dictionary with nearest-key lookup.
 - OrderedDict - Ordered dictionary with numeric indexing support.
 - OrderedSet - Ordered set with numeric indexing support.

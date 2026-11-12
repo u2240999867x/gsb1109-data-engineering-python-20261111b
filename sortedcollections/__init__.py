@@ -22,10 +22,12 @@ from sortedcontainers import (
 from .nearestdict import NearestDict
 from .ordereddict import OrderedDict
 from .recipes import (
+    REMOVE,
     IndexableDict,
     IndexableSet,
     ItemSortedDict,
     OrderedSet,
+    RevisionError,
     SegmentList,
     ValueSortedDict,
 )
@@ -37,6 +39,8 @@ __all__ = [
     'NearestDict',
     'OrderedDict',
     'OrderedSet',
+    'REMOVE',
+    'RevisionError',
     'SegmentList',
     'SortedDict',
     'SortedList',

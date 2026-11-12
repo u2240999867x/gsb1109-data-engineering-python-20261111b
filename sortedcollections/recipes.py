@@ -4,10 +4,265 @@
 
 from collections import abc
 from copy import deepcopy
-from itertools import count
+from itertools import chain, count
 
 from sortedcontainers import SortedDict, SortedKeyList, SortedSet
 from sortedcontainers.sortedlist import recursive_repr
+
+
+# Sentinel marking a row that withdraws an existing key from a revision.
+REMOVE = object()
+
+
+class RevisionError(Exception):
+    """Raised when a row of a revision order cannot be prepared.
+
+    Sort keys are evaluated while the revision order is built. When the key
+    function raises for a row, the original exception is preserved as the
+    :attr:`__cause__` and the offending row can be located through
+    :attr:`row` and :attr:`key`.
+
+    """
+
+    def __init__(self, row, key, cause):
+        self.row = row
+        self.key = key
+        self.__cause__ = cause
+        message = 'revision row {0} for key {1!r} failed: {2}'.format(
+            row, key, cause
+        )
+        super().__init__(message)
+
+
+class _RevisionOrder:
+    """Deferred revision order committed as a single transaction."""
+
+    def __init__(self, mapping, new_items, new_list):
+        self._mapping = mapping
+        self._new_items = new_items
+        self._new_list = new_list
+        self._closed = False
+
+    def __enter__(self):
+        if self._closed:
+            raise RuntimeError('revision order may only be committed once')
+        return self
+
+    def __exit__(self, _exc_type, _exc_value, _traceback):
+        if _exc_type is None:
+            self.commit()
+        self._closed = True
+        return False
+
+    def commit(self):
+        "Swap in the prepared post-revision state."
+        if self._closed:
+            raise RuntimeError('revision order may only be committed once')
+        self._closed = True
+        self._mapping._install(self._new_items, self._new_list)
+
+
+class _TransactionalSortedDict(SortedDict):
+    """Base for sorted dicts whose revisions commit atomically.
+
+    A revision may change existing values, add new keys or withdraw existing
+    keys. Sort keys are evaluated exactly once, while the revision order is
+    built, and each one is tagged with its source row. The order is applied
+    to a private copy of the sorted list first, so a failure when sort keys
+    are compared leaves the live dictionary, its rank ranges and any views
+    already handed out untouched.
+
+    """
+
+    def _make_sort_key(self, key, value):
+        "Return the comparable for the ``(key, value)`` item pair."
+        raise NotImplementedError
+
+    @staticmethod
+    def _unpack_pair(row, pair):
+        try:
+            key, value = pair
+        except (TypeError, ValueError) as cause:
+            raise TypeError(
+                'cannot interpret revision row {0} as a (key, value) '
+                'pair'.format(row)
+            ) from cause
+        return key, value
+
+    def _eval_sort_key(self, row, key, value, wrap_errors):
+        try:
+            return self._make_sort_key(key, value)
+        except Exception as cause:
+            if wrap_errors:
+                raise RevisionError(row, key, cause) from cause
+            raise
+
+    def _prepare_rows(self, pairs, wrap_errors):
+        "Validate every row and evaluate its new sort key exactly once."
+        if isinstance(pairs, abc.Mapping):
+            pairs = pairs.items()
+
+        rows = []
+        seen = set()
+
+        for row, pair in enumerate(pairs):
+            key, value = self._unpack_pair(row, pair)
+
+            if key in seen:
+                raise ValueError(
+                    'key {0!r} appears more than once in the revision; '
+                    'duplicate at row {1}'.format(key, row)
+                )
+            seen.add(key)
+
+            if value is REMOVE:
+                if key not in self:
+                    cause = KeyError(key)
+                    if wrap_errors:
+                        raise RevisionError(row, key, cause) from cause
+                    raise cause
+                rows.append((row, 'remove', key, REMOVE, None))
+            else:
+                sort_key = self._eval_sort_key(row, key, value, wrap_errors)
+                operation = 'change' if key in self else 'add'
+                rows.append((row, operation, key, value, sort_key))
+
+        return rows
+
+    def _prepare_revision(self, pairs, wrap_errors):
+        """Build the post-revision state without touching the live mapping.
+
+        Rows are validated and every new sort key is evaluated once in
+        :meth:`_prepare_rows`. A private sorted list then replays the rows
+        in order using the precomputed sort keys, so a comparison failure is
+        attributed to the row being replayed and leaves the live dictionary
+        and its blocks untouched.
+
+        """
+        rows = self._prepare_rows(pairs, wrap_errors)
+        if not rows:
+            return dict.copy(self), self._list
+
+        old_list = self._list
+        old_key_values = chain.from_iterable(old_list._keys)
+        sort_keys = dict(zip(old_list, old_key_values))
+        new_items = dict.copy(self)
+
+        def lookup(key):
+            return sort_keys[key]
+
+        new_list = SortedKeyList(key=lookup)
+        new_list._load = old_list._load
+        new_list._update(old_list)
+
+        for row, operation, key, value, sort_key in rows:
+            if operation in ('remove', 'change'):
+                new_list.remove(key)
+
+            if operation == 'remove':
+                del new_items[key]
+                del sort_keys[key]
+                continue
+
+            new_items[key] = value
+            sort_keys[key] = sort_key
+            try:
+                new_list.add(key)
+            except Exception as cause:
+                if wrap_errors:
+                    raise RevisionError(row, key, cause) from cause
+                raise
+
+        new_list._key = self._key
+        return new_items, new_list
+
+    def _install(self, new_items, new_list):
+        "Swap in a fully prepared post-revision state."
+        dict.clear(self)
+        dict.update(self, new_items)
+        self._list = new_list
+        self._bind_list_methods()
+
+    def _bind_list_methods(self):
+        "Rebind cached sorted list methods after swapping the sorted list."
+        _list = self._list
+        self._list_add = _list.add
+        self._list_clear = _list.clear
+        self._list_iter = _list.__iter__
+        self._list_reversed = _list.__reversed__
+        self._list_pop = _list.pop
+        self._list_remove = _list.remove
+        self._list_update = _list.update
+
+        self.bisect_left = _list.bisect_left
+        self.bisect = _list.bisect_right
+        self.bisect_right = _list.bisect_right
+        self.index = _list.index
+        self.irange = _list.irange
+        self.islice = _list.islice
+        self._reset = _list._reset
+
+        self.bisect_key_left = _list.bisect_key_left
+        self.bisect_key_right = _list.bisect_key_right
+        self.bisect_key = _list.bisect_key
+        self.irange_key = _list.irange_key
+
+    def revision(self, changes=()):
+        """Build a revision order from ``(key, value)`` rows.
+
+        Rows may add new keys, change existing keys or, when the value is
+        the :data:`REMOVE` sentinel, withdraw a key. Each key may appear at
+        most once in the order. The order is committed atomically, either as
+        a context manager or through :meth:`commit`::
+
+            with mapping.revision([('a', 1), ('b', REMOVE)]):
+                pass
+
+        Sort keys are evaluated while the order is built, so a failing row
+        raises :class:`RevisionError` tagged with its source row before the
+        dictionary is touched. The order captures the mapping state at build
+        time and is committed by swapping in the prepared state.
+
+        """
+        new_items, new_list = self._prepare_revision(changes, wrap_errors=True)
+        return _RevisionOrder(self, new_items, new_list)
+
+    def __setitem__(self, key, value):
+        "``mapping[key] = value``"
+        new_items, new_list = self._prepare_revision(
+            [(key, value)], wrap_errors=False
+        )
+        self._install(new_items, new_list)
+
+    _setitem = __setitem__
+
+    def __delitem__(self, key):
+        "``del mapping[key]``"
+        if key not in self:
+            raise KeyError(key)
+        new_items, new_list = self._prepare_revision(
+            [(key, REMOVE)], wrap_errors=False
+        )
+        self._install(new_items, new_list)
+
+    def update(self, *args, **kwargs):
+        """Update the mapping as one atomic revision.
+
+        Overwrites existing items. Arguments follow the same mapping,
+        iterable of pairs and keyword argument rules as :class:`dict`.
+
+        """
+        pairs = dict(*args, **kwargs).items()
+        new_items, new_list = self._prepare_revision(pairs, wrap_errors=True)
+        self._install(new_items, new_list)
+
+    _update = update
+
+    def setdefault(self, key, default=None):
+        if key in self:
+            return self[key]
+        self[key] = default
+        return default
 
 
 class IndexableDict(SortedDict):
@@ -49,7 +304,7 @@ class IndexableSet(SortedSet):
         return self.__class__, (set(self),)
 
 
-class ItemSortedDict(SortedDict):
+class ItemSortedDict(_TransactionalSortedDict):
     """Sorted dictionary with key-function support for item pairs.
 
     Requires key function callable specified as the first argument. The
@@ -78,22 +333,9 @@ class ItemSortedDict(SortedDict):
         args[0] = key_func
         super().__init__(*args, **kwargs)
 
-    def __delitem__(self, key):
-        "``del mapping[key]``"
-        if key not in self:
-            raise KeyError(key)
-        self._list_remove(key)
-        dict.__delitem__(self, key)
-
-    def __setitem__(self, key, value):
-        "``mapping[key] = value``"
-        if key in self:
-            self._list_remove(key)
-            dict.__delitem__(self, key)
-        dict.__setitem__(self, key, value)
-        self._list_add(key)
-
-    _setitem = __setitem__
+    def _make_sort_key(self, key, value):
+        "Return ``func(key, value)`` for the item pair."
+        return self._func(key, value)
 
     def copy(self):
         "Return shallow copy of the mapping."
@@ -106,7 +348,7 @@ class ItemSortedDict(SortedDict):
         return self.__class__(self._func, items)
 
 
-class ValueSortedDict(SortedDict):
+class ValueSortedDict(_TransactionalSortedDict):
     """Sorted dictionary that maintains (key, value) item pairs sorted by value.
 
     - ``ValueSortedDict()`` -> new empty dictionary.
@@ -155,22 +397,11 @@ class ValueSortedDict(SortedDict):
                 args.insert(0, key_func)
         super().__init__(*args, **kwargs)
 
-    def __delitem__(self, key):
-        "``del mapping[key]``"
-        if key not in self:
-            raise KeyError(key)
-        self._list_remove(key)
-        dict.__delitem__(self, key)
-
-    def __setitem__(self, key, value):
-        "``mapping[key] = value``"
-        if key in self:
-            self._list_remove(key)
-            dict.__delitem__(self, key)
-        dict.__setitem__(self, key, value)
-        self._list_add(key)
-
-    _setitem = __setitem__
+    def _make_sort_key(self, key, value):
+        "Return the value, or the key function applied to it."
+        if self._func is None:
+            return value
+        return self._func(value)
 
     def copy(self):
         "Return shallow copy of the mapping."
