@@ -14,7 +14,7 @@ import textwrap
 import uuid
 from collections import namedtuple
 from collections.abc import Callable, Generator, Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import InitVar, dataclass, field
 from types import TracebackType
 from typing import (
     Any,
@@ -314,6 +314,158 @@ def _fk_actions_sql(fk: ForeignKey) -> str:
     return actions
 
 
+@dataclass(frozen=True)
+class ClosureTable:
+    """
+    A table included in a foreign key closure, with the primary key values of
+    every row that was selected.
+
+    ``row_ids`` holds the declared primary key value for each row - a scalar
+    for a single-column primary key, or a tuple for a compound primary key, in
+    declaration order. Tables without a declared primary key cannot have their
+    rows identified this way, so they never appear in a closure.
+    """
+
+    name: str
+    row_ids: tuple[Any, ...]
+
+
+@dataclass(frozen=True)
+class NullForeignKey:
+    """
+    A foreign key on a selected row whose local columns include a ``NULL``.
+
+    Under SQLite's default ``MATCH SIMPLE`` behaviour such a key does not
+    reference anything, so it needs no parent row - it is reported here purely
+    for visibility. ``key`` holds the local column values (one or more
+    ``None``), as a tuple for compound keys.
+    """
+
+    table: str
+    foreign_key: ForeignKey
+    row_id: Any
+    columns: tuple[str, ...]
+    key: tuple[Any, ...]
+
+
+@dataclass(frozen=True)
+class BrokenForeignKey:
+    """
+    A non-NULL foreign key value that no row in the referenced table matches.
+
+    The closure cannot supply the missing parent, so the referencing row is
+    still included while the dangling reference is recorded here rather than
+    silently dropped. ``key`` holds the local column values, as a tuple for
+    compound keys.
+    """
+
+    table: str
+    foreign_key: ForeignKey
+    row_id: Any
+    columns: tuple[str, ...]
+    key: tuple[Any, ...]
+
+
+@dataclass(frozen=True)
+class ClosureBoundary:
+    """
+    A closure edge that could not be fully expanded because the row budget was
+    reached.
+
+    ``pending_rows`` are selected rows whose outgoing foreign keys had not been
+    inspected yet; ``pending_keys`` are parent key values that had been
+    discovered but whose parent rows had not been fetched. A result with any
+    boundary is incomplete and must not be treated as a self-contained subset.
+    """
+
+    table: str
+    pending_rows: tuple[Any, ...]
+    pending_keys: tuple[tuple[Any, ...], ...]
+
+
+@dataclass(frozen=True)
+class ClosureResult:
+    """
+    The outcome of :meth:`Database.foreign_key_closure`.
+
+    ``tables`` maps table name to :class:`ClosureTable`. ``complete`` is
+    ``True`` only when every foreign key edge from every selected row was
+    expanded within the budget - if it is ``False`` then ``boundaries`` reports
+    where expansion stopped.
+    """
+
+    tables: dict[str, ClosureTable]
+    null_foreign_keys: list[NullForeignKey]
+    broken_foreign_keys: list[BrokenForeignKey]
+    boundaries: list[ClosureBoundary]
+    budget: int | None
+    rows_selected: int
+    complete: bool
+    db: InitVar["Database"]
+    _db: "Database" = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self, db: "Database") -> None:
+        object.__setattr__(self, "_db", db)
+
+    def rows_for(self, table: str) -> list[dict[str, Any]]:
+        "Return the selected rows of ``table`` as a list of dictionaries."
+        if table not in self.tables:
+            return []
+        closure_table = self.tables[table]
+        target = self._db.table(table)
+        return [target.get(pk) for pk in closure_table.row_ids]
+
+    def to_database(
+        self,
+        filename_or_conn: Union[
+            str, pathlib.Path, sqlite3.Connection, "Database"
+        ],
+    ) -> "Database":
+        """
+        Write the closure to a new SQLite database, preserving table names,
+        schemas (including foreign key declarations) and row identity.
+
+        Tables are created from their original schema and rows are written with
+        ``insert_all(..., pk=..., replace=True)`` so primary key values survive
+        unchanged. Raises :class:`ClosureIncompleteError` if the closure is not
+        complete, since an incomplete closure would produce a database with
+        missing dimension rows.
+        """
+        if not self.complete:
+            raise ClosureIncompleteError(
+                "Cannot write an incomplete closure to a database - "
+                "increase the row budget and retry"
+            )
+        if isinstance(filename_or_conn, Database):
+            dest = filename_or_conn
+        else:
+            dest = Database(filename_or_conn)
+        existing = set(dest.table_names())
+        clashes = existing.intersection(self.tables)
+        if clashes:
+            raise ValueError(
+                "Destination database already contains table(s): "
+                + ", ".join(sorted(clashes))
+            )
+        with dest.atomic():
+            # Defer constraint checks to commit time, so cyclic foreign keys
+            # and table ordering cannot fail the row copies when the
+            # destination enforces foreign keys.
+            if dest.execute("PRAGMA foreign_keys").fetchone()[0]:
+                dest.execute("PRAGMA defer_foreign_keys=ON")
+            for table_name, closure_table in self.tables.items():
+                source_table = self._db.table(table_name)
+                dest.execute(source_table.schema)
+                rows = [source_table.get(pk) for pk in closure_table.row_ids]
+                if rows:
+                    dest.table(table_name).insert_all(
+                        rows,
+                        pk=tuple(source_table.pks),
+                        replace=True,
+                    )
+        return dest
+
+
 Index = namedtuple("Index", ("seq", "name", "unique", "origin", "partial", "columns"))
 XIndex = namedtuple("XIndex", ("name", "columns"))
 XIndexColumn = namedtuple(
@@ -468,6 +620,14 @@ class TransactionError(Exception):
     "Operation cannot be performed while a transaction is open"
 
 
+class ClosureIncompleteError(Exception):
+    "Closure was truncated by the row budget, so it cannot be treated as complete"
+
+
+class ClosurePrimaryKeyError(Exception):
+    "A table in the closure has no declared primary key, so its rows cannot be identified"
+
+
 class DescIndex(str):
     pass
 
@@ -495,6 +655,10 @@ _TRANSACTION_CONTROL_KEYWORDS = {
     "SAVEPOINT",
     "RELEASE",
 }
+
+# Maximum number of primary key values in one closure lookup statement,
+# so parent resolution over wide tables does not build an unbounded SQL string
+_CLOSURE_QUERY_CHUNK = 500
 
 # Statements that never return rows and cannot run inside (or would break
 # out of) the savepoint guard used by query()
@@ -2022,6 +2186,380 @@ class Database:
                 if fk_columns not in existing_indexes:
                     table.create_index(fk.columns, find_unique_name=True)
                     existing_indexes.add(fk_columns)
+
+    def _closure_fk_map(self) -> dict[str, list[ForeignKey]]:
+        "Foreign keys declared on each table, keyed by table name."
+        fk_map: dict[str, list[ForeignKey]] = {}
+        for table_name in self.table_names():
+            fks = self.table(table_name).foreign_keys
+            if fks:
+                fk_map[table_name] = fks
+        return fk_map
+
+    @staticmethod
+    def _closure_pk(table: "Table") -> tuple[str, ...]:
+        """
+        Declared primary key columns of ``table``, in declaration order.
+
+        Raises ``ClosurePrimaryKeyError`` for a table without a declared
+        primary key - the closure identifies rows by their real primary key
+        and never guesses a business identity for a rowid table.
+        """
+        if table.use_rowid:
+            raise ClosurePrimaryKeyError(
+                f"Table {table.name} has no declared primary key - "
+                "foreign_key_closure() cannot identify its rows"
+            )
+        return tuple(
+            column.name
+            for column in sorted(
+                (column for column in table.columns if column.is_pk),
+                key=lambda column: column.is_pk,
+            )
+        )
+
+    @staticmethod
+    def _closure_pk_value(pk_columns: tuple[str, ...], row: dict[str, Any]) -> Any:
+        if len(pk_columns) == 1:
+            return row[pk_columns[0]]
+        return tuple(row[column] for column in pk_columns)
+
+    @staticmethod
+    def _closure_key(value: Any) -> tuple[Any, ...]:
+        return value if isinstance(value, tuple) else (value,)
+
+    @staticmethod
+    def _closure_sort_key(key: tuple[Any, ...]) -> str:
+        # repr() keeps ordering deterministic even with mixed column types
+        return repr(key)
+
+    @staticmethod
+    def _closure_identity(key: tuple[Any, ...]) -> Any:
+        "Scalar primary key value for a single-column key, tuple otherwise."
+        return key[0] if len(key) == 1 else key
+
+    def _closure_fetch_by_pk(
+        self, table_name: str, pk_columns: tuple[str, ...], keys: set[tuple[Any, ...]]
+    ) -> list[dict[str, Any]]:
+        "Fetch rows of ``table_name`` whose primary key is in ``keys``."
+        if not keys:
+            return []
+        quoted_pks = [quote_identifier(column) for column in pk_columns]
+        rows: list[dict[str, Any]] = []
+        ordered_keys = sorted(keys, key=self._closure_sort_key)
+        for key_chunk in chunks(ordered_keys, _CLOSURE_QUERY_CHUNK):
+            key_list = list(key_chunk)
+            if len(pk_columns) == 1:
+                placeholders = ",".join("?" for _ in key_list)
+                params: list[Any] = [key[0] for key in key_list]
+                where = f"{quoted_pks[0]} in ({placeholders})"
+            else:
+                where = " OR ".join(
+                    " AND ".join(f"{quoted} = ?" for quoted in quoted_pks)
+                    for _ in key_list
+                )
+                params = [value for key in key_list for value in key]
+            rows.extend(
+                self.table(table_name).rows_where(
+                    where,
+                    params,
+                    order_by=",".join(quoted_pks),
+                )
+            )
+        return rows
+
+    def _closure_fetch_where(
+        self,
+        table_name: str,
+        where: str | None,
+        where_args: Sequence | dict[str, Any] | None,
+        pk_columns: tuple[str, ...],
+    ) -> list[dict[str, Any]]:
+        quoted_pks = [quote_identifier(column) for column in pk_columns]
+        return list(
+            self.table(table_name).rows_where(
+                where,
+                where_args,
+                order_by=",".join(quoted_pks),
+            )
+        )
+
+    def foreign_key_closure(
+        self,
+        seeds: Mapping[str, str | Sequence[Any]] | None = None,
+        *,
+        table: str | None = None,
+        where: str | None = None,
+        where_args: Sequence | dict[str, Any] | None = None,
+        budget: int | None = None,
+    ) -> ClosureResult:
+        """
+        Find every row reachable from a set of seed rows by following the
+        database's declared foreign keys, and return their primary keys.
+
+        Foreign keys are followed parent-wards: a selected ``orders`` row pulls
+        in the ``customers`` and ``products`` rows it references. Compound
+        foreign keys are followed as a unit and cyclic foreign keys terminate
+        naturally because each row is only processed once. Only tables with a
+        declared primary key can participate - tables without one raise
+        :class:`ClosurePrimaryKeyError`, since their business identity cannot
+        be assumed.
+
+        A foreign key whose local columns include any ``NULL`` needs no parent
+        row under SQLite's default ``MATCH SIMPLE`` behaviour and is reported in
+        ``null_foreign_keys``; a non-NULL key with no matching parent is
+        reported in ``broken_foreign_keys``.
+
+        :param seeds: Mapping of table name to either a ``WHERE`` fragment or a
+          sequence of primary key values (tuples for compound keys) selecting
+          the seed rows for that table
+        :param table: Convenience for a single seed table, paired with ``where``
+        :param where: ``WHERE`` fragment selecting seed rows of ``table``
+        :param where_args: Parameters for ``where``
+        :param budget: Maximum number of rows the closure may select; ``None``
+          means no limit
+        :raises NoTable: if a seed or referenced table does not exist
+        :raises ClosurePrimaryKeyError: if a participating table has no
+          declared primary key
+        """
+        if budget is not None and budget < 1:
+            raise ValueError("budget must be a positive integer or None")
+
+        seed_specs: dict[str, str | Sequence[Any]] = dict(seeds or {})
+        if table is not None:
+            if where is None:
+                raise ValueError("table= requires where= to select the seed rows")
+            if table in seed_specs:
+                raise ValueError(f"Table {table} was given both via table= and seeds=")
+            seed_specs[table] = where
+        if not seed_specs:
+            raise ValueError("Provide at least one seed table via seeds= or table=")
+
+        for name in seed_specs:
+            if name not in self.table_names():
+                raise NoTable(f"Table {name} does not exist")
+
+        fk_map = self._closure_fk_map()
+        pk_cache: dict[str, tuple[str, ...]] = {}
+
+        def pk_for(name: str) -> tuple[str, ...]:
+            if name not in pk_cache:
+                pk_cache[name] = self._closure_pk(self.table(name))
+            return pk_cache[name]
+
+        # Validate every table on either side of a declared foreign key.
+        for fk_table, fks in fk_map.items():
+            pk_for(fk_table)
+            for fk in fks:
+                if fk.other_table not in self.table_names():
+                    raise NoTable(
+                        f"Foreign key on {fk_table} references missing table "
+                        f"{fk.other_table}"
+                    )
+                pk_for(fk.other_table)
+
+        selected: dict[str, set[tuple[Any, ...]]] = {}
+        # (table, pk) pairs whose outgoing foreign keys still need inspecting.
+        queue: list[tuple[str, tuple[Any, ...]]] = []
+        null_fks: list[NullForeignKey] = []
+        broken_fks: list[BrokenForeignKey] = []
+        boundaries: list[ClosureBoundary] = []
+        rows_selected = 0
+        truncated = False
+
+        def add_rows(
+            table_name: str, rows: list[dict[str, Any]]
+        ) -> tuple[bool, tuple[tuple[Any, ...], ...]]:
+            """
+            Register fetched rows. Returns ``(ok, rejected)`` where ``rejected``
+            holds primary keys that did not fit in the remaining budget.
+            """
+            nonlocal rows_selected, truncated
+            pk_columns = pk_for(table_name)
+            bucket = selected.setdefault(table_name, set())
+            rejected: list[tuple[Any, ...]] = []
+            for row in rows:
+                key = self._closure_key(self._closure_pk_value(pk_columns, row))
+                if key in bucket:
+                    continue
+                if budget is not None and rows_selected >= budget:
+                    truncated = True
+                    rejected.append(key)
+                    continue
+                bucket.add(key)
+                rows_selected += 1
+                queue.append((table_name, key))
+            return not rejected, tuple(rejected)
+
+        # Phase 1: resolve the seed rows.
+        for table_name, spec in seed_specs.items():
+            pk_columns = pk_for(table_name)
+            if isinstance(spec, str):
+                rows = self._closure_fetch_where(
+                    table_name, spec, where_args, pk_columns
+                )
+            else:
+                keys = {self._closure_key(value) for value in spec}
+                bad = next(
+                    (key for key in keys if len(key) != len(pk_columns)), None
+                )
+                if bad is not None:
+                    raise ValueError(
+                        f"Seed key {bad} for table {table_name} needs "
+                        f"{len(pk_columns)} value(s)"
+                    )
+                rows = self._closure_fetch_by_pk(table_name, pk_columns, keys)
+            ok, rejected = add_rows(table_name, rows)
+            if not ok:
+                boundaries.append(
+                    ClosureBoundary(
+                        table=table_name,
+                        pending_rows=(),
+                        pending_keys=tuple(
+                            self._closure_identity(key)
+                            for key in sorted(rejected, key=self._closure_sort_key)
+                        ),
+                    )
+                )
+                break
+
+        # Phase 2: walk the declared foreign keys, parent-wards.
+        while queue and not truncated:
+            current_table, current_key = queue.pop(0)
+            pending_keys: list[tuple[Any, ...]] = []
+            matches = self._closure_fetch_by_pk(
+                current_table, pk_for(current_table), {current_key}
+            )
+            if not matches:
+                continue
+            current_row = matches[0]
+            row_id = current_key[0] if len(current_key) == 1 else current_key
+            for fk in fk_map.get(current_table, ()):
+                local_values = tuple(current_row[column] for column in fk.columns)
+                if any(value is None for value in local_values):
+                    # MATCH SIMPLE: a NULL in any FK column means no parent is
+                    # required, so this edge references nothing.
+                    null_fks.append(
+                        NullForeignKey(
+                            table=current_table,
+                            foreign_key=fk,
+                            row_id=row_id,
+                            columns=tuple(fk.columns),
+                            key=local_values,
+                        )
+                    )
+                    continue
+                parent_pk = pk_for(fk.other_table)
+                if local_values in selected.get(fk.other_table, set()):
+                    continue
+                parent_rows = self._closure_fetch_by_pk(
+                    fk.other_table, parent_pk, {local_values}
+                )
+                if not parent_rows:
+                    broken_fks.append(
+                        BrokenForeignKey(
+                            table=current_table,
+                            foreign_key=fk,
+                            row_id=row_id,
+                            columns=tuple(fk.columns),
+                            key=local_values,
+                        )
+                    )
+                    continue
+                ok, rejected = add_rows(fk.other_table, parent_rows)
+                if not ok:
+                    pending_keys.extend(rejected)
+            if truncated:
+                if pending_keys:
+                    boundaries.append(
+                        ClosureBoundary(
+                            table=current_table,
+                            pending_rows=(
+                                self._closure_identity(current_key),
+                            ),
+                            pending_keys=tuple(
+                                self._closure_identity(key)
+                                for key in sorted(
+                                    pending_keys, key=self._closure_sort_key
+                                )
+                            ),
+                        )
+                    )
+                break
+
+        # Rows still queued when the budget ran out are unexpanded edges - but
+        # only rows that actually declare outgoing foreign keys have edges.
+        if truncated:
+            for table_name, key in queue:
+                if not fk_map.get(table_name):
+                    continue
+                boundaries.append(
+                    ClosureBoundary(
+                        table=table_name,
+                        pending_rows=(self._closure_identity(key),),
+                        pending_keys=(),
+                    )
+                )
+
+        tables = {
+            name: ClosureTable(
+                name=name,
+                row_ids=tuple(
+                    self._closure_identity(key)
+                    for key in sorted(bucket, key=self._closure_sort_key)
+                ),
+            )
+            for name, bucket in sorted(selected.items())
+        }
+        return ClosureResult(
+            tables=tables,
+            null_foreign_keys=null_fks,
+            broken_foreign_keys=broken_fks,
+            boundaries=boundaries,
+            budget=budget,
+            rows_selected=rows_selected,
+            complete=not truncated,
+            db=self,
+        )
+
+    def extract_closure(
+        self,
+        output: str | pathlib.Path | sqlite3.Connection,
+        seeds: Mapping[str, str | Sequence[Any]] | None = None,
+        *,
+        table: str | None = None,
+        where: str | None = None,
+        where_args: Sequence | dict[str, Any] | None = None,
+        budget: int | None = None,
+    ) -> ClosureResult:
+        """
+        Extract a foreign key closure of seed rows into a standalone SQLite
+        database, keeping every dimension row the seeds reference.
+
+        This runs :meth:`foreign_key_closure` and writes the result with
+        :meth:`ClosureResult.to_database`. It raises
+        :class:`ClosureIncompleteError` if the budget truncates the closure, so
+        a partial package is never silently written as if it were complete -
+        raise ``budget`` and retry, or call :meth:`foreign_key_closure`
+        directly to inspect the boundaries.
+
+        :param output: Path or connection for the new database
+        :param seeds: Mapping of table name to ``WHERE`` fragment or primary
+          key values selecting the seed rows
+        :param table: Convenience for a single seed table, paired with ``where``
+        :param where: ``WHERE`` fragment selecting seed rows of ``table``
+        :param where_args: Parameters for ``where``
+        :param budget: Maximum number of rows the closure may select
+        """
+        result = self.foreign_key_closure(
+            seeds,
+            table=table,
+            where=where,
+            where_args=where_args,
+            budget=budget,
+        )
+        result.to_database(output)
+        return result
 
     def vacuum(self) -> None:
         "Run a SQLite ``VACUUM`` against the database."

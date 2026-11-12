@@ -77,6 +77,25 @@ sqlite_utils.db.ForeignKey
 
 .. autoclass:: sqlite_utils.db.ForeignKey
 
+.. _reference_db_other_closure:
+
+Foreign key closure types
+-------------------------
+
+.. autoclass:: sqlite_utils.db.ClosureTable
+
+.. autoclass:: sqlite_utils.db.ClosureResult
+
+.. autoclass:: sqlite_utils.db.NullForeignKey
+
+.. autoclass:: sqlite_utils.db.BrokenForeignKey
+
+.. autoclass:: sqlite_utils.db.ClosureBoundary
+
+.. autoclass:: sqlite_utils.db.ClosureIncompleteError
+
+.. autoclass:: sqlite_utils.db.ClosurePrimaryKeyError
+
 sqlite_utils.utils
 ==================
 

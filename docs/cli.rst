@@ -2649,6 +2649,31 @@ If you want to ensure that every foreign key column in your database has a corre
 .. note::
     In Python: :ref:`db.index_foreign_keys() <python_api_index_foreign_keys>`  CLI reference: :ref:`sqlite-utils index-foreign-keys <cli_ref_index_foreign_keys>`
 
+.. _cli_extract_closure:
+
+Extracting a foreign key closure
+--------------------------------
+
+To reproduce a handful of rows offline you need not just those rows but every dimension row they reach through declared foreign keys. The ``extract-closure`` command starts from seed rows, follows the foreign key graph parent-wards (including compound and cyclic keys) and writes the result to a new database, preserving table names, schemas and primary key values:
+
+.. code-block:: bash
+
+    sqlite-utils extract-closure shop.db repro.db orders \
+        --where "id in (:o1, :o2)" -p o1 100 -p o2 101
+
+For a table with a single-column primary key you can list seed values directly instead:
+
+.. code-block:: bash
+
+    sqlite-utils extract-closure shop.db repro.db orders --pk 100 --pk 101
+
+Foreign keys whose local columns include a ``NULL`` need no parent row under SQLite's default ``MATCH SIMPLE`` behaviour and are reported on standard error; non-NULL keys with no matching parent row are broken references and are reported the same way while the referencing row is still copied. Add ``--report report.json`` to capture these details, plus the selected primary keys, as JSON.
+
+By default the closure grows without limit. Pass ``--budget N`` to cap the number of rows selected: if the closure would exceed that budget the command exits with an error and writes no database, reporting the unexpanded edges rather than producing an incomplete package. Add ``--replace`` to overwrite an existing output file.
+
+.. note::
+    In Python: :ref:`db.foreign_key_closure() and db.extract_closure() <python_api_foreign_key_closure>`  CLI reference: :ref:`sqlite-utils extract-closure <cli_ref_extract_closure>`
+
 .. _cli_defaults_not_null:
 
 Setting defaults and not null constraints

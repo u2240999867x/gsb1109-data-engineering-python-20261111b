@@ -4,6 +4,13 @@
  Changelog
 ===========
 
+.. _v4_2_2:
+
+4.2.2 (unreleased)
+------------------
+
+- New ``db.foreign_key_closure()`` computes the transitive closure of seed rows over the database's declared foreign keys, following compound and cyclic keys and reporting null foreign keys, broken references and - when a row ``budget`` is exhausted - the unexpanded boundaries. ``db.extract_closure()`` and the new ``sqlite-utils extract-closure`` command write a complete closure to a standalone database, preserving table names, schemas and primary key values; an incomplete closure raises ``ClosureIncompleteError`` rather than writing a package missing dimension rows. Tables without a declared primary key cannot participate, since their business identity cannot be assumed.
+
 .. _v4_2_1:
 
 4.2.1 (2026-08-13)

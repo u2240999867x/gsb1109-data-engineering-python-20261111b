@@ -45,6 +45,7 @@ This page lists the ``--help`` for every ``sqlite-utils`` CLI sub-command.
         "add-foreign-key": "cli_add_foreign_key",
         "add-foreign-keys": "cli_add_foreign_keys",
         "index-foreign-keys": "cli_index_foreign_keys",
+        "extract-closure": "cli_extract_closure",
         "create-index": "cli_create_index",
         "drop-index": "cli_drop_index",
         "enable-wal": "cli_wal",
@@ -1343,6 +1344,45 @@ See :ref:`cli_index_foreign_keys`.
     Options:
       --load-extension TEXT  Path to SQLite extension, with optional :entrypoint
       -h, --help             Show this message and exit.
+
+
+.. _cli_ref_extract_closure:
+
+extract-closure
+===============
+
+See :ref:`cli_extract_closure`.
+
+::
+
+    Usage: sqlite-utils extract-closure [OPTIONS] PATH OUTPUT TABLE
+
+      Extract seed rows and every row they reference via declared foreign keys into
+      a new SQLite database, preserving table names, schemas and row IDs
+
+      Select seeds with either --where (use -p for parameters) or one or more --pk
+      values. Compound primary keys must use --where. The command exits with an
+      error and writes nothing if the --budget truncates the closure, since the
+      resulting database would be missing dimension rows.
+
+      Example:
+
+          sqlite-utils extract-closure shop.db repro.db orders \
+              --where "id in (:o1, :o2)" -p o1 100 -p o2 101
+
+    Options:
+      --where TEXT                WHERE fragment selecting the seed rows of TABLE,
+                                  e.g. 'id = :id'
+      -p, --param <TEXT TEXT>...  Named :parameters for the --where clause
+      --pk TEXT                   Seed primary key value - repeat for multiple rows
+                                  (single-column PKs only)
+      --budget INTEGER            Maximum number of rows the closure may select
+      --replace                   Overwrite OUTPUT if it already exists
+      --report FILE               Write a JSON report of the closure (null and
+                                  broken foreign keys, boundaries) to this path
+      --load-extension TEXT       Path to SQLite extension, with optional
+                                  :entrypoint
+      -h, --help                  Show this message and exit.
 
 
 .. _cli_ref_enable_wal:

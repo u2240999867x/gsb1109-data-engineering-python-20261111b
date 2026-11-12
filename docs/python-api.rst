@@ -1759,6 +1759,58 @@ Compound foreign keys get a single composite index across their columns.
 .. note::
     In the CLI: :ref:`sqlite-utils index-foreign-keys <cli_index_foreign_keys>`
 
+.. _python_api_foreign_key_closure:
+
+Extracting a foreign key closure
+--------------------------------
+
+When reproducing a bug offline you often need a few fact rows plus every dimension row they reference. ``db.foreign_key_closure()`` starts from seed rows and walks the database's *declared* foreign keys parent-wards until the transitive closure is found:
+
+.. code-block:: python
+
+    result = db.foreign_key_closure(
+        table="orders", where="id = :id", where_args={"id": 100}
+    )
+
+Seeds can also be given as primary key values - tuples for compound primary keys - across several tables at once:
+
+.. code-block:: python
+
+    result = db.foreign_key_closure(
+        seeds={"orders": [100, 101], "customers": [2]}
+    )
+
+Compound foreign keys are followed as a single unit and cyclic foreign keys terminate naturally, because each row is processed once. Only tables with a declared primary key can participate: a rowid table without one raises ``ClosurePrimaryKeyError``, since the closure identifies rows by their real primary key and will not guess a business identity.
+
+The returned ``ClosureResult`` maps each table to a ``ClosureTable`` holding the selected primary keys:
+
+.. code-block:: python
+
+    result.tables["orders"].row_ids      # (100, 101)
+    result.rows_for("orders")            # the rows as dictionaries
+    result.complete                       # True if every edge was expanded
+    result.rows_selected                  # total rows across all tables
+
+A foreign key whose local columns include a ``NULL`` does not reference anything under SQLite's default ``MATCH SIMPLE`` behaviour, so no parent row is required; these are listed in ``result.null_foreign_keys``. A non-NULL key with no matching parent row is a broken reference and appears in ``result.broken_foreign_keys`` - the referencing row is still included, but no parent can be supplied.
+
+Pass ``budget=`` to cap the number of rows selected. If the closure would exceed it, ``complete`` becomes ``False`` and ``result.boundaries`` lists the edges that were not expanded (the pending rows and any discovered but unfetched parent keys):
+
+.. code-block:: python
+
+    result = db.foreign_key_closure(seeds={"orders": [100]}, budget=5)
+    if not result.complete:
+        for boundary in result.boundaries:
+            print(boundary.table, boundary.pending_rows, boundary.pending_keys)
+
+To materialize the closure into a standalone database, call ``result.to_database(path)`` - table names, original schemas (including foreign key declarations) and primary key values are all preserved. This raises ``ClosureIncompleteError`` for an incomplete closure, so a truncated package is never written as if it were complete. ``db.extract_closure()`` combines both steps and returns the result:
+
+.. code-block:: python
+
+    result = db.extract_closure("repro.db", table="orders", where="id = 100")
+
+.. note::
+    In the CLI: :ref:`sqlite-utils extract-closure <cli_extract_closure>`
+
 .. _python_api_drop:
 
 Dropping a table or view

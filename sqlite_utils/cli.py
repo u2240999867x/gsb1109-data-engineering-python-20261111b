@@ -25,6 +25,8 @@ from sqlite_utils.db import (
     DEFAULT,
     AlterError,
     BadMultiValues,
+    ClosureIncompleteError,
+    ClosurePrimaryKeyError,
     DescIndex,
     InvalidColumns,
     NoTable,
@@ -647,6 +649,191 @@ def index_foreign_keys(path, load_extension):
     _register_db_for_cleanup(db)
     _load_extensions(db, load_extension)
     db.index_foreign_keys()
+
+
+@cli.command(name="extract-closure")
+@click.argument(
+    "path",
+    type=click.Path(exists=True, file_okay=True, dir_okay=False, allow_dash=False),
+    required=True,
+)
+@click.argument(
+    "output",
+    type=click.Path(file_okay=True, dir_okay=False, allow_dash=False),
+    required=True,
+)
+@click.argument("table")
+@click.option(
+    "--where",
+    help="WHERE fragment selecting the seed rows of TABLE, e.g. 'id = :id'",
+)
+@click.option(
+    "-p",
+    "--param",
+    multiple=True,
+    type=(str, str),
+    help="Named :parameters for the --where clause",
+)
+@click.option(
+    "--pk",
+    "pks",
+    multiple=True,
+    help="Seed primary key value - repeat for multiple rows (single-column PKs only)",
+)
+@click.option(
+    "--budget",
+    type=int,
+    help="Maximum number of rows the closure may select",
+)
+@click.option(
+    "--replace",
+    is_flag=True,
+    default=False,
+    help="Overwrite OUTPUT if it already exists",
+)
+@click.option(
+    "--report",
+    type=click.Path(file_okay=True, dir_okay=False, allow_dash=False),
+    help="Write a JSON report of the closure (null and broken foreign keys, boundaries) to this path",
+)
+@load_extension_option
+def extract_closure(path, output, table, where, param, pks, budget, replace, report, load_extension):
+    """
+    Extract seed rows and every row they reference via declared foreign keys
+    into a new SQLite database, preserving table names, schemas and row IDs
+
+    Select seeds with either --where (use -p for parameters) or one or more
+    --pk values. Compound primary keys must use --where. The command exits with
+    an error and writes nothing if the --budget truncates the closure, since
+    the resulting database would be missing dimension rows.
+
+    Example:
+
+    \b
+        sqlite-utils extract-closure shop.db repro.db orders \\
+            --where "id in (:o1, :o2)" -p o1 100 -p o2 101
+    """
+    if bool(where) == bool(pks):
+        raise click.ClickException(
+            "Provide exactly one of --where or --pk to select the seed rows"
+        )
+    if os.path.exists(output):
+        if not replace:
+            raise click.ClickException(
+                f"Output {output} already exists - use --replace to overwrite it"
+            )
+        os.remove(output)
+
+    db = sqlite_utils.Database(path)
+    _register_db_for_cleanup(db)
+    _load_extensions(db, load_extension)
+    try:
+        if where is not None:
+            result = db.foreign_key_closure(
+                table=table,
+                where=where,
+                where_args=dict(param),
+                budget=budget,
+            )
+        else:
+            target = db.table(table)
+            if not target.exists():
+                raise NoTable(f"Table {table} does not exist")
+            if len(target.pks) != 1:
+                raise click.ClickException(
+                    f"Table {table} has a compound primary key - "
+                    "select its seed rows with --where instead of --pk"
+                )
+            result = db.foreign_key_closure(
+                seeds={table: list(pks)},
+                budget=budget,
+            )
+        result.to_database(output)
+    except ClosureIncompleteError:
+        lines = [
+            f"Closure truncated at {result.rows_selected} row(s) by the budget "
+            f"of {budget} - no database was written. Unexpanded edges:"
+        ]
+        for boundary in result.boundaries:
+            lines.append(
+                f"- table {boundary.table}: pending rows {list(boundary.pending_rows)}"
+                + (
+                    f", pending parent keys {list(boundary.pending_keys)}"
+                    if boundary.pending_keys
+                    else ""
+                )
+            )
+        raise click.ClickException("\n".join(lines))
+    except (NoTable, ClosurePrimaryKeyError) as ex:
+        raise click.ClickException(str(ex))
+
+    for name, closure_table in result.tables.items():
+        click.echo(f"{name}: {len(closure_table.row_ids)} row(s)", err=True)
+    if result.null_foreign_keys:
+        click.echo(
+            f"{len(result.null_foreign_keys)} null foreign key value(s) "
+            "(no parent row required):",
+            err=True,
+        )
+        for item in result.null_foreign_keys:
+            click.echo(
+                f"- {item.table} row {item.row_id} {list(item.columns)} = "
+                f"{list(item.key)}",
+                err=True,
+            )
+    if result.broken_foreign_keys:
+        click.echo(
+            f"{len(result.broken_foreign_keys)} broken foreign key value(s) "
+            "(no matching parent row):",
+            err=True,
+        )
+        for item in result.broken_foreign_keys:
+            click.echo(
+                f"- {item.table} row {item.row_id} {list(item.columns)} = "
+                f"{list(item.key)} -> {item.foreign_key.other_table}",
+                err=True,
+            )
+
+    if report:
+        payload = {
+            "complete": result.complete,
+            "rows_selected": result.rows_selected,
+            "budget": result.budget,
+            "tables": {
+                name: list(closure_table.row_ids)
+                for name, closure_table in result.tables.items()
+            },
+            "null_foreign_keys": [
+                {
+                    "table": item.table,
+                    "row_id": item.row_id,
+                    "columns": list(item.columns),
+                    "key": list(item.key),
+                    "other_table": item.foreign_key.other_table,
+                }
+                for item in result.null_foreign_keys
+            ],
+            "broken_foreign_keys": [
+                {
+                    "table": item.table,
+                    "row_id": item.row_id,
+                    "columns": list(item.columns),
+                    "key": list(item.key),
+                    "other_table": item.foreign_key.other_table,
+                }
+                for item in result.broken_foreign_keys
+            ],
+            "boundaries": [
+                {
+                    "table": boundary.table,
+                    "pending_rows": list(boundary.pending_rows),
+                    "pending_keys": list(boundary.pending_keys),
+                }
+                for boundary in result.boundaries
+            ],
+        }
+        with open(report, "w") as fp:
+            json.dump(payload, fp, indent=2, default=repr)
 
 
 @cli.command(name="create-index")
