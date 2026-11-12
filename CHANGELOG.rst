@@ -6,6 +6,10 @@ Changelog
 Unreleased
 ----------
 
+- Add ``KeyedBatcher`` and ``BatchFlushError`` for debounced, source-sequence-aligned batching of
+  per-key change versions with boundary receipts, selective cancellation, and retryable failures.
+- Add ``flush`` and ``cancel`` to the ``Debounce`` wrapper so a pending call can be invoked
+  immediately or discarded.
 - Stop ``partial`` and ``partial_right`` wrappers from accepting a positional iteratee argument in
   a slot that a keyword argument already binds, so ``map_`` passes the element instead of an index
   into the bound parameter.

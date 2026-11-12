@@ -473,6 +473,25 @@ class Debounce(_WithArgCount, t.Generic[P, T]):
                 return
             self._invoke()
 
+    def flush(self) -> T:
+        """Invoke :attr:`func` immediately with the latest pending arguments, if any."""
+        with self._lock:
+            if self._timer is None:
+                return self.last_result  # type: ignore
+            self._generation += 1
+            self._timer.cancel()
+            return self._invoke()
+
+    def cancel(self) -> None:
+        """Cancel the pending timer and discard the arguments waiting for the next invocation."""
+        with self._lock:
+            if self._timer is not None:
+                self._timer.cancel()
+                self._timer = None
+            self._args, self._kwargs = (), {}
+            self._first_call = None
+            self._generation += 1
+
     def _invoke(self) -> T:
         """Execute ``func`` with the latest arguments. Caller must hold ``_lock``."""
         args, kwargs = self._args, self._kwargs

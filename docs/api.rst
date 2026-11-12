@@ -93,6 +93,13 @@ Arrays
     :members:
 
 
+Batching
+========
+
+.. automodule:: pydash.batching
+    :members:
+
+
 Chaining
 ========
 

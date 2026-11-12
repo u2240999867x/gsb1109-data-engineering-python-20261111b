@@ -79,6 +79,7 @@ from .arrays import (
     zip_object_deep,
     zip_with,
 )
+from .batching import BatchFlushError, KeyedBatcher
 from .chaining import _Dash, chain, tap
 from .collections import (
     at,
@@ -463,6 +464,8 @@ __all__ = (
     "zip_object",
     "zip_object_deep",
     "zip_with",
+    "BatchFlushError",
+    "KeyedBatcher",
     "_Dash",
     "chain",
     "tap",
