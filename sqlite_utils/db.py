@@ -12,7 +12,7 @@ import re
 import secrets
 import textwrap
 import uuid
-from collections import namedtuple
+from collections import Counter, namedtuple
 from collections.abc import Callable, Generator, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from types import TracebackType
@@ -314,6 +314,84 @@ def _fk_actions_sql(fk: ForeignKey) -> str:
     return actions
 
 
+@dataclass(frozen=True)
+class ForeignKeyViolation:
+    """
+    A single foreign key violation found in the database.
+
+    ``table`` is the child table holding the offending row and ``row`` is the
+    full contents of that row. ``foreign_key`` is the violated constraint -
+    for compound keys both ends are available as ordered tuples on
+    ``foreign_key.columns`` (child side) and ``foreign_key.other_columns``
+    (parent side). ``values`` holds the child-side foreign key values, which
+    are also the key values missing from the parent table.
+
+    The ``child`` and ``parent`` properties map those values back onto the
+    column names at each end of the constraint.
+    """
+
+    table: str
+    foreign_key: ForeignKey
+    row: dict[str, Any]
+    values: tuple[Any, ...]
+
+    @property
+    def child(self) -> dict[str, Any]:
+        "Mapping of child-side foreign key column names to their values."
+        return dict(zip(self.foreign_key.columns, self.values))
+
+    @property
+    def parent(self) -> dict[str, Any]:
+        "Mapping of parent-side key column names to the values that are missing."
+        return dict(zip(self.foreign_key.other_columns, self.values))
+
+    @property
+    def parent_table(self) -> str:
+        "Name of the referenced parent table."
+        return self.foreign_key.other_table
+
+
+@dataclass(frozen=True)
+class BatchImportReceipt:
+    """
+    Receipt returned by :meth:`Database.import_batch` when a batch is accepted.
+
+    ``committed`` is ``True`` when the batch was durably committed by
+    ``import_batch`` itself, and ``False`` when the caller already had an
+    open transaction - in that case the batch is only visible within that
+    outer transaction and is committed or rolled back with it. ``status``
+    exposes the same distinction as a string.
+
+    ``resolved`` holds the pre-existing violations that this batch fixed,
+    each mapped back to the offending source row.
+    """
+
+    tables: tuple[str, ...]
+    rows_written: dict[str, int]
+    committed: bool
+    resolved: tuple[ForeignKeyViolation, ...] = ()
+
+    @property
+    def status(self) -> str:
+        "``'committed'`` or ``'visible-in-outer-transaction'``."
+        return "committed" if self.committed else "visible-in-outer-transaction"
+
+
+def _foreign_key_violation_key(violation: ForeignKeyViolation) -> tuple:
+    """
+    Content-based identity for a violation, independent of rowid - deleting
+    a bad row and inserting an identical one yields the same key, so the two
+    cancel out instead of looking like a new violation.
+    """
+    return (
+        violation.table,
+        violation.foreign_key.columns,
+        violation.foreign_key.other_table,
+        violation.foreign_key.other_columns,
+        violation.values,
+    )
+
+
 Index = namedtuple("Index", ("seq", "name", "unique", "origin", "partial", "columns"))
 XIndex = namedtuple("XIndex", ("name", "columns"))
 XIndexColumn = namedtuple(
@@ -466,6 +544,38 @@ class InvalidColumns(Exception):
 
 class TransactionError(Exception):
     "Operation cannot be performed while a transaction is open"
+
+
+class ForeignKeyViolationError(sqlite3.IntegrityError):
+    """
+    A batch import was rejected because it introduced new foreign key
+    violations or aggravated existing ones.
+
+    ``violations`` holds one :class:`ForeignKeyViolation` per new or
+    aggravated violation, with both ends of the constraint mapped back to
+    the source rows.
+    """
+
+    def __init__(self, violations: Iterable[ForeignKeyViolation]) -> None:
+        self.violations = tuple(violations)
+        details = "; ".join(
+            "{}.{} = {!r} has no match in {}.{}".format(
+                violation.table,
+                ", ".join(violation.foreign_key.columns),
+                violation.values,
+                violation.foreign_key.other_table,
+                ", ".join(violation.foreign_key.other_columns),
+            )
+            for violation in self.violations[:3]
+        )
+        if len(self.violations) > 3:
+            details += "; ..."
+        super().__init__(
+            "Batch import rejected: {} new or aggravated foreign key "
+            "violation{} ({})".format(
+                len(self.violations), "s" if len(self.violations) != 1 else "", details
+            )
+        )
 
 
 class DescIndex(str):
@@ -1286,6 +1396,177 @@ class Database:
         self, sql: str, params: Sequence | dict[str, Any] | None = None
     ) -> list[dict]:
         return list(self.query(sql, params))
+
+    def _foreign_key_violations(self) -> list[ForeignKeyViolation]:
+        """
+        Every foreign key violation currently visible in the database, with
+        both ends of each constraint mapped back to the source rows.
+
+        Violations are detected with an anti-join per foreign key rather than
+        ``PRAGMA foreign_key_check``, so that compound keys and WITHOUT ROWID
+        tables are handled uniformly and every violation carries the full
+        child row.
+        """
+        violations: list[ForeignKeyViolation] = []
+        table_names = set(self.table_names())
+        for table_name in self.table_names():
+            for foreign_key in self.table(table_name).foreign_keys:
+                child_columns = [
+                    column for column in foreign_key.columns if column is not None
+                ]
+                parent_columns = [
+                    column
+                    for column in foreign_key.other_columns
+                    if column is not None
+                ]
+                if not child_columns or len(child_columns) != len(parent_columns):
+                    continue
+                conditions = [
+                    "child.{} IS NOT NULL".format(quote_identifier(column))
+                    for column in child_columns
+                ]
+                if foreign_key.other_table in table_names:
+                    conditions.append(
+                        "NOT EXISTS (SELECT 1 FROM {} AS parent WHERE {})".format(
+                            quote_identifier(foreign_key.other_table),
+                            " AND ".join(
+                                "parent.{} = child.{}".format(
+                                    quote_identifier(parent_column),
+                                    quote_identifier(child_column),
+                                )
+                                for parent_column, child_column in zip(
+                                    parent_columns, child_columns
+                                )
+                            ),
+                        )
+                    )
+                # A missing parent table makes every non-null reference bad
+                sql = "SELECT child.* FROM {} AS child WHERE {}".format(
+                    quote_identifier(table_name), " AND ".join(conditions)
+                )
+                for row in self.execute_returning_dicts(sql):
+                    violations.append(
+                        ForeignKeyViolation(
+                            table=table_name,
+                            foreign_key=foreign_key,
+                            row=row,
+                            values=tuple(row[column] for column in child_columns),
+                        )
+                    )
+        return violations
+
+    def import_batch(
+        self,
+        batch: Mapping[str, Iterable[dict[str, Any]]],
+        *,
+        upsert: bool = False,
+        pk: Any = DEFAULT,
+        alter: bool = False,
+        replace: bool = False,
+        ignore: bool = False,
+    ) -> BatchImportReceipt:
+        """
+        Import a batch of records into several tables as one atomic unit,
+        validating foreign keys against the net effect of the whole batch.
+
+        Tables in the batch may reference each other - records are written
+        with foreign key enforcement deferred and the database is checked
+        once, after every table has been written. The batch is rejected only
+        if it introduces new violations or aggravates existing ones:
+        violations already present beforehand are tolerated, and corrections
+        within the batch that cancel each other out are never seen, because
+        intermediate states are not checked. Pre-existing violations that the
+        batch fixes are reported on the receipt.
+
+        If the caller already has an open transaction the batch runs inside
+        a savepoint: rejection rolls back only the batch, and on success the
+        receipt reports ``committed=False`` - the batch is visible in the
+        outer transaction but not yet durable. Otherwise the batch is
+        committed by this method and the receipt reports ``committed=True``.
+
+        Raises :class:`ForeignKeyViolationError` if the batch is rejected.
+
+        :param batch: Mapping of table name to an iterable of records
+        :param upsert: Upsert records instead of inserting them
+        :param pk: Primary key column(s) to use, passed to ``insert_all()``
+        :param alter: Add missing columns automatically
+        :param replace: Replace existing records with the same primary key
+        :param ignore: Ignore records that already exist
+        """
+        already_in_transaction = self.conn.in_transaction
+        foreign_keys_were_on = bool(self.execute("PRAGMA foreign_keys").fetchone()[0])
+        # PRAGMA foreign_keys is a no-op inside a transaction, so with an
+        # outer transaction open defer enforcement instead of disabling it
+        should_disable_foreign_keys = (
+            foreign_keys_were_on and not already_in_transaction
+        )
+        should_defer_foreign_keys = foreign_keys_were_on and already_in_transaction
+        defer_foreign_keys_was_on = False
+        try:
+            if should_disable_foreign_keys:
+                self.execute("PRAGMA foreign_keys=0;")
+            elif should_defer_foreign_keys:
+                defer_foreign_keys_was_on = bool(
+                    self.execute("PRAGMA defer_foreign_keys").fetchone()[0]
+                )
+                if not defer_foreign_keys_was_on:
+                    self.execute("PRAGMA defer_foreign_keys=ON;")
+            with self.atomic():
+                baseline = self._foreign_key_violations()
+                baseline_counts = Counter(
+                    _foreign_key_violation_key(violation) for violation in baseline
+                )
+                rows_written: dict[str, int] = {}
+                for table_name, records in batch.items():
+                    records = list(records)
+                    self.table(table_name).insert_all(
+                        records,
+                        pk=pk,
+                        alter=alter,
+                        replace=replace,
+                        ignore=ignore,
+                        upsert=upsert,
+                    )
+                    rows_written[table_name] = len(records)
+                final = self._foreign_key_violations()
+                final_counts = Counter(
+                    _foreign_key_violation_key(violation) for violation in final
+                )
+                introduced_keys = final_counts - baseline_counts
+                if introduced_keys:
+                    final_by_key = {}
+                    for violation in final:
+                        final_by_key.setdefault(
+                            _foreign_key_violation_key(violation), violation
+                        )
+                    introduced = [
+                        final_by_key[key]
+                        for key, count in introduced_keys.items()
+                        for _ in range(count)
+                    ]
+                    raise ForeignKeyViolationError(introduced)
+                resolved_keys = baseline_counts - final_counts
+                baseline_by_key = {}
+                for violation in baseline:
+                    baseline_by_key.setdefault(
+                        _foreign_key_violation_key(violation), violation
+                    )
+                resolved = tuple(
+                    baseline_by_key[key]
+                    for key, count in resolved_keys.items()
+                    for _ in range(count)
+                )
+            return BatchImportReceipt(
+                tables=tuple(batch),
+                rows_written=rows_written,
+                committed=not already_in_transaction,
+                resolved=resolved,
+            )
+        finally:
+            if should_defer_foreign_keys and not defer_foreign_keys_was_on:
+                self.execute("PRAGMA defer_foreign_keys=OFF;")
+            if should_disable_foreign_keys:
+                self.execute("PRAGMA foreign_keys=1;")
 
     def resolve_foreign_keys(
         self, name: str, foreign_keys: ForeignKeysType

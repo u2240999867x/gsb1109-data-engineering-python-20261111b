@@ -1139,6 +1139,41 @@ This also works with generators:
 
 Tuples and lists are both supported.
 
+.. _python_api_import_batch:
+
+Batch imports with foreign key validation
+=========================================
+
+``db.import_batch()`` imports records into several tables as one atomic unit, validating foreign keys against the net effect of the whole batch. This allows importing tables that reference each other - records are written with foreign key enforcement deferred, and the database is checked once after every table has been written:
+
+.. code-block:: python
+
+    receipt = db.import_batch({
+        "authors": [{"id": 1, "name": "Ann", "featured_book_id": 10}],
+        "books": [{"id": 10, "title": "Book", "author_id": 1}],
+    })
+
+The batch is rejected with ``sqlite_utils.db.ForeignKeyViolationError`` only if it introduces new foreign key violations or aggravates existing ones. Violations that were already present in the database beforehand are tolerated, and corrections within the batch that cancel each other out are never seen, because intermediate states are not checked. The exception carries a ``violations`` tuple of ``sqlite_utils.db.ForeignKeyViolation`` objects, each mapping both ends of the constraint back to the source rows - including compound foreign keys:
+
+.. code-block:: python
+
+    try:
+        db.import_batch({"facts": [{"id": 1, "fact_region": "eu", "fact_code": 7}]})
+    except ForeignKeyViolationError as ex:
+        for violation in ex.violations:
+            violation.table   # child table, e.g. "facts"
+            violation.row     # the full offending child row
+            violation.child   # {"fact_region": "eu", "fact_code": 7}
+            violation.parent  # {"region": "eu", "code": 7} - missing parent key
+
+The returned ``sqlite_utils.db.BatchImportReceipt`` reports how the batch was persisted and which pre-existing violations it fixed:
+
+- ``receipt.committed`` is ``True`` if the batch was durably committed. If the caller already had an open transaction, the batch runs in a savepoint instead: rejection rolls back only the batch, and on success ``receipt.committed`` is ``False`` - the batch is visible in the outer transaction but commits or rolls back with it. ``receipt.status`` exposes the same distinction as ``"committed"`` or ``"visible-in-outer-transaction"``.
+- ``receipt.resolved`` holds the pre-existing violations that this batch fixed, as ``ForeignKeyViolation`` objects mapped back to the rows that used to be bad.
+- ``receipt.rows_written`` maps each table name to the number of records written.
+
+Records are inserted by default; pass ``upsert=True`` to upsert them instead, which is how a batch can repair existing bad rows. ``pk``, ``alter``, ``replace`` and ``ignore`` are passed through to ``insert_all()``.
+
 .. _python_api_insert_replace:
 
 Insert-replacing data
