@@ -179,6 +179,36 @@ explicitly assign the mutated object back to SqliteDict:
     >>> db.commit() # remember to commit (or set autocommit)
     >>> db.close()
 
+Audit snapshots of commit boundaries
+====================================
+
+For auditing you may need an immutable copy of the database as of the Nth
+confirmed commit, even while the next batch of writes is already queued.
+Subscribe *before* confirming that commit and the worker thread will back up
+the whole database file at exactly that boundary:
+
+.. code-block:: python
+
+    >>> from sqlitedict import SqliteDict, AuditSnapshotError
+    >>> db = SqliteDict("example.sqlite")
+    >>> handle = db.subscribe_audit_snapshot(target_commit=3,
+    ...                                      destination="audit/audit-3.sqlite")
+    >>> # ... batches continue to be written and committed ...
+    >>> manifest = handle.wait()
+    >>> manifest["commit_seq"]      # 3
+    >>> manifest["tables"]          # {'unnamed': 42} -- every table, with row count
+
+The copy is written to a temporary file and swapped into place atomically, so
+readers only ever see the previous complete copy or the new complete copy.
+The manifest is both embedded in the copy (``sqlitedict_audit_manifest``
+table) and written next to it as ``*.manifest.json``.
+
+Each user-visible ``commit()`` advances a 1-based sequence available as
+``db.commit_seq`` (internal flushes such as table creation do not count).  If
+the requested boundary was already confirmed before the subscription could be
+registered, ``AuditSnapshotError`` is raised: the boundary is unrecoverable
+and the current database is never relabeled as an older commit.
+
 Features
 ========
 

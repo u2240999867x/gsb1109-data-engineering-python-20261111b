@@ -1,5 +1,9 @@
 # Changes
 
+## Unreleased
+
+- Added commit-boundary audit snapshots: `SqliteDict.subscribe_audit_snapshot()` schedules an atomic, self-describing backup of the whole database at a specific confirmed commit, with a manifest of every reference table and its row count. Missed boundaries raise `AuditSnapshotError` instead of relabeling the current database.
+
 ## 2.1.0, 2022-12-03
 
 - Introduced weak references (PR [#165](https://github.com/RaRe-Technologies/sqlitedict/pull/165), [@mpenkov](https://github.com/mpenkov))

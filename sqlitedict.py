@@ -27,6 +27,8 @@ don't forget to call `mydict.commit()` when done with a transaction.
 """
 
 import sqlite3
+import io
+import json
 import os
 import sys
 import tempfile
@@ -34,6 +36,7 @@ import threading
 import logging
 import traceback
 from base64 import b64decode, b64encode
+from datetime import datetime, timezone
 import weakref
 
 __version__ = '2.1.0'
@@ -81,7 +84,64 @@ logger = logging.getLogger(__name__)
 #
 _REQUEST_CLOSE = '--close--'
 _REQUEST_COMMIT = '--commit--'
+_REQUEST_AUDIT_SUBSCRIBE = '--audit-subscribe--'
 _RESPONSE_NO_MORE = '--no more--'
+
+# Table inside every audit backup describing the boundary it represents.
+# Keeping the manifest inside the database means a single atomic rename
+# exposes a fully self-describing copy, with no window where a reader could
+# see a new database paired with a stale external manifest.
+_AUDIT_MANIFEST_TABLE = 'sqlitedict_audit_manifest'
+
+
+class AuditSnapshotError(RuntimeError):
+    """Raised when a requested commit boundary can no longer be captured.
+
+    A backup subscription targets a specific commit sequence number.  If the
+    worker thread has already persisted a later commit by the time the
+    subscription is processed, the boundary is gone for good: the database as
+    of that earlier commit was never snapshotted and cannot be reconstructed.
+    """
+
+
+class AuditSnapshotHandle(object):
+    """A pending audit backup, returned when a snapshot is subscribed.
+
+    The backup itself is produced by the worker thread when the requested
+    commit boundary is reached.  Call :meth:`wait` to block until it exists
+    and retrieve its manifest (every reference table with its row count).
+    """
+
+    def __init__(self, commit_seq, destination, completion, result_box):
+        self.commit_seq = commit_seq
+        self.destination = os.path.abspath(destination)
+        self.manifest_path = self.destination + '.manifest.json'
+        self._completion = completion
+        self._result_box = result_box
+        self._manifest = None
+
+    @property
+    def ready(self):
+        """True once the backup file has been swapped into place."""
+        return self._completion.is_set()
+
+    def wait(self, timeout=None):
+        """Block until the snapshot completes and return its manifest.
+
+        Raises AuditSnapshotError if the backup could not be written.
+        Raises TimeoutError if ``timeout`` (seconds) elapses first.
+        """
+        if self._manifest is None:
+            if not self._completion.wait(timeout):
+                raise TimeoutError(
+                    'timed out after %ss waiting for the audit snapshot of '
+                    'commit %d' % (timeout, self.commit_seq)
+                )
+            status, payload = self._result_box['result']
+            if status == 'error':
+                raise payload
+            self._manifest = payload
+        return self._manifest
 
 #
 # We work with weak references for better memory efficiency.
@@ -227,7 +287,8 @@ class SqliteDict(DictClass):
         else:
             MAKE_TABLE = 'CREATE TABLE IF NOT EXISTS "%s" (key TEXT PRIMARY KEY, value BLOB)' % self.tablename
             self.conn.execute(MAKE_TABLE)
-            self.conn.commit()
+            # Internal flush: must not advance the user-facing commit sequence.
+            self.conn.commit(counted=False)
         if flag == 'w':
             self.clear()
 
@@ -351,9 +412,9 @@ class SqliteDict(DictClass):
 
         # avoid VACUUM, as it gives "OperationalError: database schema has changed"
         CLEAR_ALL = 'DELETE FROM "%s";' % self.tablename
-        self.conn.commit()
+        self.conn.commit(counted=False)
         self.conn.execute(CLEAR_ALL)
-        self.conn.commit()
+        self.conn.commit(counted=False)
 
     @staticmethod
     def get_tablenames(filename):
@@ -378,6 +439,45 @@ class SqliteDict(DictClass):
             self.conn.commit(blocking)
     sync = commit
 
+    @property
+    def commit_seq(self):
+        """Ordinal (1-based) of the last commit confirmed by this dictionary.
+
+        Counts only commits made through this instance; a freshly opened
+        dictionary starts at 0.  The value is updated by the worker thread
+        once a commit has actually been persisted to disk.
+        """
+        if self.conn is None:
+            return 0
+        return self.conn.commit_seq
+
+    def subscribe_audit_snapshot(self, target_commit, destination):
+        """Schedule an atomic audit backup of commit boundary ``target_commit``.
+
+        Subscribe *before* the Nth commit is confirmed, typically while a
+        later batch of writes may already be queued behind it.  When the
+        worker thread reaches that commit, the whole database is copied via
+        the SQLite online backup API and swapped atomically into
+        ``destination``; readers of ``destination`` only ever see the
+        previous complete copy or the new complete copy, never a partial
+        one.  A manifest listing every reference table and its row count is
+        written next to the backup as ``destination + '.manifest.json'``.
+
+        Returns an AuditSnapshotHandle whose ``wait()`` yields the manifest.
+        Raises AuditSnapshotError if ``target_commit`` was already confirmed
+        before the subscription could be registered -- the live database is
+        never relabeled as an older commit.
+        """
+        if self.flag == 'r':
+            raise RuntimeError(
+                'Refusing to schedule an audit snapshot from a read-only SqliteDict'
+            )
+        if self.conn is None:
+            raise RuntimeError(
+                'cannot subscribe an audit snapshot after the SqliteDict was closed'
+            )
+        return self.conn.subscribe_audit_snapshot(target_commit, destination)
+
     def close(self, do_log=True, force=False):
         if do_log:
             logger.debug("closing %s" % self)
@@ -387,7 +487,7 @@ class SqliteDict(DictClass):
                 # used.  However, we need to block on close() to ensure any
                 # awaiting exceptions are handled and that all data is
                 # persisted to disk before returning.
-                self.conn.commit(blocking=True)
+                self.conn.commit(blocking=True, counted=False)
             self.conn.close(force=force)
             self.conn = None
         if self.in_temp:
@@ -444,6 +544,16 @@ class SqliteMultithread(threading.Thread):
         self.log = logging.getLogger('sqlitedict.SqliteMultithread')
 
         #
+        # Audit snapshot state.  Everything below is only touched from this
+        # worker thread (inside run()), so no extra locking is required.
+        # _commit_seq is the ordinal of the last commit already persisted.
+        # _audit_subscriptions maps commit sequence number -> list of
+        # (destination path, completion event, result box) entries.
+        #
+        self._commit_seq = 0
+        self._audit_subscriptions = {}
+
+        #
         # Parts of this object's state get accessed from different threads, so
         # we use synchronization to avoid race conditions.  For example,
         # .exception gets set inside the new daemon thread that we spawned, but
@@ -461,6 +571,11 @@ class SqliteMultithread(threading.Thread):
         self.exception = None
 
         self.start()
+
+    @property
+    def commit_seq(self):
+        """Ordinal of the last commit persisted by the worker thread."""
+        return self._commit_seq
 
     def _connect(self):
         """Connect to the underlying database.
@@ -512,9 +627,21 @@ class SqliteMultithread(threading.Thread):
 
             if req == _REQUEST_CLOSE:
                 assert res_ref, ('--close-- without return queue', res_ref)
+                self._fail_pending_audit_subscriptions(
+                    'connection closed before commit boundary %d was reached'
+                )
                 break
+            elif req == _REQUEST_AUDIT_SUBSCRIBE:
+                self._handle_audit_subscribe(arg, res_ref)
             elif req == _REQUEST_COMMIT:
+                counted = arg[0] if arg else True
                 conn.commit()
+                if counted:
+                    # Only user-visible commits advance the audit sequence;
+                    # internal flushes (table creation, clear(), close()) pass
+                    # counted=False so the first user commit is always #1.
+                    self._commit_seq += 1
+                    self._fulfill_audit_subscriptions(conn, self._commit_seq)
                 _put(res_ref, _RESPONSE_NO_MORE)
             else:
                 try:
@@ -569,12 +696,230 @@ class SqliteMultithread(threading.Thread):
                     _put(res_ref, _RESPONSE_NO_MORE)
 
                 if self.autocommit:
+                    # Persist the write immediately, but do not advance the
+                    # audit sequence here: autocommit callers follow up with an
+                    # explicit counted commit request, keeping one sequence
+                    # increment per user-visible commit.
                     conn.commit()
 
         self.log.debug('received: %s, send: --no more--', req)
         conn.close()
 
         _put(res_ref, _RESPONSE_NO_MORE)
+
+    def _handle_audit_subscribe(self, arg, res_ref):
+        """Register (or reject) an audit backup request from the queue.
+
+        Runs on the worker thread, so checking the current commit sequence
+        against the requested boundary is race-free.
+        """
+        target_seq, destination, completion, result_box = arg
+        result_queue = res_ref() if res_ref else None
+
+        if target_seq <= self._commit_seq:
+            error = AuditSnapshotError(
+                'commit boundary %d is no longer recoverable: the database '
+                'has already reached commit %d; the current database must not '
+                'be labeled as commit %d'
+                % (target_seq, self._commit_seq, target_seq)
+            )
+            if result_queue is not None:
+                result_queue.put(('error', error))
+                result_queue.put(_RESPONSE_NO_MORE)
+            else:
+                self.log.error('%s', error)
+            return
+
+        self._audit_subscriptions.setdefault(target_seq, []).append(
+            (destination, completion, result_box)
+        )
+        if result_queue is not None:
+            result_queue.put(('subscribed', target_seq))
+            result_queue.put(_RESPONSE_NO_MORE)
+
+    def _fulfill_audit_subscriptions(self, conn, commit_seq):
+        """Write all backups subscribed for this just-persisted commit."""
+        subscriptions = self._audit_subscriptions.pop(commit_seq, None)
+        if not subscriptions:
+            return
+
+        for destination, completion, result_box in subscriptions:
+            try:
+                manifest = self._write_audit_snapshot(conn, destination, commit_seq)
+                result_box['result'] = ('snapshot', manifest)
+            except Exception as error:
+                # Keep the full traceback in the log; surface a concise
+                # message to whoever is waiting on the handle.
+                self.log.exception(
+                    'failed to write audit snapshot for commit %d', commit_seq
+                )
+                result_box['result'] = ('error', AuditSnapshotError(
+                    'failed to write audit snapshot for commit %d to %s: '
+                    '%s: %s' % (
+                        commit_seq, destination,
+                        type(error).__name__, error,
+                    )
+                ))
+            finally:
+                completion.set()
+
+    def _fail_pending_audit_subscriptions(self, message):
+        """Notify every still-pending audit subscription that it cannot finish."""
+        for target_seq, subscriptions in self._audit_subscriptions.items():
+            for _destination, completion, result_box in subscriptions:
+                result_box['result'] = (
+                    'error', AuditSnapshotError(message % target_seq)
+                )
+                completion.set()
+        self._audit_subscriptions.clear()
+
+    def _write_audit_snapshot(self, conn, destination, commit_seq):
+        """Back up the database at this commit boundary, atomically.
+
+        The SQLite online backup API copies a consistent snapshot of the
+        committed database while other connections may keep writing.  The
+        copy goes to a temporary file in the destination directory, gets a
+        self-describing manifest table, and is swapped into place with a
+        single os.replace(), so readers only ever observe the previous
+        complete copy or this complete copy -- never a partial file.
+        """
+        destination = os.path.abspath(destination)
+        destination_dir = os.path.dirname(destination) or '.'
+        if not os.path.isdir(destination_dir):
+            os.makedirs(destination_dir)
+
+        fd, tmp_path = tempfile.mkstemp(
+            prefix='.audit-%d-' % commit_seq, suffix='.sqlite.tmp',
+            dir=destination_dir,
+        )
+        os.close(fd)
+        manifest_path = destination + '.manifest.json'
+        tmp_manifest_path = tmp_path + '.manifest.json'
+        try:
+            backup_conn = sqlite3.connect(tmp_path)
+            try:
+                # Standard CPython returns a backup object that must be
+                # stepped and finished.  Some builds (notably patched
+                # sqlite3 wheels) perform the whole copy synchronously and
+                # return None; support both contracts.
+                backup = conn.backup(backup_conn)
+                if backup is not None:
+                    try:
+                        backup.step()
+                    finally:
+                        backup.finish()
+
+                tables = self._read_audit_manifest(backup_conn)
+                manifest = {
+                    'source': os.path.abspath(self.filename),
+                    'backup': destination,
+                    'commit_seq': commit_seq,
+                    'captured_at': datetime.now(timezone.utc).isoformat(),
+                    'tables': tables,
+                }
+                # Embed the manifest in the copy itself so the single rename
+                # exposes an already self-describing database.
+                backup_conn.execute(
+                    'CREATE TABLE "%s" (key TEXT PRIMARY KEY, value TEXT)'
+                    % _AUDIT_MANIFEST_TABLE
+                )
+                backup_conn.executemany(
+                    'INSERT INTO "%s" (key, value) VALUES (?, ?)'
+                    % _AUDIT_MANIFEST_TABLE,
+                    [
+                        ('source', manifest['source']),
+                        ('backup', manifest['backup']),
+                        ('commit_seq', str(commit_seq)),
+                        ('captured_at', manifest['captured_at']),
+                        ('tables', json.dumps(tables, sort_keys=True)),
+                    ],
+                )
+                backup_conn.commit()
+            finally:
+                backup_conn.close()
+
+            # Sidecar JSON for readers that do not open the sqlite file.
+            # It is replaced before the database itself; the in-database
+            # manifest table always remains the authoritative description.
+            with io.open(tmp_manifest_path, 'w') as manifest_file:
+                json.dump(manifest, manifest_file, indent=2, sort_keys=True)
+            os.replace(tmp_manifest_path, manifest_path)
+            os.replace(tmp_path, destination)
+        finally:
+            for leftover in (tmp_path, tmp_manifest_path):
+                if os.path.exists(leftover):
+                    try:
+                        os.remove(leftover)
+                    except OSError:
+                        self.log.exception('failed to remove temp file %s', leftover)
+
+        self.log.info(
+            'audit snapshot of commit %d written to %s (%d tables)',
+            commit_seq, destination, len(tables),
+        )
+        return manifest
+
+    @staticmethod
+    def _read_audit_manifest(connection):
+        """Return {table_name: row_count} for every user table in a copy."""
+        tables = {}
+        names = [
+            row[0]
+            for row in connection.execute(
+                'SELECT name FROM sqlite_master '
+                "WHERE type = 'table' AND name NOT LIKE 'sqlite_%' "
+                'ORDER BY name'
+            )
+        ]
+        for name in names:
+            if name == _AUDIT_MANIFEST_TABLE:
+                continue
+            quoted = name.replace('"', '""')
+            count = connection.execute(
+                'SELECT COUNT(*) FROM "%s"' % quoted
+            ).fetchone()[0]
+            tables[name] = count
+        return tables
+
+    def subscribe_audit_snapshot(self, target_commit, destination):
+        """Request an atomic backup once commit ``target_commit`` is persisted.
+
+        The subscription is queued like every other request, so it is
+        registered relative to the same ordering as the commit commands:
+        any commit already queued ahead of the subscription will still be
+        observed by the worker when the request is processed.
+
+        Returns an :class:`AuditSnapshotHandle`.  Call ``wait()`` on it to
+        block until the backup exists and get the snapshot manifest (all
+        reference tables and their row counts).
+
+        Raises AuditSnapshotError if the requested boundary has already been
+        passed -- the current database state is never relabeled as an older
+        commit.
+        """
+        target_commit = int(target_commit)
+        if target_commit < 1:
+            raise ValueError(
+                'target_commit must be a positive commit sequence number, got %r'
+                % target_commit
+            )
+        if not destination:
+            raise ValueError('a destination path for the audit copy is required')
+
+        self.check_raise_error()
+        completion = threading.Event()
+        result_box = {}
+        res = Queue()
+        self.execute(
+            _REQUEST_AUDIT_SUBSCRIBE,
+            (target_commit, os.path.abspath(destination), completion, result_box),
+            res,
+        )
+        status, payload = res.get()
+        self.check_raise_error()
+        if status == 'error':
+            raise payload
+        return AuditSnapshotHandle(payload, destination, completion, result_box)
 
     def check_raise_error(self):
         """
@@ -663,16 +1008,16 @@ class SqliteMultithread(threading.Thread):
         except StopIteration:
             return None
 
-    def commit(self, blocking=True):
+    def commit(self, blocking=True, counted=True):
         if blocking:
             # by default, we await completion of commit() unless
             # blocking=False.  This ensures any available exceptions for any
             # previous statement are thrown before returning, and that the
             # data has actually persisted to disk!
-            self.select_one(_REQUEST_COMMIT)
+            self.select_one(_REQUEST_COMMIT, (counted,))
         else:
             # otherwise, we fire and forget as usual.
-            self.execute(_REQUEST_COMMIT)
+            self.execute(_REQUEST_COMMIT, (counted,))
 
     def close(self, force=False):
         if force:
