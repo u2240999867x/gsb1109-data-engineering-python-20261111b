@@ -88,7 +88,9 @@ def test_validated_schema_cache():
     v = Validator({'foozifix': {'coerce': int}})
     assert len(v._valid_schemas) == cache_size
 
-    max_cache_size = 163
+    # The idempotence regression enumerates 64 finite rule configurations and
+    # contributes 44 additional cached schema definitions.
+    max_cache_size = 207
     assert cache_size <= max_cache_size, (
         "There's an unexpected high amount (%s) of cached valid "
         "definition schemas. Unless you added further tests, "
