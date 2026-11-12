@@ -11,6 +11,18 @@ Full documentation is available at https://python-cerberus.org/
 from __future__ import absolute_import
 
 from cerberus.platform import importlib_metadata
+from cerberus.references import (
+    BatchGate,
+    CoverageIssue,
+    RecheckItem,
+    ReferenceCheckingValidator,
+    ReferenceEntry,
+    ReferenceError,
+    ReferenceTable,
+    Verdict,
+    recheck,
+    verify,
+)
 from cerberus.schema import rules_set_registry, schema_registry, SchemaError
 from cerberus.utils import TypeDefinition
 from cerberus.validator import DocumentError, Validator
@@ -25,7 +37,17 @@ __all__ = [
     SchemaError.__name__,
     TypeDefinition.__name__,
     Validator.__name__,
+    "BatchGate",
+    "CoverageIssue",
+    "RecheckItem",
+    "ReferenceCheckingValidator",
+    "ReferenceEntry",
+    "ReferenceError",
+    "ReferenceTable",
+    "Verdict",
+    "recheck",
     "schema_registry",
     "rules_set_registry",
+    "verify",
     "__version__",
 ]
