@@ -6,7 +6,8 @@ URL: https://github.com/barrust/count-min-sketch
 
 import math
 from array import array
-from collections.abc import ByteString
+from collections.abc import ByteString, Iterable, Sequence
+from dataclasses import dataclass, field
 from io import BytesIO, IOBase
 from mmap import mmap
 from numbers import Number
@@ -17,6 +18,45 @@ from probables.constants import INT32_T_MAX, INT32_T_MIN, INT64_T_MAX, INT64_T_M
 from probables.exceptions import CountMinSketchError, InitializationError, NotSupportedError
 from probables.hashes import HashFuncT, HashResultsT, KeyT, default_fnv_1a
 from probables.utilities import MMap, is_valid_file, resolve_path
+
+UPDATE_POLICY_STANDARD = "standard"
+UPDATE_POLICY_CONSERVATIVE = "conservative"
+_UPDATE_POLICIES = (UPDATE_POLICY_STANDARD, UPDATE_POLICY_CONSERVATIVE)
+
+
+@dataclass
+class ShuffleReport:
+    """Outcome of checking whether two ordered batches of updates may be
+    interleaved (or swapped) without changing the resulting sketch bins.
+
+    Attributes:
+        consistent (bool): `True` when every interleaving that preserves the
+            order of each source produces identical bin values
+        first_witness (list[str] | None): A concrete write order (interleaving
+            of the two batches) that produces one of the resulting bin states
+        second_witness (list[str] | None): A second, different write order that
+            produces a different bin state; `None` when `consistent` is `True`
+        first_affected_bin (int | None): Flat index into the sketch bins of the
+            first bin whose value differs between the two witnesses; `None`
+            when `consistent` is `True`
+        changed_queries (dict[str, tuple[int, int]]): Keys from the supplied
+            query vocabulary whose estimated count differs between the two
+            witnesses, mapped to the two estimates (in witness order). Empty
+            when no queried key is affected, even if the bins themselves differ
+        bin_differences (dict[int, tuple[int, int]]): Every bin whose value
+            differs between the two witnesses, mapped to the two bin values (in
+            witness order); always populated when the batches are inconsistent
+    """
+
+    consistent: bool
+    first_witness: list[str] | None = None
+    second_witness: list[str] | None = None
+    first_affected_bin: int | None = None
+    changed_queries: dict[str, tuple[int, int]] = field(default_factory=dict)
+    bin_differences: dict[int, tuple[int, int]] = field(default_factory=dict)
+
+    def __bool__(self) -> bool:
+        return self.consistent
 
 
 class CountMinSketch:
@@ -52,6 +92,7 @@ class CountMinSketch:
         "__error_rate",
         "__elements_added",
         "__query_method",
+        "__update_policy",
         "_bins",
         "_hash_function",
     )
@@ -64,6 +105,7 @@ class CountMinSketch:
         error_rate: float | None = None,
         filepath: str | Path | None = None,
         hash_function: HashFuncT | None = None,
+        update_policy: str = UPDATE_POLICY_STANDARD,
     ) -> None:
         """default initilization function"""
         # default values
@@ -73,6 +115,7 @@ class CountMinSketch:
         self.__error_rate = 0.0
         self.__elements_added = 0
         self.__query_method = self.__min_query
+        self.__update_policy = self.__validate_update_policy(update_policy)
 
         if filepath is not None and is_valid_file(filepath):
             filepath = resolve_path(filepath)
@@ -121,16 +164,24 @@ class CountMinSketch:
 
     __FOOTER_STRUCT = Struct("IIq")
     __BASIC_BIN_STRUCT = Struct("i")
+    __POLICY_STRUCT = Struct("B")
+    __POLICY_MARKER = b"CMSP"
+
+    @staticmethod
+    def __validate_update_policy(update_policy: str) -> str:
+        """normalize and validate an update policy name"""
+        if update_policy not in _UPDATE_POLICIES:
+            msg = (
+                "CountMinSketch: update_policy must be one of "
+                f"{UPDATE_POLICY_STANDARD!r} or {UPDATE_POLICY_CONSERVATIVE!r}"
+            )
+            raise InitializationError(msg)
+        return update_policy
 
     def __str__(self) -> str:
         """string representation of the count min sketch"""
         msg = (
-            "Count-Min Sketch:\n"
-            "\tWidth: {0}\n"
-            "\tDepth: {1}\n"
-            "\tConfidence: {2}\n"
-            "\tError Rate: {3}\n"
-            "\tElements Added: {4}"
+            "Count-Min Sketch:\n\tWidth: {0}\n\tDepth: {1}\n\tConfidence: {2}\n\tError Rate: {3}\n\tElements Added: {4}"
         )
         return msg.format(
             self.width,
@@ -159,11 +210,22 @@ class CountMinSketch:
         Returns:
             CountMinSketch: A count-min sketch object
         """
+        payload = cls._strip_policy_block(b)
         offset = cls.__FOOTER_STRUCT.size
-        width, depth, _ = cls.__FOOTER_STRUCT.unpack_from(bytes(b[-1 * offset :]))
+        width, depth, _ = cls.__FOOTER_STRUCT.unpack_from(payload[-1 * offset :])
         cms = CountMinSketch(width=width, depth=depth, hash_function=hash_function)
         cms._parse_bytes(b)
         return cms
+
+    @classmethod
+    def _strip_policy_block(cls, data: ByteString) -> bytes:
+        """Return the serialized sketch with any trailing update-policy block
+        removed so the standard footer sits at the end again"""
+        payload = bytes(data)
+        block_size = len(cls.__POLICY_MARKER) + cls.__POLICY_STRUCT.size
+        if len(payload) >= block_size and payload[-block_size : -cls.__POLICY_STRUCT.size] == cls.__POLICY_MARKER:
+            return payload[:-block_size]
+        return payload
 
     @property
     def width(self) -> int:
@@ -237,6 +299,27 @@ class CountMinSketch:
         else:
             self.__query_method = self.__min_query
 
+    @property
+    def update_policy(self) -> str:
+        """str: The update policy used when inserting elements
+
+        Note:
+            Valid values:
+                * 'standard': every hashed bin is incremented by the full count
+                * 'conservative': only bins whose value is below the new
+                    minimum estimate are raised to it, so bins shared with
+                    heavier keys are left untouched
+
+        Note:
+            Under the conservative policy a batched insertion of `n` copies of
+            a key leaves the sketch identical to `n` single insertions, while
+            taking time proportional to the sketch depth regardless of `n`"""
+        return self.__update_policy
+
+    @update_policy.setter
+    def update_policy(self, val: str) -> None:
+        self.__update_policy = self.__validate_update_policy(val)
+
     def clear(self) -> None:
         """Reset the count-min sketch to an empty state"""
         self.__elements_added = 0
@@ -264,6 +347,10 @@ class CountMinSketch:
             int: The number of times the element was likely inserted after the insertion"""
         return self.add_alt(self.hashes(key), num_els)
 
+    def _bin_indices(self, hashes: HashResultsT) -> list[int]:
+        """Return the flat bin indices for the supplied hash representation"""
+        return [(val % self.width) + (i * self.width) for i, val in enumerate(hashes)]
+
     def add_alt(self, hashes: HashResultsT, num_els: int = 1) -> int:
         """Insert an element by using the hash representation
 
@@ -271,8 +358,19 @@ class CountMinSketch:
             key (str): The element to insert
             num_els (int): The number of times to insert the element
         Returns:
-            int: The number of times the element was likely inserted after the insertion"""
-        bins = [(val % self.width) + (i * self.width) for i, val in enumerate(hashes)]
+            int: The number of times the element was likely inserted after the insertion
+        Note:
+            Under the conservative update policy a batched insertion of
+            `num_els` copies is resolved in one pass and yields the same bins
+            as repeating the insertion `num_els` times, so the cost does not
+            grow with `num_els`"""
+        if self.__update_policy == UPDATE_POLICY_CONSERVATIVE and num_els > 0:
+            return self._add_conservative(hashes, num_els)
+        return self._add_standard(hashes, num_els)
+
+    def _add_standard(self, hashes: HashResultsT, num_els: int) -> int:
+        """standard count-min update: every hashed bin receives the full count"""
+        bins = self._bin_indices(hashes)
         vals = [self._bins[x] + num_els for x in bins]
 
         for i, val in enumerate(vals):
@@ -282,6 +380,30 @@ class CountMinSketch:
                 vals[i] = INT32_T_MAX
             else:
                 self._bins[idx] = val
+        self.__elements_added += num_els
+        if self.elements_added > INT64_T_MAX:
+            self.__elements_added = INT64_T_MAX
+        return self.__query_method(sorted(vals))
+
+    def _add_conservative(self, hashes: HashResultsT, num_els: int) -> int:
+        """conservative update: only bins at or below the lifted minimum grow,
+        and only enough to reach the new estimate"""
+        bins = self._bin_indices(hashes)
+        vals = [self._bins[x] for x in bins]
+
+        # n single conservative updates of the same key walk the minimum bin
+        # value from m to m+n, carrying along every hashed bin whose current
+        # value lies in [m, m+n). Raising each such bin directly to m+n is
+        # therefore identical to the n single updates, while touching each bin
+        # exactly once so the cost is independent of num_els
+        target = min(vals) + num_els
+        if target > INT32_T_MAX:
+            target = INT32_T_MAX
+        for i, idx in enumerate(bins):
+            if vals[i] < target:
+                self._bins[idx] = target
+                vals[i] = target
+
         self.__elements_added += num_els
         if self.elements_added > INT64_T_MAX:
             self.__elements_added = INT64_T_MAX
@@ -339,6 +461,195 @@ class CountMinSketch:
         bins = [(val % self.width) + (i * self.width) for i, val in enumerate(hashes)]
         return self.__query_method(sorted([self._bins[i] for i in bins]))
 
+    def check_shuffle_safety(
+        self,
+        first_batch: Sequence[KeyT],
+        second_batch: Sequence[KeyT],
+        window: int | None = None,
+        query_keys: Iterable[KeyT] | None = None,
+    ) -> ShuffleReport:
+        """Determine whether two ordered batches can be interleaved, or have
+        their processing order swapped, without changing the sketch bins.
+
+        Every interleaving that keeps the relative order of the keys within
+        each batch is replayed from a copy of the current (starting) sketch.
+        When the scheduling window is smaller than the batches, only choices
+        made while both sources still hold events and before either source has
+        fallen behind the other by more than `window` events are explored;
+        beyond that boundary the first source wins the tie and, once a source
+        is exhausted, its remaining tail drains freely. This mirrors a bounded
+        scheduling window. Pass `None` to examine every interleaving.
+
+        Args:
+            first_batch (Sequence[str]): Ordered keys from the first source
+            second_batch (Sequence[str]): Ordered keys from the second source
+            window (int): Maximum number of keys from each source considered
+                when the two sources first diverge; `None` examines every
+                interleaving
+            query_keys (Iterable[str]): Finite vocabulary of keys whose
+                estimated counts should be compared between witnesses
+        Returns:
+            ShuffleReport: The consistency verdict, two reachable write orders
+                and the first affected bin when inconsistent, the queried keys
+                whose estimate changes, and every bin-level difference
+        Raises:
+            InitializationError: If `window` is not a positive integer
+        """
+        if window is not None and (not isinstance(window, Number) or window <= 0):
+            msg = "CountMinSketch: window must be a positive integer"
+            raise InitializationError(msg)
+
+        first = list(first_batch)
+        second = list(second_batch)
+        limit = len(first) + len(second) if window is None else int(window)
+        query_hashes = {key: self.hashes(key) for key in (query_keys if query_keys is not None else ())}
+        # capture the starting counter before replay mutates it so the
+        # mean-min query can evaluate each hypothetical sketch at its true total
+        starting_elements = self.elements_added
+        hypothetical_total = starting_elements + len(first) + len(second)
+        if hypothetical_total > INT64_T_MAX:
+            hypothetical_total = INT64_T_MAX
+
+        baseline: tuple[int, ...] | None = None
+        first_state: tuple[int, ...] | None = None
+        first_order: list[str] | None = None
+
+        replay = self.__replay_interleavings(first, second, limit)
+        try:
+            for order, state in replay:
+                if baseline is None:
+                    baseline = state
+                    first_state = state
+                    first_order = order
+                    continue
+                if state != baseline:
+                    assert first_order is not None and first_state is not None
+                    return self.__build_shuffle_report(
+                        query_hashes,
+                        first_order,
+                        first_state,
+                        order,
+                        state,
+                        hypothetical_total,
+                        starting_elements,
+                    )
+        finally:
+            # force the suspended replay to run its cleanup so the starting
+            # bins and element counter are restored deterministically
+            replay.close()
+
+        return ShuffleReport(consistent=True)
+
+    def __replay_interleavings(self, first: list, second: list, limit: int):
+        """yield (write order, resulting bin tuple) for each in-window
+        interleaving of the two ordered batches"""
+        n_first = len(first)
+        n_second = len(second)
+        first_hashes = [self.hashes(key) for key in first]
+        second_hashes = [self.hashes(key) for key in second]
+        conservative = self.__update_policy == UPDATE_POLICY_CONSERVATIVE
+        seen: set[tuple[int, ...]] = set()
+
+        def update(hashes: HashResultsT) -> None:
+            # call the base update helpers directly so the replay only moves
+            # the bins: element counters and heavy-hitter/threshold tracking
+            # are left untouched
+            if conservative:
+                self._add_conservative(hashes, 1)
+            else:
+                self._add_standard(hashes, 1)
+
+        def walk(i: int, j: int, order: list, bins: array):
+            if i == n_first and j == n_second:
+                signature = tuple(bins)
+                if signature not in seen:
+                    seen.add(signature)
+                    yield list(order), signature
+                return
+            choices = []
+            if i < n_first:
+                choices.append(0)
+            if j < n_second:
+                choices.append(1)
+            both_available = i < n_first and j < n_second
+            for source in choices:
+                divergence_depth = min(i, j)
+                # the window only constrains scheduling while both sources can
+                # still be chosen; once a source is exhausted its tail is
+                # drained freely, and beyond the window the first source wins
+                # the tie so each boundary prefix is examined once
+                if both_available and divergence_depth >= limit and source != 0:
+                    continue
+                snapshot = None
+                if len(choices) > 1 and divergence_depth < limit:
+                    snapshot = bins[:]
+                if source == 0:
+                    update(first_hashes[i])
+                    order.append(first[i])
+                    yield from walk(i + 1, j, order, bins)
+                    order.pop()
+                else:
+                    update(second_hashes[j])
+                    order.append(second[j])
+                    yield from walk(i, j + 1, order, bins)
+                    order.pop()
+                if snapshot is not None:
+                    bins[:] = snapshot
+
+        working = array("i", self._bins)
+        original_bins = self._bins
+        original_elements = self.__elements_added
+        self._bins = working
+        try:
+            yield from walk(0, 0, [], working)
+        finally:
+            self._bins = original_bins
+            self.__elements_added = original_elements
+
+    def __build_shuffle_report(
+        self,
+        query_hashes: dict,
+        first_order: list,
+        first_state: tuple,
+        second_order: list,
+        second_state: tuple,
+        hypothetical_elements: int,
+        starting_elements: int,
+    ) -> ShuffleReport:
+        """assemble the report for two witnesses that disagree, including the
+        first affected bin, query-level differences and all bin differences"""
+        first_affected_bin = next(
+            idx for idx, (a, b) in enumerate(zip(first_state, second_state, strict=True)) if a != b
+        )
+
+        changed_queries: dict[str, tuple[int, int]] = {}
+        # the mean-min query reads the element counter, so evaluate both
+        # hypothetical sketches using their shared post-merge total and then
+        # restore the true starting counter (replay leaves it suspended mid-run)
+        self.__elements_added = hypothetical_elements
+        try:
+            for key, hashes in query_hashes.items():
+                bins = self._bin_indices(hashes)
+                estimate_a = self.__query_method(sorted(first_state[idx] for idx in bins))
+                estimate_b = self.__query_method(sorted(second_state[idx] for idx in bins))
+                if estimate_a != estimate_b:
+                    changed_queries[key] = (estimate_a, estimate_b)
+        finally:
+            self.__elements_added = starting_elements
+
+        bin_differences = {
+            idx: (a, b) for idx, (a, b) in enumerate(zip(first_state, second_state, strict=True)) if a != b
+        }
+
+        return ShuffleReport(
+            consistent=False,
+            first_witness=first_order,
+            second_witness=second_order,
+            first_affected_bin=first_affected_bin,
+            changed_queries=changed_queries,
+            bin_differences=bin_differences,
+        )
+
     def export(self, file: Path | str | IOBase | mmap) -> None:
         """Export the count-min sketch to disk
 
@@ -352,6 +663,12 @@ class CountMinSketch:
             # write out the bins
             self._bins.tofile(file)  # type: ignore
             file.write(self.__FOOTER_STRUCT.pack(self.width, self.depth, self.elements_added))
+            # the standard policy keeps the legacy byte layout so older
+            # readers stay compatible; non-default policies append a marked
+            # block that legacy readers ignore and a restore picks back up
+            if self.__update_policy != UPDATE_POLICY_STANDARD:
+                file.write(self.__POLICY_MARKER)
+                file.write(self.__POLICY_STRUCT.pack(_UPDATE_POLICIES.index(self.__update_policy)))
 
     def join(self, second: "CountMinSketch") -> None:
         """Join two count-min sketchs into a single count-min sketch; the
@@ -416,7 +733,17 @@ class CountMinSketch:
 
     def _parse_bytes(self, file: ByteString):
         """parse bytes or a mapped file to setup the CountMin-Sketch"""
-        width, depth, els_added = self._parse_footer(file)
+        payload = bytes(file)
+        block_size = len(self.__POLICY_MARKER) + self.__POLICY_STRUCT.size
+        # new files carry a trailing update-policy block; legacy files (and
+        # unknown block values) fall back to the standard policy
+        if len(payload) >= block_size and payload[-block_size : -self.__POLICY_STRUCT.size] == self.__POLICY_MARKER:
+            (policy_idx,) = self.__POLICY_STRUCT.unpack(payload[-self.__POLICY_STRUCT.size :])
+            if policy_idx < len(_UPDATE_POLICIES):
+                self.__update_policy = _UPDATE_POLICIES[policy_idx]
+            payload = payload[:-block_size]
+
+        width, depth, els_added = self._parse_footer(payload)
         self.__width = width
         self.__depth = depth
         self.__elements_added = els_added
@@ -424,7 +751,7 @@ class CountMinSketch:
         self.__error_rate = 2 / self.width
 
         offset = self.__BASIC_BIN_STRUCT.size * self.width * self.depth
-        self._bins = array("i", bytes(file[:offset]))
+        self._bins = array("i", payload[:offset])
 
     @staticmethod
     def __min_query(results: HashResultsT) -> int:
@@ -486,8 +813,9 @@ class CountMeanSketch(CountMinSketch):
         error_rate: float | None = None,
         filepath: str | Path | None = None,
         hash_function: HashFuncT | None = None,
+        update_policy: str = UPDATE_POLICY_STANDARD,
     ) -> None:
-        super().__init__(width, depth, confidence, error_rate, filepath, hash_function)
+        super().__init__(width, depth, confidence, error_rate, filepath, hash_function, update_policy)
         self.query_type = "mean"
 
 
@@ -524,8 +852,9 @@ class CountMeanMinSketch(CountMinSketch):
         error_rate: float | None = None,
         filepath: str | Path | None = None,
         hash_function: HashFuncT | None = None,
+        update_policy: str = UPDATE_POLICY_STANDARD,
     ) -> None:
-        super().__init__(width, depth, confidence, error_rate, filepath, hash_function)
+        super().__init__(width, depth, confidence, error_rate, filepath, hash_function, update_policy)
         self.query_type = "mean-min"
 
 
@@ -565,8 +894,9 @@ class HeavyHitters(CountMinSketch):
         error_rate: float | None = None,
         filepath: str | Path | None = None,
         hash_function: HashFuncT | None = None,
+        update_policy: str = UPDATE_POLICY_STANDARD,
     ) -> None:
-        super().__init__(width, depth, confidence, error_rate, filepath, hash_function)
+        super().__init__(width, depth, confidence, error_rate, filepath, hash_function, update_policy)
         self.__top_x = {}  # type: ignore
         self.__top_x_size = 0
         self.__num_hitters = num_hitters
@@ -584,7 +914,7 @@ class HeavyHitters(CountMinSketch):
         Returns:
             HeavyHitters: A Bloom Filter object
         """
-        width, depth, _ = cls._parse_footer(b)
+        width, depth, _ = cls._parse_footer(cls._strip_policy_block(b))
         hh = HeavyHitters(width=width, depth=depth, num_hitters=num_hitters, hash_function=hash_function)
         hh._parse_bytes(b)
         return hh
@@ -726,8 +1056,9 @@ class StreamThreshold(CountMinSketch):
         error_rate: float | None = None,
         filepath: str | Path | None = None,
         hash_function: HashFuncT | None = None,
+        update_policy: str = UPDATE_POLICY_STANDARD,
     ) -> None:
-        super().__init__(width, depth, confidence, error_rate, filepath, hash_function)
+        super().__init__(width, depth, confidence, error_rate, filepath, hash_function, update_policy)
         self.__threshold = threshold
         self.__meets_threshold = {}  # type: ignore
 
@@ -743,7 +1074,7 @@ class StreamThreshold(CountMinSketch):
         Returns:
             StreamThreshold: A Bloom Filter object
         """
-        width, depth, _ = cls._parse_footer(b)
+        width, depth, _ = cls._parse_footer(cls._strip_policy_block(b))
         st = StreamThreshold(width=width, depth=depth, threshold=threshold, hash_function=hash_function)
         st._parse_bytes(b)
         return st

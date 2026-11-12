@@ -7,7 +7,16 @@ from probables.blooms import (
     ExpandingBloomFilter,
     RotatingBloomFilter,
 )
-from probables.countminsketch import CountMeanMinSketch, CountMeanSketch, CountMinSketch, HeavyHitters, StreamThreshold
+from probables.countminsketch import (
+    UPDATE_POLICY_CONSERVATIVE,
+    UPDATE_POLICY_STANDARD,
+    CountMeanMinSketch,
+    CountMeanSketch,
+    CountMinSketch,
+    HeavyHitters,
+    ShuffleReport,
+    StreamThreshold,
+)
 from probables.cuckoo import CountingCuckooFilter, CuckooFilter
 from probables.exceptions import (
     CuckooFilterFullError,
@@ -38,6 +47,9 @@ __all__ = [
     "CountMeanMinSketch",
     "HeavyHitters",
     "StreamThreshold",
+    "UPDATE_POLICY_STANDARD",
+    "UPDATE_POLICY_CONSERVATIVE",
+    "ShuffleReport",
     "CuckooFilter",
     "CountingCuckooFilter",
     "InitializationError",

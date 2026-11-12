@@ -1,5 +1,18 @@
 # PyProbables Changelog
 
+### Version 0.7.2
+
+* `Count-Min Sketch`
+  * Add a conservative update policy (`update_policy="conservative"`) that only raises bins below
+    the new minimum estimate, reducing over-estimation from hash collisions
+  * Batched conservative inserts of a compressed adjacent run are resolved in one depth-sized pass,
+    producing identical bins to one-by-one inserts regardless of the compressed count
+  * Save/restore (file and bytes) preserves the update policy while standard sketches keep the
+    legacy byte layout
+  * Add `check_shuffle_safety` to decide whether two ordered batches can be interleaved or swapped
+    without changing the bins, reporting two reachable witness orders, the first affected bin, the
+    queried keys whose estimate changes, and all bin-level differences
+
 ### Version 0.7.1
 
 * `Cuckoo Filter`

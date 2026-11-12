@@ -104,6 +104,12 @@ CountMinSketch
 .. autoclass:: probables.CountMinSketch
     :members:
 
+ShuffleReport
++++++++++++++++++++++++++++++++
+
+.. autoclass:: probables.ShuffleReport
+    :members:
+
 
 CountMeanSketch
 +++++++++++++++++++++++++++++++
