@@ -60,6 +60,51 @@ Read
     >>>
     >>> db.close()
 
+Batch lookups
+-------------
+
+Use ``getmany`` to enrich a stream of keys with the stored values. It takes an
+iterable of keys and returns results *by position*, in pages of ``max_read``
+keys, without waiting for the whole key list to be read first. Every result
+list has the same length and order as the keys in that page:
+
+* a key that is absent yields the ``MISSING`` sentinel;
+* a key whose stored value is ``None`` yields ``None`` (never ``MISSING``);
+* a value that the configured codec cannot decode yields a ``DecodeError``
+  placed at that position, instead of aborting the whole batch.
+
+All results come from one consistent snapshot taken when the read starts. A key
+that reappears pages later therefore always resolves to the same version, even
+if another connection commits a new value in the meantime. Reads are chunked
+internally, so pages larger than SQLite's bound-parameter limit are supported.
+
+.. code-block:: python
+
+    from sqlitedict import SqliteDict, MISSING
+
+    db = SqliteDict("example.sqlite")
+    key_pages = [["1", "unknown", "2"], ["1", "3"]]  # e.g. detail-stream pages
+
+    for page in key_pages:
+        for values in db.getmany(iter(page), max_read=100):
+            for key, value in zip(page, values):
+                if value is MISSING:
+                    ...  # key absent from the snapshot
+                elif isinstance(value, Exception):
+                    ...  # codec could not decode this single value
+                else:
+                    ...  # the deserialized dimension value
+
+For explicit control over the snapshot lifetime, open a reader directly. It is a
+context manager; closing it (or dropping the reference) deletes its private
+snapshot database, and writers are never blocked while it is open:
+
+.. code-block:: python
+
+    with db.snapshot_reader() as reader:
+        first = reader.read(["1", "2"])
+        second = reader.read(["1"])  # same version as `first`, guaranteed
+
 Efficiency
 ----------
 

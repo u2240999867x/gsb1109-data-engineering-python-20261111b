@@ -142,6 +142,153 @@ def identity(obj):
     return obj
 
 
+class _Missing(object):
+    """Type of the :data:`MISSING` sentinel."""
+
+    __slots__ = ()
+
+    def __repr__(self):
+        return 'MISSING'
+
+
+#: Placeholder returned by batch reads for a key absent from the snapshot.
+#: A stored ``None`` is a real value and therefore returns ``None``, not this.
+MISSING = _Missing()
+
+
+class DecodeError(Exception):
+    """
+    A stored value that the configured ``decode`` codec could not deserialize.
+
+    Batch reads never abort on a single corrupt row: an instance of this
+    exception is placed at the offending position instead. It carries the
+    original key and keeps the underlying codec error as its cause.
+    """
+
+    def __init__(self, key, error):
+        super(DecodeError, self).__init__(
+            'failed to decode value for key %r: %s' % (key, error))
+        self.key = key
+        self.__cause__ = error
+
+
+class _SnapshotBatchReader(object):
+    """
+    Point-in-time, position-preserving batch reader over one SqliteDict table.
+
+    A consistent snapshot of the table is taken once, through SQLite's online
+    backup API, into a private temporary database. Every subsequent :meth:`read`
+    queries that frozen copy, so the same key always resolves to the same version
+    for the whole lifetime of the reader, even if other connections commit new
+    values in the meantime. The snapshot holds no lock on the source database,
+    so writers keep committing normally while a reader is alive.
+
+    Reads are split into chunks of ``chunk_size`` keys, which keeps each
+    statement below SQLite's bound-parameter limit (``SQLITE_MAX_VARIABLE_NUMBER``,
+    historically 999) regardless of how many keys are requested.
+
+    Each output position corresponds to the input position of the same index:
+    a missing key yields :data:`MISSING`, a stored ``None`` yields ``None`` and a
+    value that fails to decode yields a :class:`DecodeError` instance.
+    """
+
+    def __init__(self, db, chunk_size=999):
+        if isinstance(chunk_size, bool) or not isinstance(chunk_size, int) or chunk_size <= 0:
+            raise ValueError('chunk_size must be a positive integer, got %r' % (chunk_size,))
+        if db.filename == ':memory:':
+            raise RuntimeError(
+                'snapshot batch reads need a file-backed database; '
+                'a separate connection cannot see an in-memory database')
+        self._tablename = db.tablename
+        self._encode_key = db.encode_key
+        self._decode = db.decode
+        self._chunk_size = chunk_size
+
+        fd, self._path = tempfile.mkstemp(prefix='sqlitedict-snapshot-', suffix='.sqlite')
+        os.close(fd)
+        self._conn = None
+        source = None
+        try:
+            # A short-lived connection takes the backup and is closed right away,
+            # so no read lock is retained on the live database.
+            source = sqlite3.connect(db.filename, timeout=5)
+            self._conn = sqlite3.connect(self._path)
+            source.backup(self._conn)
+        except BaseException:
+            self.close()
+            raise
+        finally:
+            if source is not None:
+                source.close()
+
+    def read(self, keys):
+        """
+        Return the snapshot values for the sequence ``keys``, one entry per key.
+
+        The returned list always has the same length and order as ``keys``.
+        Only the last committed state at reader creation time is visible.
+        """
+        if self._conn is None:
+            raise RuntimeError('cannot read from a closed snapshot reader')
+
+        results = [MISSING] * len(keys)
+        for start in range(0, len(keys), self._chunk_size):
+            chunk = keys[start:start + self._chunk_size]
+            stored_keys = [self._encode_key(key) for key in chunk]
+            placeholders = ','.join('?' * len(stored_keys))
+            query = 'SELECT key, value FROM "%s" WHERE key IN (%s)' % (self._tablename, placeholders)
+            rows = self._conn.execute(query, stored_keys).fetchall()
+
+            snapshot = {}
+            for stored_key, stored_value in rows:
+                try:
+                    snapshot[stored_key] = (self._decode(stored_value), None)
+                except Exception as error:
+                    logger.exception('failed to decode snapshot value for key %r', stored_key)
+                    snapshot[stored_key] = (None, error)
+
+            for offset, stored_key in enumerate(stored_keys):
+                if stored_key not in snapshot:
+                    continue
+                value, error = snapshot[stored_key]
+                position = start + offset
+                if error is not None:
+                    results[position] = DecodeError(chunk[offset], error)
+                else:
+                    results[position] = value
+        return results
+
+    def close(self):
+        """Release the snapshot connection and delete its temporary database."""
+        conn = self._conn
+        self._conn = None
+        if conn is not None:
+            conn.close()
+        path = self._path
+        if path is not None and os.path.exists(path):
+            try:
+                os.remove(path)
+            except OSError:
+                logger.exception('failed to remove snapshot database %s', path)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        self.close()
+
+    def __del__(self):
+        # Best-effort cleanup if a caller forgot to close() the reader.
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    def __repr__(self):
+        return '%s(table=%r, chunk_size=%d, closed=%r)' % (
+            self.__class__.__name__, self._tablename, self._chunk_size, self._conn is None)
+
+
 class SqliteDict(DictClass):
     VALID_FLAGS = ['c', 'r', 'w', 'n']
 
@@ -304,6 +451,62 @@ class SqliteDict(DictClass):
         if item is None:
             raise KeyError(key)
         return self.decode(item[0])
+
+    def snapshot_reader(self, chunk_size=999):
+        """
+        Open a point-in-time, position-preserving batch reader on this table.
+
+        The returned :class:`_SnapshotBatchReader` is bound to one consistent
+        snapshot taken at call time. Use it from a context manager or call its
+        ``close()`` once done, so the temporary snapshot database is released.
+        """
+        return _SnapshotBatchReader(self, chunk_size=chunk_size)
+
+    def getmany(self, keys, max_read=None, chunk_size=999):
+        """
+        Stream dimension values for the ordered iterable ``keys`` by position.
+
+        Yields lists of at most ``max_read`` results without waiting for the
+        whole key stream to be consumed, which lets a caller process each
+        look-ahead page as it arrives. Every result keeps the position of its
+        key inside the current batch:
+
+        * a key absent from the snapshot yields :data:`MISSING`;
+        * a stored ``None`` is returned as ``None``;
+        * a value that the codec cannot decode is returned as a
+          :class:`DecodeError` instance.
+
+        All values come from the same snapshot, so a key that reappears pages
+        later always resolves to the same version, even if other connections
+        commit new values meanwhile. The snapshot resources are released as
+        soon as iteration finishes or is abandoned early.
+
+        ``chunk_size`` bounds the bound parameters of a single SQL statement,
+        keeping reads below SQLite's variable limit for arbitrarily long
+        batches.
+        """
+        if max_read is not None and (isinstance(max_read, bool)
+                                     or not isinstance(max_read, int) or max_read <= 0):
+            raise ValueError('max_read must be a positive integer or None, got %r' % (max_read,))
+        if isinstance(chunk_size, bool) or not isinstance(chunk_size, int) or chunk_size <= 0:
+            raise ValueError('chunk_size must be a positive integer, got %r' % (chunk_size,))
+
+        reader = self.snapshot_reader(chunk_size=chunk_size)
+
+        def _pages():
+            pending = []
+            try:
+                for key in keys:
+                    pending.append(key)
+                    if max_read is not None and len(pending) >= max_read:
+                        yield reader.read(pending)
+                        pending = []
+                if pending:
+                    yield reader.read(pending)
+            finally:
+                reader.close()
+
+        return _pages()
 
     def __setitem__(self, key, value):
         if self.flag == 'r':

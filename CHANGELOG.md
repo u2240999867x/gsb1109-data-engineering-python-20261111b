@@ -1,5 +1,10 @@
 # Changes
 
+## UNRELEASED
+
+- Added `SqliteDict.getmany()` and `SqliteDict.snapshot_reader()` for point-in-time, position-preserving batch reads. All reads within one reader resolve against a single consistent snapshot (a private database copy taken via the online backup API), even across SQLite parameter limits and concurrent commits, without blocking writers.
+- Added the `MISSING` sentinel for absent keys and `DecodeError` for values that fail the configured `decode` codec; both occupy their original position in batch results.
+
 ## 2.1.0, 2022-12-03
 
 - Introduced weak references (PR [#165](https://github.com/RaRe-Technologies/sqlitedict/pull/165), [@mpenkov](https://github.com/mpenkov))
