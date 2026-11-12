@@ -28,6 +28,7 @@ from .recipes import (
     OrderedSet,
     SegmentList,
     ValueSortedDict,
+    replace_column_slices,
 )
 
 __all__ = [
@@ -43,6 +44,7 @@ __all__ = [
     'SortedListWithKey',
     'SortedSet',
     'ValueSortedDict',
+    'replace_column_slices',
 ]
 
 __version__ = '2.1.0'
