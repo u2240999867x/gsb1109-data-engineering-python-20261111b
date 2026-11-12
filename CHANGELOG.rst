@@ -6,6 +6,12 @@ Changelog
 Unreleased
 ----------
 
+- Add ``pydash.timeseries`` with the per-device ``DeviceImputer`` for revision-aware sensor
+  imputation. It accepts retransmissions and corrections of stable ``(event_time, event_seq)``
+  events, carries observed values forward up to ``max_gap`` measured from the original observed
+  timestamp, and emits added, withdrawn, and source-changed readings for only the affected device
+  interval. ``DeviceImputer.reprocess`` replays a full history so that a one-shot backfill yields
+  the same final values and source pointers as incremental processing.
 - Stop ``partial`` and ``partial_right`` wrappers from accepting a positional iteratee argument in
   a slot that a keyword argument already binds, so ``map_`` passes the element instead of an index
   into the bound parameter.

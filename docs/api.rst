@@ -142,6 +142,13 @@ Strings
     :members:
 
 
+Time Series
+===========
+
+.. automodule:: pydash.timeseries
+    :members:
+
+
 Utilities
 =========
 
