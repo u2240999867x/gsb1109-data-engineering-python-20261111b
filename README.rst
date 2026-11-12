@@ -156,6 +156,36 @@ It's also possible to use a custom (de)serializer for keys to allow non-string k
     >>> with SqliteDict("example.sqlite", encode_key=encode_key, decode_key=decode_key) as mydict:
     ...     pass
 
+Read-only snapshots
+-------------------
+
+``ReadonlySnapshot`` pins an existing database to a single committed version
+for the duration of a read-only job (e.g. backfilling one partition from a
+reference library).  All tables opened through one snapshot share the same
+read-only connection and therefore the same version: accessing a second table
+never switches to a newer committed state, even if other connections keep
+writing (WAL mode).  The connection itself refuses writes (``mode=ro`` plus
+``PRAGMA query_only``), and neither a missing database file nor a missing
+table is ever created.
+
+.. code-block:: python
+
+    >>> from sqlitedict import ReadonlySnapshot
+    >>> with ReadonlySnapshot("reference.sqlite") as snapshot:
+    ...     cities = snapshot.table("cities")     # SqliteDict with flag='r'
+    ...     countries = snapshot.table("countries")
+    ...     print(snapshot.version)               # e.g. "wal:12:347"
+    ...     print(cities["oslo"])
+
+``snapshot.version`` identifies the pinned committed version; two partitions
+backfilled from snapshots with equal version strings were read from the same
+committed state and can be merged safely.
+
+Databases in WAL mode are only accepted while their ``-wal`` companion file is
+present, so an active source's last consistent commit can be authenticated.
+A detached copy of the main database file alone cannot be authenticated and is
+rejected with ``RuntimeError``.
+
 More
 ----
 

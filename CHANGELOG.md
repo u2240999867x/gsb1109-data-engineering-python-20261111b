@@ -1,5 +1,13 @@
 # Changes
 
+## Unreleased
+
+- Added `ReadonlySnapshot`: a pinned, read-only view of an existing database, shareable across tables via `SqliteDict(flag='r')` handles bound to one connection. Exposes a `version` identifier of the pinned committed version so independent backfills can be checked for mergeability.
+- Read-only connections now open the database with `mode=ro` and `PRAGMA query_only = ON`, so the connection itself refuses writes.
+- `flag='r'` no longer creates a missing database file (raises `IOError` instead); missing tables still raise `RuntimeError` without creating anything.
+- WAL-mode databases without their `-wal` companion file are rejected as unauthenticatable offline copies.
+- `SqliteDict.commit()` is now a no-op in read-only mode, so it cannot release a pinned snapshot transaction.
+
 ## 2.1.0, 2022-12-03
 
 - Introduced weak references (PR [#165](https://github.com/RaRe-Technologies/sqlitedict/pull/165), [@mpenkov](https://github.com/mpenkov))
