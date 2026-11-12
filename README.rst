@@ -156,6 +156,48 @@ It's also possible to use a custom (de)serializer for keys to allow non-string k
     >>> with SqliteDict("example.sqlite", encode_key=encode_key, decode_key=decode_key) as mydict:
     ...     pass
 
+Operation receipts
+-------------------
+
+Writes are handled by a background thread, so a write error may only surface on a
+later, unrelated call.  Pass ``receipts=True`` to opt into operation receipts that
+attribute each write (or commit) to the call that submitted it.
+
+.. code-block:: python
+
+    >>> from sqlitedict import SqliteDict, SqliteDictError, OperationStatus
+    >>> db = SqliteDict("example.sqlite", receipts=True)
+    >>> receipt = db.__setitem__("1", {"name": "first item"})
+    >>> receipt.wait()                       # block until the background write is done
+    OperationReceipt(operation='setitem', identity='1', status=succeeded)
+    >>> receipt.status                      # SUCCEEDED / FAILED / CANCELLED
+    <OperationStatus.SUCCEEDED: 'succeeded'>
+    >>> receipt.identity                    # the key (for setitem/delitem/update)
+    '1'
+    >>> commit_receipt = db.commit()        # commits return a receipt too
+    >>> commit_receipt.raise_for_status()   # returns the receipt, or raises if it failed
+    OperationReceipt(operation='commit', identity='unnamed', status=succeeded)
+
+A failed receipt keeps both the operation identity and the original exception
+raised in the background thread; the error is delivered through that one receipt
+only and is never re-raised on an unrelated request.
+
+.. code-block:: python
+
+    >>> failed = db.update([("bad", object())])[0]   # doctest: +SKIP
+    >>> failed.wait()                                 # doctest: +SKIP
+    >>> try:                                          # doctest: +SKIP
+    ...     failed.raise_for_status()
+    ... except SqliteDictError as exc:
+    ...     exc.receipt.identity      # the offending item
+    ...     exc.__cause__             # the original background exception
+
+Receipts still pending when the connection is closed reach a terminal
+``CANCELLED`` state, so nothing is left waiting forever.  ``pending_receipts()``
+and ``all_receipts()`` return in-memory snapshots for diagnostics and never
+re-execute SQL.  When ``receipts`` is False (the default), the mapping keeps its
+original behavior and return values.
+
 More
 ----
 

@@ -1,5 +1,16 @@
 # Changes
 
+## Unreleased
+
+- Added optional operation receipts (`SqliteDict(..., receipts=True)`). Writes and
+  commits return an `OperationReceipt` carrying the operation identity and lifecycle
+  (`pending`/`succeeded`/`failed`/`cancelled`), so a background writer error is
+  attributed to the exact operation that failed instead of being re-raised on a later,
+  unrelated call. A failed receipt retains the original exception; the same error is no
+  longer delivered to multiple requests, and receipts still pending on close reach a
+  terminal state. `pending_receipts()`/`all_receipts()` provide in-memory diagnostics
+  without re-executing SQL. The default mapping behavior and return values are unchanged.
+
 ## 2.1.0, 2022-12-03
 
 - Introduced weak references (PR [#165](https://github.com/RaRe-Technologies/sqlitedict/pull/165), [@mpenkov](https://github.com/mpenkov))
