@@ -12,6 +12,8 @@ Features
 - ValueSortedDict - Dictionary with (key, value) item pairs sorted by value.
 - ItemSortedDict - Dictionary with key-function support for item pairs.
 - NearestDict - Dictionary with nearest-key lookup.
+- ScheduleAlignment - Timezone-aware, true-time alignment of wall-clock
+  scheduling records to NearestDict reference marks.
 - OrderedDict - Ordered dictionary with numeric indexing support.
 - OrderedSet - Ordered set with numeric indexing support.
 - IndexableDict - Dictionary with numeric indexing support.

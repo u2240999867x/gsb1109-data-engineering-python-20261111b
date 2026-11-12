@@ -6,6 +6,7 @@
    valuesorteddict
    itemsorteddict
    nearestdict
+   schedule
    ordereddict
    orderedset
    indexabledict

@@ -29,20 +29,37 @@ from .recipes import (
     SegmentList,
     ValueSortedDict,
 )
+from .schedule import (
+    NEAREST,
+    NEXT,
+    PREVIOUS,
+    AlignmentResult,
+    NoCandidate,
+    ScheduleAlignment,
+    ToleranceExceeded,
+    ordinary_linear_nearest,
+)
 
 __all__ = [
     'IndexableDict',
     'IndexableSet',
     'ItemSortedDict',
+    'NEAREST',
+    'NEXT',
     'NearestDict',
+    'NoCandidate',
     'OrderedDict',
     'OrderedSet',
+    'PREVIOUS',
+    'ScheduleAlignment',
     'SegmentList',
     'SortedDict',
     'SortedList',
     'SortedListWithKey',
     'SortedSet',
+    'ToleranceExceeded',
     'ValueSortedDict',
+    'ordinary_linear_nearest',
 ]
 
 __version__ = '2.1.0'
