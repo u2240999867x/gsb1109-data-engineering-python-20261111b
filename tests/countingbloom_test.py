@@ -13,6 +13,7 @@ sys.path.insert(0, str(this_dir))
 sys.path.insert(0, str(this_dir.parent))
 
 from probables import CountingBloomFilter  # noqa: E402
+from probables.constants import UINT32_T_MAX  # noqa: E402
 from probables.exceptions import InitializationError, SimilarityError  # noqa: E402
 from tests.utilities import calc_file_md5, different_hash  # noqa: E402
 
@@ -79,10 +80,10 @@ class TestCountingBloomFilter(unittest.TestCase):
             "\telements added: 10\n"
             "\tcurrent false positive rate: 0.048806\n"
             "\tis on disk: no\n"
-            "\tindex fullness: 0.634921\n"
+            "\tindex fullness: 0.603175\n"
             "\tmax index usage: 3\n"
             "\tmax index id: 56\n"
-            "\tcalculated elements: 10\n"
+            "\tcalculated elements: 9\n"
         )
         blm = CountingBloomFilter(est_elements=10, false_positive_rate=0.05)
         for i in range(0, 10):
@@ -105,7 +106,7 @@ class TestCountingBloomFilter(unittest.TestCase):
 
     def test_cbf_export_file(self):
         """test exporting bloom filter to file"""
-        md5_val = "0b83c837da30e25f768f0527c039d341"
+        md5_val = "bdb045d625b52cbb442f76e41588471a"
         with NamedTemporaryFile(dir=os.getcwd(), suffix=".cbm", delete=DELETE_TEMP_FILES) as fobj:
             blm = CountingBloomFilter(est_elements=10, false_positive_rate=0.01)
             blm.add("test")
@@ -126,7 +127,7 @@ class TestCountingBloomFilter(unittest.TestCase):
 
     def test_cbf_bytes(self):
         """test exporting counting bloom filter to bytes"""
-        md5_val = "0b83c837da30e25f768f0527c039d341"
+        md5_val = "bdb045d625b52cbb442f76e41588471a"
         blm = CountingBloomFilter(est_elements=10, false_positive_rate=0.01)
         blm.add("test")
         blm.add("out")
@@ -200,16 +201,28 @@ class TestCountingBloomFilter(unittest.TestCase):
     def test_cbf_export_hex(self):
         """test the exporting of the bloom filter to a hex string"""
         h_val = (
-            "01000000000000000100000002000000000000000100000001000000"
-            "00000000000000000000000001000000000000000000000002000000"
-            "00000000010000000200000000000000000000000000000001000000"
-            "00000000000000000200000000000000010000000200000000000000"
-            "00000000000000000100000000000000000000000100000000000000"
-            "01000000020000000000000000000000000000000100000001000000"
-            "00000000010000000000000001000000020000000000000000000000"
-            "01000000000000000100000001000000010000000000000001000000"
-            "03000000000000000100000001000000000000000000000001000000"
-            "000000000000000a000000000000000a3d4ccccd"
+            "43424c4d010000000000000000000000"
+            "00000000000000000000000000000000"
+            "00000000000000000000000000000000"
+            "00000000000000000000000000000000"
+            "00000000010000000000000001000000"
+            "02000000000000000100000001000000"
+            "00000000000000000000000001000000"
+            "00000000000000000200000000000000"
+            "01000000020000000000000000000000"
+            "00000000010000000000000000000000"
+            "02000000000000000100000001000000"
+            "00000000000000000000000001000000"
+            "00000000000000000100000000000000"
+            "01000000020000000000000000000000"
+            "00000000010000000100000000000000"
+            "01000000000000000100000001000000"
+            "00000000000000000100000000000000"
+            "01000000010000000100000000000000"
+            "01000000030000000000000001000000"
+            "01000000000000000000000001000000"
+            "000000000000000a000000000000000a"
+            "3d4ccccd"
         )
 
         blm = CountingBloomFilter(est_elements=10, false_positive_rate=0.05)
@@ -263,16 +276,35 @@ class TestCountingBloomFilter(unittest.TestCase):
     def test_cbf_export_c_header(self):
         """test exporting a c header"""
         hex_val = (
-            "01000000000000000100000002000000000000000100000001000000"
-            "00000000000000000000000001000000000000000000000002000000"
-            "00000000010000000200000000000000000000000000000001000000"
-            "00000000000000000200000000000000010000000200000000000000"
-            "00000000000000000100000000000000000000000100000000000000"
-            "01000000020000000000000000000000000000000100000001000000"
-            "00000000010000000000000001000000020000000000000000000000"
-            "01000000000000000100000001000000010000000000000001000000"
-            "03000000000000000100000001000000000000000000000001000000"
-            "000000000000000a000000000000000a3d4ccccd"
+            "43424c4d0100000000000000"
+            "000000000000000000000000"
+            "000000000000000000000000"
+            "000000000000000000000000"
+            "000000000000000000000000"
+            "000000000000000001000000"
+            "000000000100000002000000"
+            "000000000100000001000000"
+            "000000000000000000000000"
+            "010000000000000000000000"
+            "020000000000000001000000"
+            "020000000000000000000000"
+            "000000000100000000000000"
+            "000000000200000000000000"
+            "010000000100000000000000"
+            "000000000000000001000000"
+            "000000000000000001000000"
+            "000000000100000002000000"
+            "000000000000000000000000"
+            "010000000100000000000000"
+            "010000000000000001000000"
+            "010000000000000000000000"
+            "010000000000000001000000"
+            "010000000100000000000000"
+            "010000000300000000000000"
+            "010000000100000000000000"
+            "000000000100000000000000"
+            "0000000a000000000000000a"
+            "3d4ccccd"
         )
         blm = CountingBloomFilter(est_elements=10, false_positive_rate=0.05)
         for i in range(0, 10):
@@ -305,7 +337,7 @@ class TestCountingBloomFilter(unittest.TestCase):
     def test_cbf_export_size(self):
         """test the size of the exported file"""
         blm = CountingBloomFilter(est_elements=10, false_positive_rate=0.01)
-        self.assertEqual(404, blm.export_size())
+        self.assertEqual(505, blm.export_size())
 
     def test_cbf_jaccard_ident(self):
         """test jaccard of two identical counting bloom filters"""
@@ -538,6 +570,251 @@ class TestCountingBloomFilter(unittest.TestCase):
             blm.add(str(i))
         # NOTE: this causes an exception when all bits are set
         self.assertEqual(-1, blm.estimate_elements())
+
+
+class TestCountingBloomFilterSaturation(unittest.TestCase):
+    """Test saturated bucket handling and exact/lower-bound distinction"""
+
+    def test_saturated_bucket_keeps_accepting_events(self):
+        """a saturated bucket stays clamped but still records new insertions"""
+        blm = CountingBloomFilter(est_elements=10, false_positive_rate=0.05)
+        self.assertFalse(blm.has_saturated_buckets)
+        blm.add("hot", UINT32_T_MAX)
+        self.assertTrue(blm.has_saturated_buckets)
+        self.assertEqual(blm.check("hot"), UINT32_T_MAX)
+
+        blm.add("hot", 1000)
+        self.assertEqual(blm.check("hot"), UINT32_T_MAX)
+        self.assertTrue(blm.is_saturated("hot"))
+        self.assertEqual(blm.saturated_buckets, tuple(sorted(blm.saturated_buckets)))
+
+    def test_check_with_status_distinguishes_exact_from_lower_bound(self):
+        """exact counters and lower-bound counters are distinguishable"""
+        blm = CountingBloomFilter(est_elements=10, false_positive_rate=0.05)
+        blm.add("normal", 3)
+        count, is_exact = blm.check_with_status("normal")
+        self.assertEqual((count, is_exact), (3, True))
+
+        blm.add("hot", UINT32_T_MAX)
+        count, is_exact = blm.check_with_status("hot")
+        self.assertEqual(count, UINT32_T_MAX)
+        self.assertFalse(is_exact)
+
+    def test_remove_does_not_erase_present_key_via_saturated_bucket(self):
+        """removing from a saturated bucket must not drop a still-present key"""
+        blm = CountingBloomFilter(est_elements=10, false_positive_rate=0.05)
+        blm.add("hot", UINT32_T_MAX)
+        blm.remove("hot", 1000)
+        self.assertEqual(blm.check("hot"), UINT32_T_MAX)
+        self.assertTrue(blm.is_saturated("hot"))
+        self.assertTrue("hot" in blm)
+
+    def test_remove_mixed_saturated_and_exact_buckets(self):
+        """only exact buckets are decremented when one bucket is saturated"""
+        blm = CountingBloomFilter(est_elements=10, false_positive_rate=0.05)
+        saturated_key = [7, 11, 13, 17]
+        blm.add_alt(saturated_key, UINT32_T_MAX)
+        # shares bucket 7 with the saturated key; other buckets stay exact
+        mixed_key = [7, 21, 25, 29]
+        blm.add_alt(mixed_key, 4)
+        blm.remove_alt(mixed_key, 2)
+        self.assertEqual(blm.bloom[21], 2)
+        self.assertEqual(blm.bloom[25], 2)
+        self.assertEqual(blm.bloom[29], 2)
+        self.assertEqual(blm.bloom[7], UINT32_T_MAX)
+
+    def test_duplicate_hash_positions_count_once(self):
+        """repeated hash positions within a key update each bucket once"""
+        blm = CountingBloomFilter(est_elements=10, false_positive_rate=0.05)
+        key = [5, 5, 9, 9]
+        blm.add_alt(key)
+        self.assertEqual(blm.bloom[5], 1)
+        self.assertEqual(blm.bloom[9], 1)
+        self.assertEqual(blm.check_alt(key), 1)
+        blm.remove_alt(key)
+        self.assertEqual(blm.bloom[5], 0)
+        self.assertEqual(blm.bloom[9], 0)
+
+    def test_clear_resets_saturation(self):
+        """clearing also resets the saturation flags"""
+        blm = CountingBloomFilter(est_elements=10, false_positive_rate=0.05)
+        blm.add("hot", UINT32_T_MAX)
+        self.assertTrue(blm.has_saturated_buckets)
+        blm.clear()
+        self.assertFalse(blm.has_saturated_buckets)
+        self.assertEqual(blm.saturated_buckets, ())
+
+
+class TestCountingBloomFilterExport(unittest.TestCase):
+    """Test versioned export round trips and legacy format compatibility"""
+
+    def test_bytes_round_trip_preserves_saturation(self):
+        blm = CountingBloomFilter(est_elements=10, false_positive_rate=0.05)
+        blm.add("normal", 2)
+        blm.add("hot", UINT32_T_MAX)
+        saturated = blm.saturated_buckets
+
+        blm2 = CountingBloomFilter.frombytes(bytes(blm))
+        self.assertEqual(bytes(blm2), bytes(blm))
+        self.assertEqual(blm2.saturated_buckets, saturated)
+        self.assertEqual(blm2.check_with_status("normal"), (2, True))
+        self.assertEqual(blm2.check_with_status("hot"), (UINT32_T_MAX, False))
+
+    def test_legacy_bytes_load_without_saturation_flags(self):
+        """legacy binary exports (header-less) still load as exact counters"""
+        blm = CountingBloomFilter(est_elements=10, false_positive_rate=0.05)
+        blm.add("this is a test")
+        data = bytes(blm)
+        header = len(CountingBloomFilter._EXPORT_HEADER)
+        legacy = data[header + blm.bloom_length:]
+
+        blm2 = CountingBloomFilter.frombytes(legacy)
+        self.assertTrue(blm2.check("this is a test"))
+        self.assertFalse(blm2.has_saturated_buckets)
+
+    def test_legacy_hex_still_loads(self):
+        """legacy hex exports without the versioned header remain readable"""
+        h_val = (
+            "01000000000000000100000002000000000000000100000001000000"
+            "00000000000000000000000001000000000000000000000002000000"
+            "00000000010000000200000000000000000000000000000001000000"
+            "00000000000000000200000000000000010000000200000000000000"
+            "00000000000000000100000000000000000000000100000000000000"
+            "01000000020000000000000000000000000000000100000001000000"
+            "00000000010000000000000001000000020000000000000000000000"
+            "01000000000000000100000001000000010000000000000001000000"
+            "03000000000000000100000001000000000000000000000001000000"
+            "000000000000000a000000000000000a3d4ccccd"
+        )
+        blm = CountingBloomFilter(hex_string=h_val)
+        self.assertTrue("this is a test 0" in blm)
+        self.assertFalse(blm.has_saturated_buckets)
+
+    def test_hex_round_trip_preserves_saturation(self):
+        blm = CountingBloomFilter(est_elements=10, false_positive_rate=0.05)
+        blm.add("hot", UINT32_T_MAX)
+        blm2 = CountingBloomFilter(hex_string=blm.export_hex())
+        self.assertEqual(blm2.saturated_buckets, blm.saturated_buckets)
+        self.assertEqual(blm2.check_with_status("hot"), (UINT32_T_MAX, False))
+
+    def test_file_round_trip_preserves_saturation(self):
+        with NamedTemporaryFile(dir=os.getcwd(), suffix=".cbm", delete=DELETE_TEMP_FILES) as fobj:
+            blm = CountingBloomFilter(est_elements=10, false_positive_rate=0.05)
+            blm.add("hot", UINT32_T_MAX)
+            blm.export(fobj.name)
+
+            blm2 = CountingBloomFilter(filepath=fobj.name)
+            self.assertEqual(blm2.saturated_buckets, blm.saturated_buckets)
+            self.assertTrue(blm2.is_saturated("hot"))
+
+    def test_export_size_matches_bytes(self):
+        blm = CountingBloomFilter(est_elements=10, false_positive_rate=0.01)
+        blm.add("this is a test")
+        self.assertEqual(blm.export_size(), len(bytes(blm)))
+
+    def test_union_and_intersection_propagate_saturation(self):
+        blm1 = CountingBloomFilter(est_elements=10, false_positive_rate=0.05)
+        blm2 = CountingBloomFilter(est_elements=10, false_positive_rate=0.05)
+        blm1.add("hot", UINT32_T_MAX)
+        blm2.add("other")
+
+        union = blm1.union(blm2)
+        self.assertTrue(all(union._saturated[i] for i in blm1.saturated_buckets))
+
+        intersection = blm1.intersection(blm2)
+        for i in range(blm1.bloom_length):
+            expected_flag = (
+                blm1._saturated[i] | blm2._saturated[i]
+                if blm1.bloom[i] > 0 and blm2.bloom[i] > 0
+                else 0
+            )
+            self.assertEqual(intersection._saturated[i], expected_flag)
+
+
+class TestCountingBloomFilterReconcile(unittest.TestCase):
+    """Test sealed-segment reconciliation against the complete key stream"""
+
+    def test_reconcile_recovers_later_batch_only(self):
+        """recomputing a sealed segment leaves exactly the later batch ledger"""
+        segment_one = [f"seg1-{i}" for i in range(8)]
+        segment_two = [f"seg2-{i}" for i in range(8)]
+
+        blm = CountingBloomFilter(est_elements=30, false_positive_rate=0.05)
+        for key in segment_one + segment_two:
+            blm.add(key)
+        blm.reconcile(segment_one)
+
+        expected = CountingBloomFilter(est_elements=30, false_positive_rate=0.05)
+        for key in segment_two:
+            expected.add(key)
+        self.assertEqual(list(blm.bloom), list(expected.bloom))
+        self.assertEqual(blm.elements_added, len(segment_two))
+        self.assertTrue(all(key not in blm for key in segment_one))
+        self.assertTrue(all(key in blm for key in segment_two))
+
+    def test_reconcile_keeps_later_batch_share_of_shared_bucket(self):
+        """a shared bucket keeps the still-present key's contribution"""
+        blm = CountingBloomFilter(est_elements=10, false_positive_rate=0.05)
+        sealed = [5, 10, 15, 20]
+        present = [5, 25, 30, 35]  # shares bucket 5 with the sealed key
+        blm.add_alt(sealed)
+        blm.add_alt(present)
+        self.assertEqual(blm.bloom[5], 2)
+
+        touched = blm.reconcile_alt([sealed])
+        self.assertEqual(touched, 4)
+        self.assertEqual(blm.bloom[5], 1)
+        self.assertEqual(blm.check_alt(present), 1)
+        self.assertEqual(blm.check_alt(sealed), 0)
+
+    def test_reconcile_is_incremental(self):
+        """splitting the segment stream into pieces reaches the same result"""
+        segment_one = [f"seg1-{i}" for i in range(8)]
+        segment_two = [f"seg2-{i}" for i in range(8)]
+
+        blm = CountingBloomFilter(est_elements=30, false_positive_rate=0.05)
+        for key in segment_one + segment_two:
+            blm.add(key)
+        split = 3
+        blm.reconcile(segment_one[:split])
+        blm.reconcile(segment_one[split:])
+
+        expected = CountingBloomFilter(est_elements=30, false_positive_rate=0.05)
+        for key in segment_two:
+            expected.add(key)
+        self.assertEqual(list(blm.bloom), list(expected.bloom))
+
+    def test_reconcile_honors_multiplicity_and_duplicate_positions(self):
+        """shared buckets accumulate the real update multiplicity"""
+        blm = CountingBloomFilter(est_elements=30, false_positive_rate=0.05)
+        segment_one = [f"seg1-{i}" for i in range(6)]
+        segment_two = [f"seg2-{i}" for i in range(6)]
+        for key in segment_one:
+            blm.add(key, 3)
+        for key in segment_two:
+            blm.add(key)
+        blm.reconcile(segment_one, num_els=3)
+
+        expected = CountingBloomFilter(est_elements=30, false_positive_rate=0.05)
+        for key in segment_two:
+            expected.add(key)
+        self.assertEqual(list(blm.bloom), list(expected.bloom))
+        self.assertEqual(blm.elements_added, len(segment_two))
+
+    def test_reconcile_retains_saturation_flags(self):
+        """a clamped bucket stays a lower bound after subtracting a segment"""
+        blm = CountingBloomFilter(est_elements=10, false_positive_rate=0.05)
+        blm.add("hot", UINT32_T_MAX)
+        blm.add("later", 2)
+        saturated = set(blm.saturated_buckets)
+        blm.reconcile(["hot"], num_els=UINT32_T_MAX)
+        self.assertEqual(set(blm.saturated_buckets), saturated)
+        self.assertTrue(blm.is_saturated("hot"))
+
+    def test_reconcile_invalid_num_els(self):
+        blm = CountingBloomFilter(est_elements=10, false_positive_rate=0.05)
+        blm.add("key")
+        self.assertRaises(InitializationError, lambda: blm.reconcile(["key"], num_els=0))
 
 
 if __name__ == "__main__":

@@ -2,6 +2,12 @@
 
 ### Version 0.7.1
 
+* `Counting Bloom Filter`
+  * Track per-bucket saturation: saturated buckets keep accepting events while their counter stays clamped at `UINT32_T_MAX`, so the stored value is exposed as a lower bound via `check_with_status`, `is_saturated`, `has_saturated_buckets` and `saturated_buckets`
+  * Never decrement saturated buckets on removal, preventing a still-present key sharing a bucket from being erased
+  * Collapse duplicate hash positions of a key so each touched bucket is updated once per operation
+  * Add `reconcile`/`reconcile_alt` to recompute only the buckets of a sealed segment from its complete key stream without clearing later batches' contributions
+  * Export saturation flags in a versioned binary/hex format while remaining able to read legacy exports
 * `Cuckoo Filter`
   * Implement rewind for both regular and counting; see [#149](https://github.com/barrust/pyprobables/pull/149); thanks [mayur-dhavan](https://github.com/mayur-dhavan)
   * `CountingCuckooFilter`: Increment Elements Added by number of elements inserted
