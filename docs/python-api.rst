@@ -959,6 +959,54 @@ To specify ``ON DELETE`` or ``ON UPDATE`` actions, pass ``ForeignKey`` objects i
 
 Foreign key actions are preserved by :ref:`table.transform() <python_api_transform>` - prior to sqlite-utils 4.0 they were silently dropped when a table was transformed.
 
+.. _python_api_fk_audit:
+
+Auditing foreign key violations
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+SQLite only enforces foreign keys while ``PRAGMA foreign_keys`` is on, so rows can be left orphaned - for example by loading data with the pragma off. ``Database.audit_foreign_keys()`` scans every constraint and returns the rows that currently fail:
+
+.. code-block:: python
+
+    report = db.audit_foreign_keys()
+    for violation in report.violations:
+        print(
+            violation.table,
+            violation.row_pk,
+            violation.foreign_key,
+            violation.key_values,
+            violation.source_values,
+        )
+
+Each :class:`~sqlite_utils.db.ForeignKeyViolation` carries the source row's primary key (a tuple for compound primary keys, including ``WITHOUT ROWID`` tables), the exact :class:`~sqlite_utils.db.ForeignKey` declaration, the offending key values and the full source row. A row that fails two constraints produces two separate violations - they are never merged. Keys containing a ``NULL`` are not violations, matching SQLite's default ``MATCH NONE`` behavior.
+
+Incremental re-checks
+^^^^^^^^^^^^^^^^^^^^^
+
+Re-scanning a large database after every change is wasteful. :meth:`~sqlite_utils.db.Database.recheck_foreign_keys` takes the previous violation list and a :class:`~sqlite_utils.db.RowChanges` object describing the parent and child rows that changed, and only re-reads the affected key ranges:
+
+.. code-block:: python
+
+    from sqlite_utils import RowChanges
+
+    changes = RowChanges(
+        # primary key -> current row, or None for deletes
+        inserted={"parents": {4: {"id": 4}}},
+        updated={"children": {7: {"id": 7, "pid": 4}}},
+        deleted={"parents": {2: None}},
+        # rows as they stood before an update/delete, so the old parent key
+        # interval can still be searched
+        previous={"parents": {2: {"id": 2}}},
+    )
+    report = db.recheck_foreign_keys(previous_report.violations, changes)
+    report.new_violations       # not in the previous list
+    report.resolved_violations  # previously failing, now satisfied
+    report.remaining_violations # still failing
+
+Rows outside every affected interval are never read and keep their previous verdict. ``report.access`` records the index and exact key ranges visited on each table, and ``report.describe_access()`` renders them as text. Relevant key columns must have a usable index - call :meth:`~sqlite_utils.db.Database.index_foreign_keys` first if needed.
+
+If a collation or foreign key declaration was upgraded while rows were changing, the previous evidence may no longer be comparable. Such violations are returned in ``report.invalidated_evidence`` instead of being classified as resolved or remaining, so they can be re-established with a fresh full scan. On a small database the incremental result is identical to calling :meth:`~sqlite_utils.db.Database.audit_foreign_keys` again - the incremental audit is a bounded optimization, not a different definition of violation.
+
 .. _python_api_table_configuration:
 
 Table configuration options

@@ -4,6 +4,13 @@
  Changelog
 ===========
 
+.. _v4_3_unreleased:
+
+Unreleased
+----------
+
+- New incremental foreign key violation auditing: ``Database.audit_foreign_keys()`` / ``Table.audit_foreign_keys()`` run a full scan, while ``Database.recheck_foreign_keys(previous, RowChanges(...))`` re-verifies only the key ranges affected by explicit parent/child row changes and classifies violations as new, resolved or still unresolved. Reports include source primary keys (including ``WITHOUT ROWID`` compound keys), foreign key declarations, current source column values and the exact index ranges visited; collation or foreign-key declaration changes that invalidate prior evidence are reported separately.
+
 .. _v4_2_1:
 
 4.2.1 (2026-08-13)

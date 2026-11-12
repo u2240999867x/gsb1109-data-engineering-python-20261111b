@@ -35,6 +35,7 @@ from .create_table_parser import (
     check_references_identifier,
     parse_autoincrement,
     parse_checks,
+    parse_column_collations,
     parse_column_comments,
     parse_uniques,
     rewrite_check_expression,
@@ -312,6 +313,722 @@ def _fk_actions_sql(fk: ForeignKey) -> str:
     if fk.on_delete and fk.on_delete != "NO ACTION":
         actions += f" ON DELETE {fk.on_delete}"
     return actions
+
+
+@dataclass(frozen=True)
+class ForeignKeyViolation:
+    """
+    One row that fails one foreign key constraint.
+
+    A row covered by two failing constraints produces two separate
+    violations - they are never merged.
+
+    ``table`` / ``foreign_key`` identify the constraint, ``row_pk`` is the
+    row's primary key (a tuple for compound primary keys, including every
+    ``WITHOUT ROWID`` table), ``key_values`` holds the offending child
+    column values in the foreign key's column order, and ``source_values``
+    is the full row as currently stored.
+
+    ``child_collations`` / ``parent_collations`` snapshot the explicit
+    ``COLLATE`` declarations on each side at the time the violation was
+    observed. They let a later incremental audit tell whether a schema
+    upgrade invalidated the original evidence.
+    """
+
+    table: str
+    foreign_key: ForeignKey
+    row_pk: Any
+    key_values: tuple[Any, ...]
+    source_values: dict[str, Any]
+    child_collations: tuple[tuple[str, str], ...] = ()
+    parent_collations: tuple[tuple[str, str], ...] = ()
+
+    def __hash__(self) -> int:
+        # Identity hashing lets violations be collected into sets even though
+        # source_values is an unhashable dict. Full-field equality still
+        # implies equal identity fields, so equal violations hash equally.
+        return hash(
+            (
+                self.table,
+                self.row_pk,
+                tuple(self.foreign_key.columns),
+                self.foreign_key.other_table,
+                tuple(self.foreign_key.other_columns),
+            )
+        )
+
+
+@dataclass(frozen=True)
+class RowChanges:
+    """
+    Explicit parent/child row changes fed to an incremental audit.
+
+    Each table maps primary-key values to the row as it stands after the
+    change: for a rowid table the key is the rowid value, for a compound
+    primary key (including ``WITHOUT ROWID`` tables) it is a tuple in
+    primary-key order. Deleted rows map to ``None``.
+
+    ``previous`` optionally carries the row as it stood before an update or
+    delete. Old parent key values are required to bound the key interval in
+    which referencing child rows may have become newly orphaned.
+
+    Tables whose schema (collation or foreign key declaration) was rebuilt
+    must also be listed here - an empty mapping is enough - so the audit
+    knows their previous evidence may be stale.
+    """
+
+    inserted: dict[str, dict[Any, dict[str, Any] | None]] = field(default_factory=dict)
+    updated: dict[str, dict[Any, dict[str, Any] | None]] = field(default_factory=dict)
+    deleted: dict[str, dict[Any, dict[str, Any] | None]] = field(default_factory=dict)
+    previous: dict[str, dict[Any, dict[str, Any]]] = field(default_factory=dict)
+
+    def tables(self) -> frozenset[str]:
+        return (
+            frozenset(self.inserted)
+            | frozenset(self.updated)
+            | frozenset(self.deleted)
+            | frozenset(self.previous)
+        )
+
+    def current_entries(self, table: str) -> dict[Any, dict[str, Any] | None]:
+        merged: dict[Any, dict[str, Any] | None] = {}
+        merged.update(self.inserted.get(table, {}))
+        merged.update(self.updated.get(table, {}))
+        # Deletes win: a row inserted and then deleted is simply gone.
+        merged.update(self.deleted.get(table, {}))
+        return merged
+
+
+@dataclass(frozen=True)
+class AccessRange:
+    """
+    A slice of one indexed key column that was actually visited.
+
+    ``column`` is the indexed column, ``lo`` / ``hi`` the inclusive bounds
+    of the visited interval, ``values`` the explicit values probed when the
+    access was driven by equality lookups, and ``access`` the seek type:
+    ``"eq"`` for point lookups, ``"range"`` for an interval scan.
+    """
+
+    column: str
+    lo: Any
+    hi: Any
+    values: tuple[Any, ...]
+    access: str
+
+    def describe(self) -> str:
+        if self.access == "eq":
+            shown = ", ".join(repr(value) for value in self.values)
+            return f"{self.column}: {len(self.values)} point lookup(s) [{shown}]"
+        return f"{self.column}: range scan [{self.lo!r} .. {self.hi!r}]"
+
+
+@dataclass(frozen=True)
+class TableAccess:
+    """Index ranges visited on one table during an incremental audit."""
+
+    table: str
+    index: str | None
+    ranges: tuple[AccessRange, ...]
+    rows_scanned: int
+
+    def describe(self) -> list[str]:
+        header = (
+            f"{self.table} via {self.index or 'table scan'} "
+            f"({self.rows_scanned} row(s))"
+        )
+        return [header] + [f"  - {rng.describe()}" for rng in self.ranges]
+
+
+@dataclass(frozen=True)
+class ForeignKeyAuditReport:
+    """
+    Result of an incremental foreign key audit.
+
+    ``new_violations`` were not in the previous violation list,
+    ``resolved_violations`` were in it but now satisfy their constraint, and
+    ``remaining_violations`` still fail. ``invalidated_evidence`` lists prior
+    violations whose supporting collation or foreign key declaration changed
+    underneath them, so they need a fresh full scan rather than a verdict.
+    ``access`` records the exact index ranges visited on each table.
+    """
+
+    new_violations: tuple[ForeignKeyViolation, ...]
+    resolved_violations: tuple[ForeignKeyViolation, ...]
+    remaining_violations: tuple[ForeignKeyViolation, ...]
+    invalidated_evidence: tuple[ForeignKeyViolation, ...]
+    access: tuple[TableAccess, ...]
+
+    @property
+    def violations(self) -> tuple[ForeignKeyViolation, ...]:
+        "All violations currently present (new plus still-unresolved)."
+        return self.new_violations + self.remaining_violations
+
+    def describe_access(self) -> str:
+        return "\n".join(line for table in self.access for line in table.describe())
+
+
+def _audit_order_key(value: Any) -> tuple[str, str]:
+    # Mixed-type values (ints, strings, bytes, None) cannot be sorted
+    # together directly - order deterministically by type name then repr.
+    if isinstance(value, tuple):
+        return ("tuple", repr(tuple(_audit_order_key(item) for item in value)))
+    return (type(value).__name__, repr(value))
+
+
+class ForeignKeyAuditor:
+    """
+    Incremental foreign key violation checker.
+
+    Given the violation list produced by a previous (full) audit plus the
+    explicit set of parent/child row changes since then, re-verify only the
+    key ranges those changes can affect. Rows outside every affected range
+    are never read. On a small database the result is identical to a full
+    re-scan, which :meth:`full_audit` provides directly.
+    """
+
+    def __init__(self, db: "Database") -> None:
+        self.db = db
+
+    def full_audit(
+        self, tables: Iterable[str] | None = None
+    ) -> ForeignKeyAuditReport:
+        """Scan foreign keys and return all current violations.
+
+        Every table is scanned by default; pass ``tables`` to limit the scan
+        to a subset. This is the reference implementation the incremental
+        audit must match on a fully-affected database."""
+        found: dict[tuple, ForeignKeyViolation] = {}
+        access: list[TableAccess] = []
+        names = list(tables) if tables is not None else self.db.table_names()
+        for name in names:
+            child = self.db.table(name)
+            for fk in child.foreign_keys:
+                access.append(self._full_scan_fk(fk, found))
+        violations = tuple(
+            sorted(found.values(), key=ForeignKeyAuditor._sort_key)
+        )
+        return ForeignKeyAuditReport(
+            new_violations=violations,
+            resolved_violations=(),
+            remaining_violations=(),
+            invalidated_evidence=(),
+            access=tuple(access),
+        )
+
+    def audit(
+        self,
+        previous_violations: Iterable[ForeignKeyViolation],
+        changes: RowChanges,
+    ) -> ForeignKeyAuditReport:
+        previous = tuple(previous_violations)
+        changed_tables = changes.tables()
+        existing_tables = frozenset(self.db.table_names())
+
+        # Snapshot current declarations and collations once per table.
+        current_fks: dict[str, list[ForeignKey]] = {
+            name: self.db.table(name).foreign_keys
+            for name in changed_tables
+            if name in existing_tables
+        }
+        current_collations: dict[str, dict[str, str]] = {
+            name: parse_column_collations(self.db.table(name).schema)
+            for name in changed_tables
+            if name in existing_tables
+        }
+
+        invalidated: list[ForeignKeyViolation] = []
+        fresh: list[ForeignKeyViolation] = []
+        for violation in previous:
+            if self._evidence_stale(
+                violation,
+                changed_tables,
+                existing_tables,
+                current_fks,
+                current_collations,
+            ):
+                invalidated.append(violation)
+            else:
+                fresh.append(violation)
+
+        affected_fks = self._affected_fks(changed_tables)
+        found: dict[tuple, ForeignKeyViolation] = {}
+        checked: set[tuple] = set()
+        access: list[TableAccess] = []
+        for fk in affected_fks:
+            access.extend(self._audit_fk(fk, changes, found, checked))
+
+        found_keys = set(found)
+        fresh_identities = {self._identity(v): v for v in fresh}
+
+        new = [found[key] for key in found_keys - set(fresh_identities)]
+        remaining = [found[key] for key in found_keys & set(fresh_identities)]
+
+        # Previous violations whose row was actually re-verified and now
+        # satisfies the constraint are resolved; rows outside every affected
+        # range were never read and keep their previous verdict.
+        remaining_keys = {self._identity(v) for v in remaining}
+        for identity, violation in fresh_identities.items():
+            if identity in remaining_keys or identity in found_keys:
+                continue
+            if identity in checked:
+                continue
+            remaining.append(violation)
+        remaining_keys = {self._identity(v) for v in remaining}
+        resolved = [
+            violation
+            for violation in fresh
+            if self._identity(violation) not in remaining_keys
+        ]
+
+        return ForeignKeyAuditReport(
+            new_violations=tuple(sorted(new, key=self._sort_key)),
+            resolved_violations=tuple(sorted(resolved, key=self._sort_key)),
+            remaining_violations=tuple(sorted(remaining, key=self._sort_key)),
+            invalidated_evidence=tuple(
+                sorted(invalidated, key=self._sort_key)
+            ),
+            access=tuple(access),
+        )
+
+    # -- schema / evidence -------------------------------------------------
+
+    def _evidence_stale(
+        self,
+        violation: ForeignKeyViolation,
+        changed_tables: frozenset[str],
+        existing_tables: frozenset[str],
+        current_fks: dict[str, list[ForeignKey]],
+        current_collations: dict[str, dict[str, str]],
+    ) -> bool:
+        fk = violation.foreign_key
+        if fk.table not in existing_tables or fk.other_table not in existing_tables:
+            return True
+        if fk.table in changed_tables and fk not in current_fks[fk.table]:
+            # The exact constraint (columns, target table/columns, actions)
+            # no longer exists on the rebuilt child table.
+            return True
+        if self._relevant_collations_changed(
+            fk.table,
+            fk.columns,
+            violation.child_collations,
+            changed_tables,
+            current_collations,
+        ):
+            return True
+        if self._relevant_collations_changed(
+            fk.other_table,
+            fk.other_columns,
+            violation.parent_collations,
+            changed_tables,
+            current_collations,
+        ):
+            return True
+        return False
+
+    @staticmethod
+    def _relevant_collations_changed(
+        table: str,
+        columns: tuple[str, ...],
+        snapshot: tuple[tuple[str, str], ...],
+        changed_tables: frozenset[str],
+        current_collations: dict[str, dict[str, str]],
+    ) -> bool:
+        if table not in changed_tables or not snapshot:
+            return False
+        before = dict(snapshot)
+        after = current_collations[table]
+        return any(before.get(column) != after.get(column) for column in columns)
+
+    # -- constraint selection ---------------------------------------------
+    def _affected_fks(self, changed_tables: frozenset[str]) -> list[ForeignKey]:
+        affected: list[ForeignKey] = []
+        seen: set[tuple] = set()
+        for name in self.db.table_names():
+            for fk in self.db.table(name).foreign_keys:
+                if fk.table in changed_tables or fk.other_table in changed_tables:
+                    key = self._fk_key(fk)
+                    if key not in seen:
+                        seen.add(key)
+                        affected.append(fk)
+        return affected
+
+    @staticmethod
+    def _fk_key(fk: ForeignKey) -> tuple:
+        return (
+            fk.table,
+            tuple(fk.columns),
+            fk.other_table,
+            tuple(fk.other_columns),
+        )
+
+    @staticmethod
+    def _identity(violation: ForeignKeyViolation) -> tuple:
+        return (
+            violation.table,
+            violation.row_pk,
+            tuple(violation.foreign_key.columns),
+            violation.foreign_key.other_table,
+            tuple(violation.foreign_key.other_columns),
+        )
+
+    @staticmethod
+    def _identity_key(fk: ForeignKey, row_pk: Any) -> tuple:
+        return (
+            fk.table,
+            row_pk,
+            tuple(fk.columns),
+            fk.other_table,
+            tuple(fk.other_columns),
+        )
+
+    @staticmethod
+    def _sort_key(violation: ForeignKeyViolation) -> tuple[str, str]:
+        return (
+            violation.table,
+            repr(violation.row_pk),
+            repr(tuple(violation.foreign_key.columns)),
+        )
+
+    # -- full scan ---------------------------------------------------------
+
+    def _full_scan_fk(
+        self,
+        fk: ForeignKey,
+        found: dict[tuple, ForeignKeyViolation],
+    ) -> TableAccess:
+        child = self.db.table(fk.table)
+        scanned = 0
+        for pk, row in child.pks_and_rows_where():
+            scanned += 1
+            self._verify_row(fk, pk, row, found)
+        return TableAccess(
+            table=fk.table,
+            index=self._usable_index(child, tuple(fk.columns)),
+            ranges=(),
+            rows_scanned=scanned,
+        )
+
+    # -- per-constraint incremental check ---------------------------------
+
+    def _audit_fk(
+        self,
+        fk: ForeignKey,
+        changes: RowChanges,
+        found: dict[tuple, ForeignKeyViolation],
+        checked: set[tuple],
+    ) -> list[TableAccess]:
+        child = self.db.table(fk.table)
+        parent = self.db.table(fk.other_table)
+        if not child.exists() or not parent.exists():
+            return []
+
+        child_entries = changes.current_entries(fk.table)
+        parent_entries = changes.current_entries(fk.other_table)
+        parent_previous = changes.previous.get(fk.other_table, {})
+
+        candidate_pks: set[Any] = set()
+        fk_probe_ranges: list[AccessRange] = []
+        fk_matched: set[Any] = set()
+
+        # Child-side changes: the changed rows are re-read by primary key,
+        # so they add candidate PKs without touching the foreign key index.
+        if child_entries:
+            candidate_pks.update(child_entries.keys())
+
+        # Parent-side changes: only child rows carrying an old or new parent
+        # key value can flip, and they are sought through the foreign key
+        # index within that key's interval.
+        parent_keys = self._parent_key_values(
+            fk, parent_entries, parent_previous
+        )
+        if parent_keys:
+            fk_matched, fk_probe_ranges = self._children_with_keys(
+                fk, parent_keys
+            )
+            candidate_pks.update(fk_matched)
+
+        if not candidate_pks:
+            return []
+
+        violations, scanned, parent_probes, parent_ranges = (
+            self._verify_candidates(fk, candidate_pks, checked)
+        )
+        for violation in violations:
+            found[self._identity(violation)] = violation
+
+        access: list[TableAccess] = []
+        if fk_matched:
+            access.append(
+                TableAccess(
+                    table=fk.table,
+                    index=self._usable_index(child, tuple(fk.columns)),
+                    ranges=tuple(fk_probe_ranges),
+                    rows_scanned=len(fk_matched),
+                )
+            )
+        # Every candidate is then re-read through its primary key for the
+        # current source column values (this is what makes WITHOUT ROWID
+        # compound keys addressable).
+        access.append(
+            TableAccess(
+                table=fk.table,
+                index=self._pk_index_name(child),
+                ranges=tuple(self._pk_ranges(child, candidate_pks)),
+                rows_scanned=scanned,
+            )
+        )
+        if parent_ranges:
+            access.append(
+                TableAccess(
+                    table=fk.other_table,
+                    index=self._usable_index(
+                        parent, tuple(fk.other_columns)
+                    ),
+                    ranges=tuple(parent_ranges),
+                    rows_scanned=parent_probes,
+                )
+            )
+        return access
+
+    def _parent_key_values(
+        self,
+        fk: ForeignKey,
+        current_entries: dict[Any, dict[str, Any] | None],
+        previous_entries: dict[Any, dict[str, Any]],
+    ) -> list[tuple[Any, ...]]:
+        rows = [row for row in current_entries.values() if row is not None]
+        rows.extend(previous_entries.values())
+        values: list[tuple[Any, ...]] = []
+        seen: set[tuple[Any, ...]] = set()
+        for row in rows:
+            key = tuple(row.get(column) for column in fk.other_columns)
+            if all(value is None for value in key):
+                continue
+            if key not in seen:
+                seen.add(key)
+                values.append(key)
+        return values
+
+    def _children_with_keys(
+        self,
+        fk: ForeignKey,
+        key_values: list[tuple[Any, ...]],
+    ) -> tuple[set[Any], list[AccessRange]]:
+        child = self.db.table(fk.table)
+        pks: set[Any] = set()
+        ranges: list[AccessRange] = []
+        leading = fk.columns[0]
+        leading_values = self._distinct_sorted(
+            key[0] for key in key_values if key[0] is not None
+        )
+        if not leading_values:
+            return pks, ranges
+        # Keep every statement under SQLite's parameter limit; each chunk is
+        # still a set of equality seeks within the same index interval.
+        for batch in chunks(leading_values, SQLITE_MAX_VARS):
+            batch = list(batch)
+            placeholders = ", ".join("?" for _ in batch)
+            where = f"{quote_identifier(leading)} IN ({placeholders})"
+            for pk, _ in child.pks_and_rows_where(where, batch):
+                pks.add(pk)
+        ranges.append(
+            AccessRange(
+                column=leading,
+                lo=leading_values[0],
+                hi=leading_values[-1],
+                values=tuple(leading_values),
+                access="eq" if len(leading_values) == 1 else "range",
+            )
+        )
+        # Compound keys: record the equality probes on the remaining columns.
+        for offset, column in enumerate(fk.columns[1:], start=1):
+            tail = self._distinct_sorted(
+                key[offset] for key in key_values if key[offset] is not None
+            )
+            if tail:
+                ranges.append(
+                    AccessRange(
+                        column=column,
+                        lo=tail[0],
+                        hi=tail[-1],
+                        values=tuple(tail),
+                        access="eq" if len(tail) == 1 else "range",
+                    )
+                )
+        return pks, ranges
+
+    def _verify_candidates(
+        self,
+        fk: ForeignKey,
+        candidate_pks: set[Any],
+        checked: set[tuple],
+    ) -> tuple[list[ForeignKeyViolation], int, int, list[AccessRange]]:
+        child = self.db.table(fk.table)
+        parent = self.db.table(fk.other_table)
+        violations: list[ForeignKeyViolation] = []
+        scanned = 0
+        parent_probes = 0
+        parent_probe_values: dict[str, list[Any]] = {
+            column: [] for column in fk.other_columns
+        }
+        child_collations = tuple(
+            sorted(parse_column_collations(child.schema).items())
+        )
+        parent_collations = tuple(
+            sorted(parse_column_collations(parent.schema).items())
+        )
+        for pk in sorted(candidate_pks, key=_audit_order_key):
+            try:
+                row = child.get(pk if isinstance(pk, tuple) else pk)
+            except NotFoundError:
+                # The child row itself was deleted, so its old violation
+                # cannot survive - record that the identity was settled.
+                checked.add(self._identity_key(fk, pk))
+                continue
+            scanned += 1
+            checked.add(self._identity_key(fk, pk))
+            key_values = tuple(row.get(column) for column in fk.columns)
+            if any(value is None for value in key_values):
+                # SQLite MATCH NONE (the default): a key containing any
+                # NULL is not required to match a parent row.
+                continue
+            for column, value in zip(fk.other_columns, key_values):
+                parent_probe_values[column].append(value)
+            parent_probes += 1
+            if self._parent_row_exists(parent, fk, key_values):
+                continue
+            violations.append(
+                ForeignKeyViolation(
+                    table=fk.table,
+                    foreign_key=fk,
+                    row_pk=pk,
+                    key_values=key_values,
+                    source_values=dict(row),
+                    child_collations=child_collations,
+                    parent_collations=parent_collations,
+                )
+            )
+        parent_ranges: list[AccessRange] = []
+        for column, values in parent_probe_values.items():
+            distinct = self._distinct_sorted(values)
+            if distinct:
+                parent_ranges.append(
+                    AccessRange(
+                        column=column,
+                        lo=distinct[0],
+                        hi=distinct[-1],
+                        values=tuple(distinct),
+                        access="eq",
+                    )
+                )
+        return violations, scanned, parent_probes, parent_ranges
+
+    def _verify_row(
+        self,
+        fk: ForeignKey,
+        pk: Any,
+        row: dict[str, Any],
+        found: dict[tuple, ForeignKeyViolation],
+    ) -> None:
+        parent = self.db.table(fk.other_table)
+        key_values = tuple(row.get(column) for column in fk.columns)
+        if any(value is None for value in key_values):
+            # SQLite MATCH NONE (the default): a key containing any NULL is
+            # not required to match a parent row.
+            return
+        if self._parent_row_exists(parent, fk, key_values):
+            return
+        child = self.db.table(fk.table)
+        violation = ForeignKeyViolation(
+            table=fk.table,
+            foreign_key=fk,
+            row_pk=pk,
+            key_values=key_values,
+            source_values=dict(row),
+            child_collations=tuple(
+                sorted(parse_column_collations(child.schema).items())
+            ),
+            parent_collations=tuple(
+                sorted(parse_column_collations(parent.schema).items())
+            ),
+        )
+        found[self._identity(violation)] = violation
+
+    def _parent_row_exists(
+        self,
+        parent: "Table",
+        fk: ForeignKey,
+        key_values: tuple[Any, ...],
+    ) -> bool:
+        clauses: list[str] = []
+        args: list[Any] = []
+        for column, value in zip(fk.other_columns, key_values):
+            if value is None:
+                clauses.append(f"{quote_identifier(column)} IS ?")
+            else:
+                clauses.append(f"{quote_identifier(column)} = ?")
+            args.append(value)
+        return parent.count_where(" and ".join(clauses), args) > 0
+
+    def _pk_index_name(self, table: "Table") -> str:
+        if table.use_rowid:
+            return "rowid"
+        return "PRIMARY KEY ({})".format(
+            ", ".join(quote_identifier(column) for column in table.pks)
+        )
+
+    def _pk_ranges(
+        self, table: "Table", candidate_pks: set[Any]
+    ) -> list[AccessRange]:
+        pk_columns = table.pks
+        tuples = [pk if isinstance(pk, tuple) else (pk,) for pk in candidate_pks]
+        ranges: list[AccessRange] = []
+        for index, column in enumerate(pk_columns):
+            values = self._distinct_sorted(
+                pk_tuple[index]
+                for pk_tuple in tuples
+                if index < len(pk_tuple) and pk_tuple[index] is not None
+            )
+            if values:
+                ranges.append(
+                    AccessRange(
+                        column=column,
+                        lo=values[0],
+                        hi=values[-1],
+                        values=tuple(values),
+                        access="eq" if len(values) == 1 else "range",
+                    )
+                )
+        return ranges
+
+    @staticmethod
+    def _distinct_sorted(values: Iterable[Any]) -> list[Any]:
+        unique: list[Any] = []
+        seen: set[str] = set()
+        for value in values:
+            marker = repr(value)
+            if marker not in seen:
+                seen.add(marker)
+                unique.append(value)
+        return sorted(unique, key=_audit_order_key)
+
+    @staticmethod
+    def _usable_index(table: "Table", columns: tuple[str, ...]) -> str | None:
+        wanted = tuple(fold_identifier_case(c) for c in columns)
+        for index in table.indexes:
+            actual = tuple(fold_identifier_case(c) for c in index.columns)
+            if actual[: len(wanted)] == wanted:
+                return index.name
+        # WITHOUT ROWID tables are indexed by their primary key even when no
+        # explicit index shows up in PRAGMA index_list.
+        if not table.use_rowid:
+            pk_prefix = tuple(fold_identifier_case(c) for c in table.pks)[
+                : len(wanted)
+            ]
+            if pk_prefix == wanted:
+                return f"PRIMARY KEY ({', '.join(table.pks)})"
+        return None
 
 
 Index = namedtuple("Index", ("seq", "name", "unique", "origin", "partial", "columns"))
@@ -2023,6 +2740,30 @@ class Database:
                     table.create_index(fk.columns, find_unique_name=True)
                     existing_indexes.add(fk_columns)
 
+    def foreign_key_auditor(self) -> "ForeignKeyAuditor":
+        "Return a :class:`ForeignKeyAuditor` bound to this database."
+        return ForeignKeyAuditor(self)
+
+    def audit_foreign_keys(self) -> "ForeignKeyAuditReport":
+        """Run a full foreign key violation scan across every table.
+
+        See :class:`ForeignKeyAuditor` and :ref:`python_api_fk_audit`.
+        """
+        return ForeignKeyAuditor(self).full_audit()
+
+    def recheck_foreign_keys(
+        self,
+        previous_violations: Iterable["ForeignKeyViolation"],
+        changes: "RowChanges",
+    ) -> "ForeignKeyAuditReport":
+        """Incrementally re-check foreign keys after explicit row changes.
+
+        :param previous_violations: violations returned by an earlier full
+          scan or incremental re-check
+        :param changes: the parent/child row changes since that scan
+        """
+        return ForeignKeyAuditor(self).audit(previous_violations, changes)
+
     def vacuum(self) -> None:
         "Run a SQLite ``VACUUM`` against the database."
         self.execute("VACUUM;")
@@ -2462,6 +3203,20 @@ class Table(Queryable):
                 )
             )
         return fks
+
+    def audit_foreign_keys(self) -> "ForeignKeyAuditReport":
+        """Scan this table's foreign keys and return every current
+        violation, with source primary keys, declarations and column values.
+        """
+        return ForeignKeyAuditor(self.db).full_audit([self.name])
+
+    def recheck_foreign_keys(
+        self,
+        previous_violations: Iterable["ForeignKeyViolation"],
+        changes: "RowChanges",
+    ) -> "ForeignKeyAuditReport":
+        """Incrementally re-check this table's foreign keys after changes."""
+        return ForeignKeyAuditor(self.db).audit(previous_violations, changes)
 
     @property
     def virtual_table_using(self) -> str | None:

@@ -77,6 +77,29 @@ sqlite_utils.db.ForeignKey
 
 .. autoclass:: sqlite_utils.db.ForeignKey
 
+.. _reference_db_other_fk_audit:
+
+Foreign key auditing
+--------------------
+
+.. autoclass:: sqlite_utils.db.ForeignKeyAuditor
+   :members:
+
+.. autoclass:: sqlite_utils.db.ForeignKeyAuditReport
+   :members:
+
+.. autoclass:: sqlite_utils.db.ForeignKeyViolation
+   :members:
+
+.. autoclass:: sqlite_utils.db.RowChanges
+   :members:
+
+.. autoclass:: sqlite_utils.db.TableAccess
+   :members:
+
+.. autoclass:: sqlite_utils.db.AccessRange
+   :members:
+
 sqlite_utils.utils
 ==================
 
