@@ -479,6 +479,181 @@ class BadMultiValues(Exception):
         self.values = values
 
 
+class ImportStatus:
+    """
+    Per-record outcome of a bulk import, used in :class:`ImportReport`.
+
+    - ``INSERTED`` - the input produced a newly inserted row
+    - ``UPDATED`` - an existing row was updated in place
+    - ``IGNORED`` - the input was not written because an equivalent row already exists
+    - ``FAILED`` - the input raised an error and was not written
+    - ``UNKNOWN`` - the row was written, but SQLite cannot attribute the change
+      to this input (for example a trigger also modified other rows)
+    """
+
+    INSERTED = "inserted"
+    UPDATED = "updated"
+    IGNORED = "ignored"
+    FAILED = "failed"
+    UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True)
+class RowResult:
+    """
+    The outcome of a single input record within a bulk import.
+
+    :param index: Zero-based position of the input in the iterable supplied to
+      ``insert_all()`` / ``upsert_all()``, so records sharing a business key can
+      be told apart by their position.
+    :param status: One of the constants on :class:`ImportStatus`.
+    :param key: The business key (primary key value) of the input, or ``None``
+      when the key could not be resolved.
+    :param error: The exception for a ``failed`` record, otherwise ``None``.
+    :param detail: Human-readable explanation for ``ignored`` and ``unknown``
+      results, otherwise ``None``.
+    """
+
+    index: int
+    status: str
+    key: Any | None = None
+    error: Exception | None = None
+    detail: str | None = None
+
+    @property
+    def inserted(self) -> bool:
+        return self.status == ImportStatus.INSERTED
+
+    @property
+    def updated(self) -> bool:
+        return self.status == ImportStatus.UPDATED
+
+    @property
+    def ignored(self) -> bool:
+        return self.status == ImportStatus.IGNORED
+
+    @property
+    def failed(self) -> bool:
+        return self.status == ImportStatus.FAILED
+
+    @property
+    def unknown(self) -> bool:
+        return self.status == ImportStatus.UNKNOWN
+
+
+@dataclass
+class BatchResult:
+    """
+    The outcome of one batch (one committed transaction) of a bulk import.
+
+    :param index: Zero-based batch number in commit order.
+    :param size: Number of input records in the batch.
+    :param committed: Whether the batch's transaction committed. A batch that
+      raised is not committed; batches after a failure never execute.
+    :param row_results: One :class:`RowResult` per input record in the batch,
+      in input order.
+    """
+
+    index: int
+    size: int
+    committed: bool
+    row_results: list[RowResult] = field(default_factory=list)
+
+
+@dataclass
+class ImportReport:
+    """
+    Auditable, per-input result of an ``insert_all()`` / ``upsert_all()`` call.
+
+    Returned by the ``import_all()`` / ``import_upsert_all()`` methods. The
+    input iterable is consumed exactly once while the report is built.
+
+    :param batches: One :class:`BatchResult` per batch, in execution order.
+    """
+
+    batches: list[BatchResult] = field(default_factory=list)
+
+    @property
+    def rows(self) -> list[RowResult]:
+        "Every per-input result, in the order the inputs were supplied."
+        return [
+            row_result
+            for batch in self.batches
+            for row_result in batch.row_results
+        ]
+
+    @property
+    def committed_batches(self) -> list[BatchResult]:
+        "Batches whose transaction committed successfully."
+        return [batch for batch in self.batches if batch.committed]
+
+    @property
+    def failed_batches(self) -> list[BatchResult]:
+        "Batches that did not commit: the batch that raised plus any batch that never ran."
+        return [batch for batch in self.batches if not batch.committed]
+
+    @property
+    def errored_batches(self) -> list[BatchResult]:
+        "Batches whose transaction actually raised an error."
+        return [
+            batch
+            for batch in self.batches
+            if not batch.committed
+            and any(row.error is not None for row in batch.row_results)
+        ]
+
+    @property
+    def unexecuted_batches(self) -> list[BatchResult]:
+        "Batches that were never executed because an earlier batch failed."
+        return [
+            batch
+            for batch in self.batches
+            if not batch.committed
+            and all(row_result.error is None for row_result in batch.row_results)
+        ]
+
+    def _count(self, status: str) -> int:
+        return sum(
+            1 for row_result in self.rows if row_result.status == status
+        )
+
+    @property
+    def inserted(self) -> int:
+        "Number of inputs that inserted a new row."
+        return self._count(ImportStatus.INSERTED)
+
+    @property
+    def updated(self) -> int:
+        "Number of inputs that updated an existing row."
+        return self._count(ImportStatus.UPDATED)
+
+    @property
+    def ignored(self) -> int:
+        "Number of inputs that were ignored."
+        return self._count(ImportStatus.IGNORED)
+
+    @property
+    def failed(self) -> int:
+        "Number of inputs that raised an error."
+        return self._count(ImportStatus.FAILED)
+
+    @property
+    def unknown(self) -> int:
+        "Number of inputs whose effect could not be reliably attributed."
+        return self._count(ImportStatus.UNKNOWN)
+
+    @property
+    def totals(self) -> dict[str, int]:
+        "Summary counts keyed by :class:`ImportStatus` value."
+        return {
+            ImportStatus.INSERTED: self.inserted,
+            ImportStatus.UPDATED: self.updated,
+            ImportStatus.IGNORED: self.ignored,
+            ImportStatus.FAILED: self.failed,
+            ImportStatus.UNKNOWN: self.unknown,
+        }
+
+
 _COUNTS_TABLE_CREATE_SQL = """
 CREATE TABLE IF NOT EXISTS "{}"(
    "table" TEXT PRIMARY KEY,
@@ -2281,6 +2456,8 @@ class Table(Queryable):
     last_rowid: int | None = None
     #: The primary key of the last inserted, updated or selected row.
     last_pk: Any | None = None
+    #: Per-input audit report from the most recent ``audit=True`` bulk import.
+    last_import_report: "ImportReport | None" = None
 
     def __init__(
         self,
@@ -4517,6 +4694,80 @@ class Table(Queryable):
                     self.last_pk = pk_values
         return queries_and_params
 
+    def _attribution_key_cols(
+        self, pk: Any, hash_id: str | None
+    ) -> list[str] | None:
+        """
+        Columns that uniquely identify a business row and are present in every
+        input record, enabling reliable per-record attribution. Returns ``None``
+        when attribution is not possible (e.g. a rowid table whose implicit
+        rowid is not part of the input).
+        """
+        if hash_id:
+            return [hash_id]
+        if isinstance(pk, str):
+            return [pk]
+        if pk:
+            return list(pk)
+        if self.exists() and not self.use_rowid:
+            return list(self.pks)
+        return None
+
+    def _record_business_key(
+        self,
+        record: dict[str, Any],
+        key_cols: list[str] | None,
+        hash_id: str | None,
+        hash_id_columns: Iterable[str] | None,
+        list_mode: bool,
+    ) -> Any | None:
+        if key_cols is None:
+            return None
+        try:
+            if hash_id:
+                if list_mode:
+                    # The hash column is not part of list-mode input rows
+                    return None
+                return hash_record(record, hash_id_columns)
+            values = tuple(
+                record[resolve_casing(col, record)] for col in key_cols
+            )
+        except KeyError:
+            return None
+        if any(value is None for value in values):
+            # A NULL key never identifies a row for conflict purposes
+            return None
+        return values[0] if len(values) == 1 else values
+
+    def _record_as_dict(
+        self,
+        record: dict[str, Any] | Sequence[Any],
+        all_columns: list[str],
+        list_mode: bool,
+    ) -> dict[str, Any]:
+        if not list_mode:
+            return cast(dict[str, Any], record)
+        return dict(zip(all_columns, cast(Sequence[Any], record)))
+
+    def _snapshot_business_keys(
+        self, key_cols: list[str] | None
+    ) -> set[Any] | None:
+        if not key_cols:
+            return None
+        columns_sql = ", ".join(quote_identifier(col) for col in key_cols)
+        rows = self.db.execute(
+            f"select {columns_sql} from {quote_identifier(self.name)}"
+        ).fetchall()
+        return {
+            self._normalize_snapshot_key(row)
+            for row in rows
+            if not any(value is None for value in row)
+        }
+
+    @staticmethod
+    def _normalize_snapshot_key(row: Sequence[Any]) -> Any:
+        return row[0] if len(row) == 1 else tuple(row)
+
     def insert_chunk(
         self,
         alter,
@@ -4533,7 +4784,20 @@ class Table(Queryable):
         replace,
         ignore,
         list_mode=False,
-    ) -> sqlite3.Cursor | None:
+        row_offset: int = 0,
+        seen_keys: set[Any] | None = None,
+        audit: bool = False,
+    ) -> tuple[sqlite3.Cursor | None, list[RowResult], bool]:
+        """
+        Execute one batch inside a transaction.
+
+        Returns ``(cursor, row_results, committed)``:
+
+        - ``cursor`` is the last cursor executed (as returned historically),
+        - ``row_results`` holds one :class:`RowResult` per chunk record when
+          ``audit=True`` and is empty otherwise,
+        - ``committed`` says whether the batch transaction committed.
+        """
         queries_and_params = self.build_insert_queries_and_params(
             extracts,
             chunk,
@@ -4549,57 +4813,228 @@ class Table(Queryable):
             ignore,
             list_mode,
         )
+        key_cols = self._attribution_key_cols(pk, hash_id) if audit else None
+        had_triggers = bool(self.triggers) if audit and self.exists() else False
+        before = self._snapshot_business_keys(key_cols)
         result = None
-        with self.db.atomic():
-            for query, params in queries_and_params:
-                try:
-                    result = self.db.execute(query, params)
-                except OperationalError as e:
-                    if alter and (" column" in e.args[0]):
-                        # Attempt to add any missing columns, then try again
-                        self.add_missing_columns(chunk)
+        try:
+            with self.db.atomic():
+                for query, params in queries_and_params:
+                    try:
                         result = self.db.execute(query, params)
-                    elif e.args[0] == "too many SQL variables":
-                        first_half = chunk[: len(chunk) // 2]
-                        second_half = chunk[len(chunk) // 2 :]
+                    except OperationalError as e:
+                        if alter and (" column" in e.args[0]):
+                            # Attempt to add any missing columns, then try again
+                            self.add_missing_columns(chunk)
+                            result = self.db.execute(query, params)
+                        elif e.args[0] == "too many SQL variables":
+                            first_half = chunk[: len(chunk) // 2]
+                            second_half = chunk[len(chunk) // 2 :]
 
-                        self.insert_chunk(
-                            alter,
-                            extracts,
-                            first_half,
-                            all_columns,
-                            hash_id,
-                            hash_id_columns,
-                            upsert,
-                            pk,
-                            not_null,
-                            conversions,
-                            num_records_processed,
-                            replace,
-                            ignore,
-                            list_mode,
-                        )
+                            first_cursor, first_results, first_committed = (
+                                self.insert_chunk(
+                                    alter,
+                                    extracts,
+                                    first_half,
+                                    all_columns,
+                                    hash_id,
+                                    hash_id_columns,
+                                    upsert,
+                                    pk,
+                                    not_null,
+                                    conversions,
+                                    num_records_processed,
+                                    replace,
+                                    ignore,
+                                    list_mode,
+                                    row_offset=row_offset,
+                                    seen_keys=seen_keys,
+                                    audit=audit,
+                                )
+                            )
+                            if not first_committed:
+                                return first_cursor, first_results, False
 
-                        result = self.insert_chunk(
-                            alter,
-                            extracts,
-                            second_half,
-                            all_columns,
-                            hash_id,
-                            hash_id_columns,
-                            upsert,
-                            pk,
-                            not_null,
-                            conversions,
-                            num_records_processed,
-                            replace,
-                            ignore,
-                            list_mode,
-                        )
+                            result, second_results, second_committed = (
+                                self.insert_chunk(
+                                    alter,
+                                    extracts,
+                                    second_half,
+                                    all_columns,
+                                    hash_id,
+                                    hash_id_columns,
+                                    upsert,
+                                    pk,
+                                    not_null,
+                                    conversions,
+                                    num_records_processed,
+                                    replace,
+                                    ignore,
+                                    list_mode,
+                                    row_offset=row_offset + len(first_half),
+                                    seen_keys=seen_keys,
+                                    audit=audit,
+                                )
+                            )
+                            return (
+                                result,
+                                first_results + second_results,
+                                first_committed and second_committed,
+                            )
 
+                        else:
+                            raise
+        except Exception as ex:
+            if not audit:
+                raise
+            # The whole batch is one transaction: either every statement
+            # committed or none of them did. Attribute the failure to each
+            # input in the batch, leaving the error itself for the caller.
+            row_results = []
+            for position, record in enumerate(chunk):
+                record_dict = self._record_as_dict(
+                    record, all_columns, list_mode
+                )
+                key = self._record_business_key(
+                    record_dict,
+                    key_cols,
+                    hash_id,
+                    hash_id_columns,
+                    list_mode,
+                )
+                row_results.append(
+                    RowResult(
+                        index=row_offset + position,
+                        status=ImportStatus.FAILED,
+                        key=key,
+                        error=ex,
+                        detail=(
+                            "batch raised before committing; no record in "
+                            "the batch was written"
+                        ),
+                    )
+                )
+            return result, row_results, False
+
+        row_results = (
+            self._classify_chunk(
+                chunk,
+                all_columns,
+                hash_id,
+                hash_id_columns,
+                upsert,
+                ignore,
+                replace,
+                list_mode,
+                key_cols,
+                before,
+                had_triggers,
+                row_offset,
+                seen_keys if seen_keys is not None else set(),
+            )
+            if audit
+            else []
+        )
+        return result, row_results, True
+
+    def _classify_chunk(
+        self,
+        chunk,
+        all_columns,
+        hash_id,
+        hash_id_columns,
+        upsert,
+        ignore,
+        replace,
+        list_mode,
+        key_cols,
+        before,
+        had_triggers,
+        row_offset,
+        seen_keys,
+    ) -> list[RowResult]:
+        after = self._snapshot_business_keys(key_cols)
+        row_results: list[RowResult] = []
+        for position, record in enumerate(chunk):
+            record_dict = self._record_as_dict(record, all_columns, list_mode)
+            key = self._record_business_key(
+                record_dict, key_cols, hash_id, hash_id_columns, list_mode
+            )
+            index = row_offset + position
+            detail = None
+            if key_cols is None or key is None or after is None:
+                status = ImportStatus.UNKNOWN
+                detail = (
+                    "no business key is available on the input, so the row "
+                    "change cannot be attributed to this record"
+                )
+            else:
+                already_stored = key in (before or set())
+                already_seen = key in seen_keys
+                still_present = key in after
+                if upsert:
+                    if already_stored or already_seen:
+                        status = ImportStatus.UPDATED
+                    elif still_present:
+                        status = ImportStatus.INSERTED
                     else:
-                        raise
-        return result
+                        status = ImportStatus.UNKNOWN
+                        detail = "the upserted key is not present after commit"
+                elif ignore:
+                    if already_stored or already_seen:
+                        status = ImportStatus.IGNORED
+                        if already_seen and not already_stored:
+                            detail = (
+                                "duplicate business key within the import; an "
+                                "earlier occurrence was written instead"
+                            )
+                        else:
+                            detail = "a row with this business key already exists"
+                    elif still_present:
+                        status = ImportStatus.INSERTED
+                    else:
+                        status = ImportStatus.UNKNOWN
+                        detail = "the ignored insert neither wrote nor matched a row"
+                elif replace:
+                    if already_stored or already_seen:
+                        status = ImportStatus.UPDATED
+                    elif still_present:
+                        status = ImportStatus.INSERTED
+                    else:
+                        status = ImportStatus.UNKNOWN
+                        detail = "the replaced key is not present after commit"
+                else:
+                    if still_present and not already_stored:
+                        status = ImportStatus.INSERTED
+                    else:
+                        status = ImportStatus.UNKNOWN
+                        detail = (
+                            "the row change cannot be matched to this record"
+                        )
+            if had_triggers and status in (
+                ImportStatus.INSERTED,
+                ImportStatus.UPDATED,
+            ):
+                # Triggers can insert or update other rows, so the table's
+                # change count no longer proves what this input did.
+                row_results.append(
+                    RowResult(
+                        index=index,
+                        status=ImportStatus.UNKNOWN,
+                        key=key,
+                        detail=(
+                            "a trigger on this table also modified rows; the "
+                            "change cannot be reliably attributed to this input"
+                        ),
+                    )
+                )
+            else:
+                row_results.append(
+                    RowResult(index=index, status=status, key=key, detail=detail)
+                )
+            if key is not None:
+                seen_keys.add(key)
+        return row_results
 
     def insert(
         self,
@@ -4691,13 +5126,20 @@ class Table(Queryable):
         upsert: bool = False,
         analyze: bool = False,
         strict: bool | Default | None = DEFAULT,
+        audit: bool = False,
     ) -> "Table":
         """
         Like ``.insert()`` but takes a list of records and ensures that the table
         that it creates (if table does not exist) has columns for ALL of that data.
 
         Use ``analyze=True`` to run ``ANALYZE`` after the insert has completed.
+
+        When ``audit=True`` an :class:`ImportReport` is built while the input is
+        consumed exactly once, and afterwards is available on
+        ``self.last_import_report``. Prefer :meth:`import_all` /
+        :meth:`import_upsert_all`, which return the report directly.
         """
+        self.last_import_report = ImportReport()
         pk = self.value_or_default("pk", pk)
         foreign_keys = self.value_or_default("foreign_keys", foreign_keys)
         column_order = self.value_or_default("column_order", column_order)
@@ -4824,7 +5266,15 @@ class Table(Queryable):
             with self.db.atomic():
                 self.db.execute(f"DELETE FROM {quote_identifier(self.name)};")
         result = None
-        for chunk in chunks(itertools.chain([first_record], records_iter), batch_size):
+        report = self.last_import_report
+        assert report is not None
+        seen_keys: set[Any] = set()
+        row_offset = 0
+        batch_index = 0
+        chunk_iter = chunks(
+            itertools.chain([first_record], records_iter), batch_size
+        )
+        for chunk in chunk_iter:
             chunk = list(chunk)
             num_records_processed += len(chunk)
             if first:
@@ -4887,7 +5337,7 @@ class Table(Queryable):
 
             first = False
 
-            result = self.insert_chunk(
+            result, row_results, committed = self.insert_chunk(
                 alter,
                 extracts,
                 chunk,
@@ -4902,7 +5352,63 @@ class Table(Queryable):
                 replace,
                 ignore,
                 list_mode,
+                row_offset=row_offset,
+                seen_keys=seen_keys,
+                audit=audit,
             )
+            if audit:
+                report.batches.append(
+                    BatchResult(
+                        index=batch_index,
+                        size=len(chunk),
+                        committed=committed,
+                        row_results=row_results,
+                    )
+                )
+            batch_index += 1
+            row_offset += len(chunk)
+            if audit and not committed:
+                # The input is read only once: drain whatever the iterator
+                # still holds and mark those batches as never executed.
+                pending: list[Any] = []
+                for remaining in chunk_iter:
+                    pending.extend(remaining)
+                for start in range(0, len(pending), batch_size):
+                    unexecuted = pending[start : start + batch_size]
+                    report.batches.append(
+                        BatchResult(
+                            index=batch_index,
+                            size=len(unexecuted),
+                            committed=False,
+                            row_results=[
+                                RowResult(
+                                    index=row_offset + position,
+                                    status=ImportStatus.FAILED,
+                                    detail=(
+                                        "batch never executed because an "
+                                        "earlier batch failed"
+                                    ),
+                                )
+                                for position in range(len(unexecuted))
+                            ],
+                        )
+                    )
+                    batch_index += 1
+                    row_offset += len(unexecuted)
+                originating_error = next(
+                    (
+                        row_result.error
+                        for batch in report.batches
+                        for row_result in batch.row_results
+                        if row_result.error is not None
+                    ),
+                    None,
+                )
+                if originating_error is not None:
+                    raise originating_error
+                raise RuntimeError(
+                    "bulk import stopped before every batch executed"
+                )
 
         # If we only handled a single row populate self.last_pk
         if num_records_processed == 1:
@@ -5083,6 +5589,7 @@ class Table(Queryable):
         columns: dict[str, Any] | Default | None = DEFAULT,
         analyze: bool = False,
         strict: bool | Default | None = DEFAULT,
+        audit: bool = False,
     ) -> "Table":
         """
         Like ``.upsert()`` but can be applied to a list of records.
@@ -5104,7 +5611,39 @@ class Table(Queryable):
             upsert=True,
             analyze=analyze,
             strict=strict,
+            audit=audit,
         )
+
+    def import_all(self, records, **kwargs) -> "ImportReport":
+        """
+        Run :meth:`insert_all` with auditing enabled and return the
+        :class:`ImportReport` describing every input record and every batch.
+
+        The input iterable is consumed exactly once. Keyword arguments are the
+        same as :meth:`insert_all` (notably ``ignore=True`` or ``replace=True``);
+        pass ``pk=`` so per-record business keys can be attributed.
+
+        If a batch fails its transaction, earlier batches remain committed and
+        later batches are recorded as unexecuted in the report before the
+        original error is re-raised. The partial report is also left on
+        ``self.last_import_report``.
+        """
+        kwargs["audit"] = True
+        self.insert_all(records, **kwargs)
+        assert self.last_import_report is not None
+        return self.last_import_report
+
+    def import_upsert_all(self, records, **kwargs) -> "ImportReport":
+        """
+        Run :meth:`upsert_all` with auditing enabled and return the
+        :class:`ImportReport`, distinguishing inserted from updated inputs.
+
+        See :meth:`import_all` for failure and batch-commit semantics.
+        """
+        kwargs["audit"] = True
+        self.upsert_all(records, **kwargs)
+        assert self.last_import_report is not None
+        return self.last_import_report
 
     def add_missing_columns(self, records: Iterable[dict[str, Any]]) -> "Table":
         needed_columns = suggest_column_types(records)

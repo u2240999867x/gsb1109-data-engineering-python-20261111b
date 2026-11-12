@@ -1139,6 +1139,59 @@ This also works with generators:
 
 Tuples and lists are both supported.
 
+.. _python_api_import_report:
+
+Auditing bulk imports
+---------------------
+
+When ``ignore=True`` or ``upsert`` is used, the total number of rows written does not reveal what happened to each individual input. The ``import_all()`` and ``import_upsert_all()`` methods return an :class:`~sqlite_utils.db.ImportReport` with an explicit, per-input result instead of just a single count.
+
+The input iterable is consumed exactly once while the report is built. Each input gets a :class:`~sqlite_utils.db.RowResult`, identified by its zero-based position in the input (``index``) and its business key, classified into one of five statuses:
+
+- ``inserted`` - the input produced a newly inserted row
+- ``updated`` - an existing row with the same business key was updated in place
+- ``ignored`` - the input was not written because the key already existed
+- ``failed`` - the input's batch raised an error and was not written
+- ``unknown`` - the row was written, but the change cannot be reliably attributed to this input
+
+.. code-block:: python
+
+    from sqlite_utils.db import ImportStatus
+
+    db["books"].insert({"id": 1, "title": "Existing"}, pk="id")
+    report = db["books"].import_all(
+        [
+            {"id": 1, "title": "Ignored"},
+            {"id": 2, "title": "New"},
+            {"id": 2, "title": "Duplicate key"},
+        ],
+        pk="id",
+        ignore=True,
+    )
+    report.totals
+    # {'inserted': 1, 'updated': 0, 'ignored': 2, 'failed': 0, 'unknown': 0}
+    [(row.index, row.status, row.key) for row in report.rows]
+    # [(0, 'ignored', 1), (1, 'inserted', 2), (2, 'ignored', 2)]
+
+Because every input carries its ``index``, repeated occurrences of the same business key are reported separately, including duplicates that appear within a single batch.
+
+Each batch is committed in its own transaction and represented by a :class:`~sqlite_utils.db.BatchResult`. Its ``committed`` flag records whether that transaction committed. If a batch fails, earlier batches stay committed, the failing batch is marked uncommitted, and every batch that never ran is recorded as unexecuted - so the report always states which batches committed and which did not. The original exception is still raised after the partial report is stored on ``table.last_import_report``:
+
+.. code-block:: python
+
+    try:
+        report = db["books"].import_all(records(), pk="id", batch_size=100)
+    except Exception as ex:
+        report = db["books"].last_import_report
+    [(batch.index, batch.size, batch.committed) for batch in report.batches]
+    report.committed_batches
+    report.failed_batches
+    report.unexecuted_batches
+
+Attribution relies on a business key that identifies the row, such as a primary key passed via ``pk=`` (or a ``hash_id``). When no such key is available - for example a rowid table whose implicit rowid is not part of the input, or a conflict on a non-primary-key UNIQUE column - results are marked ``unknown`` rather than guessed. Rows written while a trigger on the table also modifies other rows are marked ``unknown`` as well, because the table's change count no longer proves which input inserted the row.
+
+The same report is available from ``insert_all(..., audit=True)`` / ``upsert_all(..., audit=True)`` on ``table.last_import_report`` for code that wants the table object back instead of the report.
+
 .. _python_api_insert_replace:
 
 Insert-replacing data

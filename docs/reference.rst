@@ -77,6 +77,28 @@ sqlite_utils.db.ForeignKey
 
 .. autoclass:: sqlite_utils.db.ForeignKey
 
+.. _reference_db_other_import_report:
+
+sqlite_utils.db.ImportStatus
+----------------------------
+
+.. autoclass:: sqlite_utils.db.ImportStatus
+
+sqlite_utils.db.RowResult
+-------------------------
+
+.. autoclass:: sqlite_utils.db.RowResult
+
+sqlite_utils.db.BatchResult
+---------------------------
+
+.. autoclass:: sqlite_utils.db.BatchResult
+
+sqlite_utils.db.ImportReport
+----------------------------
+
+.. autoclass:: sqlite_utils.db.ImportReport
+
 sqlite_utils.utils
 ==================
 
