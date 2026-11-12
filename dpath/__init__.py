@@ -24,6 +24,7 @@ __all__ = [
 ]
 
 from collections.abc import MutableMapping, MutableSequence
+from copy import copy
 from typing import Union, List, Any, Callable, Optional
 
 from dpath import segments, options
@@ -71,63 +72,130 @@ def new(obj: MutableMapping, path: Path, value, separator="/", creator: Creator 
     return segments.set(obj, split_segments, value)
 
 
+def _shallow_copy(node):
+    """
+    Return a shallow copy of a container such that removing keys or indices
+    from the copy never affects the original.
+    """
+    try:
+        return node.copy()
+    except AttributeError:
+        pass
+
+    try:
+        if isinstance(node, MutableMapping):
+            return type(node)(dict(node))
+
+        if isinstance(node, MutableSequence):
+            return type(node)(list(node))
+    except Exception:
+        pass
+
+    return copy(node)
+
+
 def delete(obj: MutableMapping, glob: Glob, separator="/", afilter: Filter | None = None) -> int:
     """
     Given a obj, delete all elements that match the glob.
 
-    Returns the number of deleted objects. Raises PathNotFound if no paths are
-    found to delete.
+    Returns the number of paths selected for deletion. Raises PathNotFound if
+    no paths are found to delete.
+
+    Selections are made against a snapshot of the object: afilter only ever
+    observes pre-delete values, and if afilter raises the object is left
+    unmodified. When the same Python object is reachable through several
+    paths, selected paths are cleaned without collaterally modifying the
+    values seen through retained paths; selected paths that agree on what to
+    delete share a single physical removal.
     """
     globlist = _split_path(glob, separator)
 
-    def f(obj, pair, counter):
-        (path_segments, value) = pair
+    # Snapshot the object before mutating it. All filtering decisions are
+    # made against these pre-delete values, so an afilter that raises leaves
+    # the object untouched.
+    pairs = tuple(segments.walk(obj))
 
-        # Skip segments if they no longer exist in obj.
+    # Select the target paths. afilter is only consulted for values that
+    # match the glob, so matching values outside of the glob are never
+    # deleted.
+    targets = []
+    for (path_segments, value) in pairs:
+        if not segments.match(path_segments, globlist):
+            continue
+
+        if afilter is None:
+            targets.append(path_segments)
+        elif segments.leaf(value) and afilter(value):
+            targets.append(path_segments)
+
+    if not targets:
+        raise PathNotFound(f"Could not find {glob} to delete it")
+
+    # Index containers by identity to detect objects that are reachable
+    # through several paths.
+    occurrences = {id(obj): [()]}
+    for (path_segments, value) in pairs:
+        if not segments.leaf(value):
+            occurrences.setdefault(id(value), []).append(path_segments)
+
+    # A shared container may be mutated in place only when every path
+    # reaching it agrees on what gets deleted underneath. Otherwise the
+    # selected branches receive their own copy so that retained paths keep
+    # their original values.
+    tainted = {
+        identity
+        for identity, paths in occurrences.items()
+        if len(paths) > 1 and len({
+            frozenset(
+                tuple(segments.int_str(segment) for segment in target[len(path):])
+                for target in targets
+                if target[:len(path)] == path
+            )
+            for path in paths
+        }) > 1
+    }
+
+    # Apply the deletions.
+    for path_segments in targets:
+        # Skip paths that an earlier removal already covered: several
+        # selected paths can share a single physical deletion.
         if not segments.has(obj, path_segments):
-            return
+            continue
 
-        matched = segments.match(path_segments, globlist)
-        selected = afilter and segments.leaf(value) and afilter(value)
+        # Copy-on-write along the parent chain so that a shared container is
+        # never mutated in place while a retained path still points at it.
+        parent_path = path_segments[:-1]
+        for depth in range(1, len(parent_path) + 1):
+            prefix = parent_path[:depth]
+            node = segments.get(obj, prefix)
 
-        if (matched and not afilter) or selected:
-            key = path_segments[-1]
-            parent = segments.get(obj, path_segments[:-1])
+            if id(node) in tainted:
+                segments.set(obj, prefix, _shallow_copy(node), creator=None)
 
-            # Deletion behavior depends on parent type
-            if isinstance(parent, MutableMapping):
+        key = path_segments[-1]
+        parent = segments.get(obj, parent_path)
+
+        # Deletion behavior depends on parent type
+        if isinstance(parent, MutableMapping):
+            del parent[key]
+
+        else:
+            # Handle sequence types
+            # TODO: Consider cases where type isn't a simple list (e.g. set)
+
+            if len(parent) - 1 == key:
+                # Removing the last element of a sequence. It can be
+                # truly removed without affecting the ordering of
+                # remaining items.
                 del parent[key]
 
             else:
-                # Handle sequence types
-                # TODO: Consider cases where type isn't a simple list (e.g. set)
+                # This key can't be removed completely because it
+                # would affect the order of items that remain in our
+                # result.
+                parent[key] = None
 
-                if len(parent) - 1 == key:
-                    # Removing the last element of a sequence. It can be
-                    # truly removed without affecting the ordering of
-                    # remaining items.
-                    #
-                    # Note: In order to achieve proper behavior we are
-                    # relying on the reverse iteration of
-                    # non-dictionaries from segments.kvs().
-                    # Otherwise we'd be unable to delete all the tails
-                    # of a list and end up with None values when we
-                    # don't need them.
-                    del parent[key]
-
-                else:
-                    # This key can't be removed completely because it
-                    # would affect the order of items that remain in our
-                    # result.
-                    parent[key] = None
-
-            counter[0] += 1
-
-    [deleted] = segments.foldm(obj, f, [0])
-    if not deleted:
-        raise PathNotFound(f"Could not find {glob} to delete it")
-
-    return deleted
+    return len(targets)
 
 
 def set(obj: MutableMapping, glob: Glob, value, separator="/", afilter: Filter | None = None) -> int:

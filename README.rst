@@ -261,8 +261,8 @@ To delete keys in an object, use dpath.delete, which accepts the same globbing s
     delete(obj, glob, separator='/', afilter=None):
         Given a path glob, delete all elements that match the glob.
 
-        Returns the number of deleted objects. Raises PathNotFound if
-        no paths are found to delete.
+        Returns the number of paths selected for deletion. Raises
+        PathNotFound if no paths are found to delete.
 
 Example: Merging
 ================
