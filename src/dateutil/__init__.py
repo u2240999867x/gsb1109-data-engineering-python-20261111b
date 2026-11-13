@@ -5,7 +5,15 @@ try:
 except ImportError:
     __version__ = 'unknown'
 
-__all__ = ["easter", "parser", "relativedelta", "rrule", "tz", "utils"]
+__all__ = [
+    "easter",
+    "parser",
+    "relativedelta",
+    "relativedelta_compat",
+    "rrule",
+    "tz",
+    "utils",
+]
 
 
 def __getattr__(name):

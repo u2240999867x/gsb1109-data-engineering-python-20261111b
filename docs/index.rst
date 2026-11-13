@@ -24,6 +24,7 @@ Contents:
    easter
    parser
    relativedelta
+   relativedelta_compat
    rrule
    tz
    tz.win <tzwin>

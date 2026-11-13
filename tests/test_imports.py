@@ -38,7 +38,15 @@ def clean_import():
 
 @pytest.mark.parametrize(
     "module",
-    ["easter", "parser", "relativedelta", "rrule", "tz", "utils"],
+    [
+        "easter",
+        "parser",
+        "relativedelta",
+        "relativedelta_compat",
+        "rrule",
+        "tz",
+        "utils",
+    ],
 )
 def test_lazy_import(clean_import, module):
     """Test that dateutil.[submodule] loads lazily"""

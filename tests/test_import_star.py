@@ -17,6 +17,7 @@ def test_imported_modules():
     import dateutil.easter
     import dateutil.parser
     import dateutil.relativedelta
+    import dateutil.relativedelta_compat
     import dateutil.rrule
     import dateutil.tz
     import dateutil.utils
@@ -24,6 +25,9 @@ def test_imported_modules():
     assert dateutil.easter == new_locals.pop("easter")
     assert dateutil.parser == new_locals.pop("parser")
     assert dateutil.relativedelta == new_locals.pop("relativedelta")
+    assert dateutil.relativedelta_compat == new_locals.pop(
+        "relativedelta_compat"
+    )
     assert dateutil.rrule == new_locals.pop("rrule")
     assert dateutil.tz == new_locals.pop("tz")
     assert dateutil.utils == new_locals.pop("utils")
