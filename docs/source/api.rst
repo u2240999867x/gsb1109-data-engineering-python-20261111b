@@ -12,9 +12,49 @@ The :mod:`sqlparse` module provides the following functions on module-level.
 
 .. autofunction:: sqlparse.parse
 
+.. autofunction:: sqlparse.format_lineage
+
 In most cases there's no need to set the `encoding` parameter. If
 `encoding` is not set, sqlparse assumes that the given SQL statement
 is encoded either in utf-8 or latin-1.
+
+
+Column lineage and verbatim regions
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Reporting tools often have to point a column in the *formatted* output
+back at the exact span of the *original* SQL.  :meth:`~sqlparse.format_lineage`
+does this without string search: it returns the formatted statement
+together with a :class:`~sqlparse.SourceMap`.  Every output position is
+resolved by offset, so a column name occurring several times always maps
+to the right occurrence, and multi-byte aliases or newline conversion do
+not shift the result.
+
+A *verbatim region* is a span that formatting must leave byte for byte.
+Mark it inline with the default markers ``@@VBEGIN@@`` and ``@@VEND@@``
+(or pass a custom pair via ``verbatim_markers``), or pass explicit
+half-open character ranges via ``verbatim_ranges``.  A region may begin in
+the middle of a ``SELECT`` list and reach into a subquery; its brackets and
+quoting still participate in structural parsing outside the region.
+
+The returned :class:`~sqlparse.SourceMap` exposes:
+
+``source_for(out_start, out_end=None)``
+  Returns the half-open ``(start, end)`` range in the original input.  A
+  range spanning inserted whitespace, a verbatim boundary or any other
+  source discontinuity raises ``SQLParseError`` with a line/column
+  diagnostic.
+
+``fragment_for(out_start, out_end=None)``
+  Like ``source_for`` but returns the original text slice directly.
+
+``regions``
+  The output and source ranges of every verbatim region.
+
+Markers inside strings, quoted identifiers or comments are treated as
+literal text.  Unmatched markers, empty or overlapping regions and
+unbalanced brackets inside a region raise ``SQLParseError`` reporting the
+offending line and column.
 
 
 .. _formatting:

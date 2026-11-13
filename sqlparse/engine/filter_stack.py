@@ -20,20 +20,37 @@ class FilterStack:
         self.stmtprocess = []
         self.postprocess = []
         self._grouping = False
+        #: When True every token carries its source range, even if no
+        #: verbatim region was resolved.
+        self._lineage = False
+        #: Resolved verbatim regions.
+        self.directives = ()
         if strip_semicolon:
             self.stmtprocess.append(StripTrailingSemicolonFilter())
 
     def enable_grouping(self):
         self._grouping = True
 
+    def enable_lineage(self, directives=()):
+        """Switch to offset-tracked tokenization for verbatim regions."""
+        self._lineage = True
+        self.directives = tuple(directives)
+
     def run(self, sql, encoding=None):
         try:
-            stream = lexer.tokenize(sql, encoding)
+            if self._lineage:
+                stream = lexer.tokenize_with_offsets(
+                    sql, self.directives, encoding)
+                splitter = StatementSplitter(track_offsets=True)
+            else:
+                stream = lexer.tokenize(sql, encoding)
+                splitter = StatementSplitter()
+
             # Process token stream
             for filter_ in self.preprocess:
                 stream = filter_.process(stream)
 
-            stream = StatementSplitter().process(stream)
+            stream = splitter.process(stream)
 
             # Output: Stream processed Statements
             for stmt in stream:

@@ -16,10 +16,16 @@ class _CaseFilter:
         self.convert = getattr(str, case)
 
     def process(self, stream):
-        for ttype, value in stream:
+        for item in stream:
+            ttype, value = item[0], item[1]
             if ttype in self.ttype:
                 value = self.convert(value)
-            yield ttype, value
+            # Lineage mode carries (ttype, value, start, end) tuples; the
+            # source range survives the in-place case conversion.
+            if len(item) == 4:
+                yield ttype, value, item[2], item[3]
+            else:
+                yield ttype, value
 
 
 class KeywordCaseFilter(_CaseFilter):
@@ -30,10 +36,14 @@ class IdentifierCaseFilter(_CaseFilter):
     ttype = T.Name, T.String.Symbol
 
     def process(self, stream):
-        for ttype, value in stream:
+        for item in stream:
+            ttype, value = item[0], item[1]
             if ttype in self.ttype and value.strip()[0] != '"':
                 value = self.convert(value)
-            yield ttype, value
+            if len(item) == 4:
+                yield ttype, value, item[2], item[3]
+            else:
+                yield ttype, value
 
 
 class TruncateStringFilter:
@@ -42,18 +52,19 @@ class TruncateStringFilter:
         self.char = char
 
     def process(self, stream):
-        for ttype, value in stream:
-            if ttype != T.Literal.String.Single:
-                yield ttype, value
-                continue
+        for item in stream:
+            ttype, value = item[0], item[1]
+            if ttype == T.Literal.String.Single:
+                if value[:2] == "''":
+                    inner = value[2:-2]
+                    quote = "''"
+                else:
+                    inner = value[1:-1]
+                    quote = "'"
 
-            if value[:2] == "''":
-                inner = value[2:-2]
-                quote = "''"
+                if len(inner) > self.width:
+                    value = ''.join((quote, inner[:self.width], self.char, quote))
+            if len(item) == 4:
+                yield ttype, value, item[2], item[3]
             else:
-                inner = value[1:-1]
-                quote = "'"
-
-            if len(inner) > self.width:
-                value = ''.join((quote, inner[:self.width], self.char, quote))
-            yield ttype, value
+                yield ttype, value

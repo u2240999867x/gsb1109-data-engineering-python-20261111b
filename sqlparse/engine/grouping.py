@@ -316,7 +316,7 @@ def group_identifier_list(tlist):
     sqlcls = (sql.Function, sql.Case, sql.Identifier, sql.Comparison,
               sql.IdentifierList, sql.Operation)
     ttypes = (T_NUMERICAL + T_STRING + T_NAME
-              + (T.Keyword, T.Comment, T.Wildcard))
+              + (T.Keyword, T.Comment, T.Wildcard, T.Verbatim))
 
     def match(token):
         return token.match(T.Punctuation, ',')

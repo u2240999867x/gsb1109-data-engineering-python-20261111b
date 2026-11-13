@@ -116,6 +116,19 @@ class Lexer:
 
         ``stack`` is the initial stack (default: ``['root']``)
         """
+        for ttype, value, _start, _end in self.get_tokens_with_offsets(text):
+            yield ttype, value
+
+    def get_tokens_with_offsets(self, text, encoding=None, directives=()):
+        """Like :meth:`get_tokens` but every item is a
+        ``(ttype, value, start, end)`` tuple carrying the half-open
+        character range of the token in the input.
+
+        ``directives`` are resolved verbatim regions (see
+        :mod:`sqlparse.lineage`): marker spans are consumed without
+        emitting a token while each region content is emitted as a single
+        :data:`sqlparse.tokens.Verbatim` token.
+        """
         if isinstance(text, TextIOBase):
             text = text.read()
 
@@ -132,11 +145,34 @@ class Lexer:
         else:
             raise TypeError(f"Expected text or file-like object, got {type(text)!r}")
 
+        skip_to = {}
+        region_to = {}
+        for directive in directives:
+            if directive.open_start != directive.content_start:
+                skip_to[directive.open_start] = directive.open_end
+            region_to[directive.content_start] = directive.content_end
+            # For marker directives the close marker starts exactly at
+            # content_end; for explicit ranges the two coincide and the
+            # entry is a harmless zero-width skip.
+            if directive.close_end > directive.content_end:
+                skip_to[directive.close_start] = directive.close_end
+
         delimited_spans = keywords.find_delimited_spans(text)
         span_openers = delimited_spans.openers
 
         iterable = enumerate(text)
         for pos, char in iterable:
+            if pos in region_to:
+                end = region_to[pos]
+                yield tokens.Verbatim, text[pos:end], pos, end
+                consume(iterable, end - pos - 1)
+                continue
+
+            if pos in skip_to:
+                end = skip_to[pos]
+                consume(iterable, end - pos - 1)
+                continue
+
             # Only positions the lexer actually reaches may open a
             # dollar-quoted literal or a multiline comment; a delimiter
             # inside a string literal or behind a "--" comment is skipped
@@ -145,7 +181,7 @@ class Lexer:
                 resolved = delimited_spans.resolve(pos)
                 if resolved is not None:
                     end, ttype = resolved
-                    yield ttype, text[pos:end]
+                    yield ttype, text[pos:end], pos, end
                     consume(iterable, end - pos - 1)
                     continue
 
@@ -155,14 +191,16 @@ class Lexer:
                 if not m:
                     continue
                 elif isinstance(action, tokens._TokenType):
-                    yield action, m.group()
+                    value = m.group()
+                    yield action, value, pos, pos + len(value)
                 elif action is keywords.PROCESS_AS_KEYWORD:
-                    yield self.is_keyword(m.group())
+                    ttype, value = self.is_keyword(m.group())
+                    yield ttype, value, pos, pos + len(value)
 
                 consume(iterable, m.end() - pos - 1)
                 break
             else:
-                yield tokens.Error, char
+                yield tokens.Error, char, pos, pos + 1
 
 
 def tokenize(sql, encoding=None):
@@ -172,3 +210,10 @@ def tokenize(sql, encoding=None):
     of ``(token type, value)`` items.
     """
     return Lexer.get_default_instance().get_tokens(sql, encoding)
+
+
+def tokenize_with_offsets(sql, directives=(), encoding=None):
+    """Tokenize *sql* as ``(token type, value, start, end)`` tuples,
+    treating resolved *directives* as verbatim regions."""
+    return Lexer.get_default_instance().get_tokens_with_offsets(
+        sql, encoding, directives)

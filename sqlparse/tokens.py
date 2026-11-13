@@ -42,6 +42,11 @@ Error = Token.Error
 # Text that doesn't belong to this lexer (e.g. HTML in PHP)
 Other = Token.Other
 
+# A byte-for-byte verbatim region requested by the caller.  Tokens of this
+# type are never rewritten by any filter and carry the source offsets that
+# back the output-to-source range mapping (see sqlparse.lineage).
+Verbatim = Token.Verbatim
+
 # Common token types for source code
 Keyword = Token.Keyword
 Name = Token.Name

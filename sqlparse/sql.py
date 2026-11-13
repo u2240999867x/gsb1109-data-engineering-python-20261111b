@@ -54,11 +54,13 @@ class Token:
         'is_whitespace',
         'normalized',
         'parent',
+        'source_end',
+        'source_start',
         'ttype',
         'value',
     )
 
-    def __init__(self, ttype, value):
+    def __init__(self, ttype, value, source_start=None, source_end=None):
         value = str(value)
         self.value = value
         self.ttype = ttype
@@ -68,6 +70,11 @@ class Token:
         self.is_whitespace = self.ttype in T.Whitespace
         self.is_newline = self.ttype in T.Newline
         self.normalized = value.upper() if self.is_keyword else value
+        # Half-open character range of this token in the original input.
+        # ``None`` marks tokens synthesized by a formatting filter; verbatim
+        # tokens always carry the range of their region.
+        self.source_start = source_start
+        self.source_end = source_end
 
     def __str__(self):
         return self.value

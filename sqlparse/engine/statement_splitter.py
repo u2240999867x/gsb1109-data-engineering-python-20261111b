@@ -7,13 +7,18 @@
 
 from sqlparse import sql
 from sqlparse import tokens as T
+from sqlparse.lineage import iter_code_spans
 
 
 class StatementSplitter:
     """Filter that split stream at individual statements"""
 
-    def __init__(self):
+    def __init__(self, track_offsets=False):
         self._reset()
+        #: When True the input stream carries ``(ttype, value, start,
+        #: end)`` tuples and the produced tokens remember their source
+        #: range (verbatim/lineage mode).
+        self.track_offsets = track_offsets
 
     def _reset(self):
         """Set the filter attributes to its default values"""
@@ -100,8 +105,6 @@ class StatementSplitter:
             return -1
         elif ttype not in T.Keyword:  # if normal token return
             return 0
-
-        # Everything after here is ttype = T.Keyword
         unified = value.upper()
 
         # DDL Create though can contain more words such as "or replace"
@@ -148,12 +151,40 @@ class StatementSplitter:
         # Handle closing keywords
         return self._handle_closing_keyword(unified)
 
+    def _verbatim_level_delta(self, value):
+        """Parenthesis nesting contributed by an opaque verbatim token.
+
+        The region content is never interpreted, but the parentheses it
+        contains still participate in statement-level structure
+        judgment, mirroring ``_change_splitlevel`` which only counts
+        round brackets; brackets inside strings or comments of the
+        region are ignored.  Square brackets never change split level.
+        """
+        delta = 0
+        for start, end in iter_code_spans(value):
+            for offset in range(start, end):
+                char = value[offset]
+                if char == '(':
+                    self._parenthesis_level += 1
+                    delta += 1
+                elif char == ')':
+                    level = max(0, self._parenthesis_level - 1)
+                    delta += level - self._parenthesis_level
+                    self._parenthesis_level = level
+        return delta
+
     def process(self, stream):
         """Process the stream"""
         EOS_TTYPE = T.Whitespace, T.Comment.Single
 
         # Run over all stream tokens
-        for ttype, value in stream:
+        for item in stream:
+            if self.track_offsets:
+                ttype, value, src_start, src_end = item
+            else:
+                ttype, value = item
+                src_start = src_end = None
+
             # Yield token if we finished a statement and there's no whitespaces
             # It will count newline token as a non whitespace. In this context
             # whitespace ignores newlines.
@@ -165,10 +196,18 @@ class StatementSplitter:
                 self._reset()
 
             # Change current split level (increase, decrease or remain equal)
-            self.level += self._change_splitlevel(ttype, value)
+            if ttype is T.Verbatim:
+                self.level += self._verbatim_level_delta(value)
+            else:
+                self.level += self._change_splitlevel(ttype, value)
 
             # Append the token to the current statement
-            self.tokens.append(sql.Token(ttype, value))
+            self.tokens.append(
+                sql.Token(ttype, value, src_start, src_end))
+
+            # Opaque regions never terminate a statement on their own.
+            if ttype is T.Verbatim:
+                continue
 
             # Check if we get the end of a statement
             # Issue762: Allow GO (or "GO 2") as statement splitter.

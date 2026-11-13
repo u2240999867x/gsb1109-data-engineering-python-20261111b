@@ -1,3 +1,22 @@
+Unreleased
+----------
+
+Enhancements
+
+* Add verbatim regions and output-to-source range mapping for column
+  lineage.  `sqlparse.format_lineage()` formats SQL like `format()` while
+  preserving marked spans byte for byte (keyword casing, whitespace,
+  re-indentation and newline conversion all skip them) and returns a
+  `SourceMap` that projects formatted-output ranges back onto the original
+  input by offset, so identical column text is never located by string
+  search.  Regions are marked inline with `@@VBEGIN@@`/`@@VEND@@` (or a
+  custom pair) or supplied as explicit ranges, may start in the middle of a
+  SELECT list and reach into a subquery, while the brackets they contain
+  still participate in statement structure.  Unmappable positions,
+  ambiguous ranges, bad markers and unbalanced brackets raise
+  `SQLParseError` with line/column diagnostics.
+
+
 Release 0.6.1 (Nov 01, 2026)
 ----------------------------
 
