@@ -15,8 +15,19 @@ import re
 from io import TextIOBase
 from threading import Lock
 
-from sqlparse import keywords, tokens
+from sqlparse import keywords, profiles, tokens
 from sqlparse.utils import consume
+
+# Position of the quote rules in keywords.SQL_REGEX.  A profile replaces the
+# single-quoted, double-quoted and backtick patterns in place so the order
+# relative to the surrounding rules (comments, numbers, keywords, ...) stays
+# untouched.
+_QUOTE_RULES = {
+    'single': r"'(''|\\'|[^'])*'",
+    'double': r'"(""|\\"|[^"])*"',
+    'double_fallback': r'(""|".*?[^\\]")',
+    'backtick': r"`(``|[^`])*`",
+}
 
 
 class Lexer:
@@ -25,6 +36,7 @@ class Lexer:
 
     _default_instance = None
     _lock = Lock()
+    _profile_instances = {}
 
     # Development notes:
     # - This class is prepared to be able to support additional SQL dialects
@@ -76,14 +88,67 @@ class Lexer:
         to make the lexer functional again."""
         self._SQL_REGEX = []
         self._keywords = []
+        self.profile = None
 
-    def set_SQL_REGEX(self, SQL_REGEX):
-        """Set the list of regex that will parse the SQL."""
+    def set_SQL_REGEX(self, SQL_REGEX, profile=None):
+        """Set the list of regex that will parse the SQL.
+
+        If *profile* is given, the quoting patterns of its rules are
+        replaced by equivalents that follow that profile's escape rules.
+        The ``default`` profile keeps the built-in rules unchanged.
+        """
         FLAGS = re.IGNORECASE | re.UNICODE
+        resolved = None if profile is None else profiles.get_profile(profile)
+        if resolved is not None and resolved is not profiles.DEFAULT:
+            SQL_REGEX = self._profile_regexes(SQL_REGEX, resolved)
+        self.profile = resolved
         self._SQL_REGEX = [
             (re.compile(rx, FLAGS).match, tt)
             for rx, tt in SQL_REGEX
         ]
+
+    @staticmethod
+    def _profile_regexes(SQL_REGEX, profile):
+        """Replace the quoting rules without changing rule order."""
+        single = profile.quote_regex("'")
+        double = profile.quote_regex('"')
+        backtick = profile.quote_regex(
+            '`', backslash=profile.backtick_escapes)
+        replacements = {
+            _QUOTE_RULES['single']: single,
+            _QUOTE_RULES['double']: double,
+            _QUOTE_RULES['backtick']: backtick,
+        }
+        result = []
+        seen = set()
+        for regex, ttype in SQL_REGEX:
+            if regex in replacements:
+                seen.add(regex)
+                result.append((replacements[regex], ttype))
+                if regex == _QUOTE_RULES['double']:
+                    # The second, permissive double-quote pattern cannot be
+                    # used with an explicit profile: it would accept a quote
+                    # char that the profile says is escaped.
+                    continue
+            elif regex == _QUOTE_RULES['double_fallback']:
+                if _QUOTE_RULES['double'] in seen:
+                    continue
+                result.append((double, ttype))
+            else:
+                result.append((regex, ttype))
+        return result
+
+    def use_profile(self, profile):
+        """Switch this lexer to the quoting rules of *profile*.
+
+        Keyword dictionaries are kept; only the quoting patterns change.
+        Passing ``None`` restores the default rules that accept the SQL
+        standard and the backslash extension.
+        """
+        if profile is None:
+            self.set_SQL_REGEX(keywords.SQL_REGEX)
+            return
+        self.set_SQL_REGEX(keywords.SQL_REGEX, profile)
 
     def add_keywords(self, keywords):
         """Add keyword dictionaries. Keywords are looked up in the same order
@@ -102,6 +167,24 @@ class Lexer:
                 return kwdict[val], value
         else:
             return tokens.Name, value
+
+    @classmethod
+    def get_profile_instance(cls, profile):
+        """Return a dedicated lexer for *profile*.
+
+        Profile-specific lexers are cached per profile and are independent
+        from the default lexer, so two consumers with different quoting
+        rules can tokenize interleaved streams without sharing state.
+        """
+        profile = profiles.get_profile(profile)
+        with cls._lock:
+            instance = cls._profile_instances.get(profile)
+            if instance is None:
+                instance = cls()
+                instance.default_initialization()
+                instance.use_profile(profile)
+                cls._profile_instances[profile] = instance
+        return instance
 
     def get_tokens(self, text, encoding=None):
         """
@@ -172,3 +255,13 @@ def tokenize(sql, encoding=None):
     of ``(token type, value)`` items.
     """
     return Lexer.get_default_instance().get_tokens(sql, encoding)
+
+
+def tokenize_with_profile(sql, profile, encoding=None):
+    """Tokenize *sql* with the quoting rules of *profile*.
+
+    Unlike temporarily reconfiguring the default lexer, this keeps two
+    profile-consuming streams independent.
+    """
+    lexer = Lexer.get_profile_instance(profile)
+    return lexer.get_tokens(sql, encoding)

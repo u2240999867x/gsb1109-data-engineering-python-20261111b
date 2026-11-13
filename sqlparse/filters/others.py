@@ -174,7 +174,9 @@ class StripTrailingSemicolonFilter:
 # postprocess
 
 class SerializerUnicode:
-    @staticmethod
-    def process(stmt):
-        lines = split_unquoted_newlines(stmt)
+    def __init__(self, profile=None):
+        self.profile = profile
+
+    def process(self, stmt):
+        lines = split_unquoted_newlines(stmt, self.profile)
         return '\n'.join(line.rstrip() for line in lines)

@@ -16,6 +16,102 @@ In most cases there's no need to set the `encoding` parameter. If
 `encoding` is not set, sqlparse assumes that the given SQL statement
 is encoded either in utf-8 or latin-1.
 
+Quoting profiles
+----------------
+
+By default sqlparse accepts both the SQL standard form of a quoted string
+(``'it''s'``) and the common backslash extension (``'it\'s'``). Data that
+comes from more than one source cannot be read that way, because the same
+byte sequence then has two possible meanings.
+
+Pass ``profile`` to :func:`~sqlparse.split`, :func:`~sqlparse.parse` or
+:func:`~sqlparse.format` to select exactly one interpretation:
+
+.. code-block:: python
+
+   >>> sql = "SELECT 'a\\';b'; SELECT 2;"
+   >>> sqlparse.split(sql, profile='ansi')
+   ["SELECT 'a\\';", "b';", 'SELECT 2;']
+   >>> sqlparse.split(sql, profile='mysql')
+   ["SELECT 'a\\';b';", 'SELECT 2;']
+
+The built-in names are ``ansi`` (and its aliases ``standard``, ``sql`` and
+``sqlite``), ``mysql``, ``postgres`` and ``backslash``. The ``default``
+profile keeps the historical permissive behaviour and is selected when no
+profile is given.
+
+.. autoclass:: sqlparse.profiles.QuoteProfile
+   :members:
+
+.. autofunction:: sqlparse.profiles.get_profile
+
+Reading dump files
+------------------
+
+:func:`~sqlparse.ingestion.ingest` parses all ``INSERT`` statements of a
+dump with one profile. It returns a manifest that contains, at the same
+time, the target table of every row, the raw source range of every column
+and the lines that could not be ingested::
+
+   >>> from sqlparse import ingestion
+   >>> manifest = ingestion.ingest(text, profile='mysql')
+   >>> manifest.row_list()
+   (('db.orders', (1, 'open')),)
+   >>> manifest.rows[0].columns[0].raw
+   "'open'"
+   >>> manifest.residual[0].reason
+   'unsupported_statement'
+
+The same manifest is produced whether the text is passed directly, split
+with :func:`~sqlparse.split` and ingested statement by statement, or
+formatted with :func:`~sqlparse.format` and then ingested again. Only the
+character offsets change when the text is reformatted.
+
+.. autofunction:: sqlparse.ingestion.ingest
+
+.. autoclass:: sqlparse.ingestion.IngestManifest
+   :members:
+
+.. autoclass:: sqlparse.ingestion.IngestedRow
+   :members:
+
+.. autoclass:: sqlparse.ingestion.ColumnSpan
+   :members:
+
+.. autoclass:: sqlparse.ingestion.ResidualLine
+   :members:
+
+Comparing profiles
+------------------
+
+When two sources use different quoting rules, :func:`~sqlparse.ingestion.
+compare_profiles` reports the first source line at which their statement
+boundaries diverge. That is the line where a semicolon moved into or out
+of a string value.
+
+.. autofunction:: sqlparse.compare_profiles
+
+.. autofunction:: sqlparse.statement_boundaries
+
+.. autoclass:: sqlparse.ingestion.BoundaryDiff
+   :members:
+
+.. autoclass:: sqlparse.ingestion.StatementBoundary
+   :members:
+
+Streaming
+---------
+
+:func:`~sqlparse.ingestion.ingest_stream` creates an incremental consumer.
+Each consumer owns its quoting state, so several streams can be fed in
+alternating order even when more than one of them is in the middle of a
+quoted literal.
+
+.. autofunction:: sqlparse.ingestion.ingest_stream
+
+.. autoclass:: sqlparse.ingestion.IngestStream
+   :members:
+
 
 .. _formatting:
 

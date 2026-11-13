@@ -19,13 +19,19 @@ _STRING_CONTENT = {
 }
 
 
-def split_unquoted_newlines(stmt):
+def split_unquoted_newlines(stmt, profile=None):
     """Split a string on all unquoted newlines.
 
     Unlike str.splitlines(), this will ignore CR/LF/CR+LF if the requisite
     character is inside of a string. A quote that is never closed is
-    treated as plain text."""
+    treated as plain text.
+
+    If *profile* is given, its quoting rules decide which newlines are
+    quoted and which ones end a line, so a formatted statement is split the
+    same way the lexer read it."""
     text = str(stmt)
+    if profile is not None:
+        return _split_unquoted_newlines_profile(text, profile)
     length = len(text)
     lines = []
     line_start = pos = 0
@@ -51,6 +57,29 @@ def split_unquoted_newlines(stmt):
             pos += 1
         else:
             pos = _UNQUOTED_TEXT.match(text, pos).end()
+    lines.append(text[line_start:])
+    return lines
+
+
+def _split_unquoted_newlines_profile(text, profile):
+    """Profile-aware variant of :func:`split_unquoted_newlines`."""
+    from sqlparse import profiles, quotes
+
+    profile = profiles.get_profile(profile)
+    state = quotes.QuoteState(profile)
+    lines = []
+    line_start = pos = 0
+    length = len(text)
+    while pos < length:
+        char = text[pos]
+        if char in '\r\n' and not state.in_string:
+            lines.append(text[line_start:pos])
+            pos += 2 if text.startswith('\r\n', pos) else 1
+            line_start = pos
+            continue
+        state.step(char)
+        pos += 1
+    state.close_pending()
     lines.append(text[line_start:])
     return lines
 

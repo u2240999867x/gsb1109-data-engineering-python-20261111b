@@ -160,6 +160,16 @@ def create_parser():
         default='utf-8',
         help='Specify the input encoding (default utf-8)')
 
+    group.add_argument(
+        '--profile',
+        dest='profile',
+        metavar='PROFILE',
+        default=None,
+        choices=sorted(sqlparse.profiles.PROFILES),
+        help='quoting rules for string literals, one of {}'.format(
+            ', '.join(f'"{x}"'
+                      for x in sorted(sqlparse.profiles.PROFILES))))
+
     return parser
 
 
