@@ -87,10 +87,48 @@ Expanding Bloom Filter
 """""""""""""""""""""""""""""""""""""""""""""""
 
 The **Expanding Bloom Filter** is a specialized version of the standard
-Bloom Filter that automatically grows to ensure that the desired false positive
-rate is not exceeded. This is ideal for situations that it is a wild guess to
-determine the number of elements that will be added.
+Bloom Filter that automatically grows. This is ideal for situations where it
+is a wild guess to determine the number of elements that will be added.
 
+By default ``false_positive_rate`` is the target rate of *one layer*. Since
+a query succeeds when any layer reports a match, that per layer value is not
+an overall guarantee once the filter has expanded. Use an explicit overall
+budget when the rate is a commitment for the whole filter:
+
+.. code:: python
+
+    >>> from probables import ExpandingBloomFilter
+    >>> blm = ExpandingBloomFilter(est_elements=100000, overall_false_positive_rate=0.01)
+    >>> blm.budget_mode
+    True
+    >>> blm.layer_false_positive_rates[0]
+    0.005
+    >>> blm.false_positive_rate_bound <= 0.01
+    True
+
+Layer ``i`` (starting at zero) receives ``P / 2 ** (i + 1)`` where ``P`` is
+the overall budget. The series sums to ``P``, so the union bound for any
+number of layers never exceeds ``P``; for a finite number of layers it is
+strictly smaller. A new layer is opened as soon as the newest layer has
+received ``est_elements`` keys. Queries always cover every active layer.
+
+Later layers use more hash permutations, so hashes are generated at the
+largest depth required by the layers (and by the next layer). Passing a
+pre-computed hash list that is too short raises ``ValueError`` instead of
+reusing a shorter list. ``overall_fpr``, ``overall_budget`` and ``budget``
+are accepted as aliases for ``overall_false_positive_rate``; alternatively
+pass ``budget_mode=True`` with the budget in ``false_positive_rate``.
+
+``false_positive_rate_bound`` is the mathematical union bound for the active
+layers. Measuring the false positive rate on one sample of absent keys is a
+sanity check only; a sample frequency is not an upper bound. Exported files
+preserve the budget mode, the overall budget, every layer rate and the next
+layer index. Files written without budget mode keep the original layout and
+load as per layer filters.
+
+The **Rotating Bloom Filter** supports the same budget keywords. Each queue
+slot gets the geometric rate for its position, so the active union bound
+stays within the configured overall budget as layers rotate.
 
 Rotating Bloom Filter
 """""""""""""""""""""""""""""""""""""""""""""""

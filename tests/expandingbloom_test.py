@@ -2,10 +2,12 @@
 """Unittest class"""
 
 import hashlib
+import itertools
 import os
 import sys
 import unittest
 from pathlib import Path
+from struct import Struct
 from tempfile import NamedTemporaryFile
 
 this_dir = Path(__file__).parent
@@ -13,7 +15,7 @@ sys.path.insert(0, str(this_dir))
 sys.path.insert(0, str(this_dir.parent))
 
 from probables import ExpandingBloomFilter, RotatingBloomFilter  # noqa: E402
-from probables.exceptions import RotatingBloomFilterError  # noqa: E402
+from probables.exceptions import InitializationError, RotatingBloomFilterError  # noqa: E402
 from tests.utilities import calc_file_md5, different_hash  # noqa: E402
 
 DELETE_TEMP_FILES = True
@@ -154,6 +156,267 @@ class TestExpandingBloomFilter(unittest.TestCase):
             # check for things that are not there!
             for i in range(99, 125):
                 self.assertEqual(f"{i}" in blm2, False)
+
+
+class TestExpandingBloomFilterBudget(unittest.TestCase):
+    """Test explicit overall false positive budget mode"""
+
+    def test_default_mode_is_per_layer(self):
+        """without opting in, false_positive_rate remains the per layer rate"""
+        blm = ExpandingBloomFilter(est_elements=10, false_positive_rate=0.05)
+        self.assertFalse(blm.budget_mode)
+        self.assertIsNone(blm.overall_false_positive_rate)
+        self.assertIsNone(blm.budget_strategy)
+        self.assertEqual(len(blm.layer_false_positive_rates), 1)
+        self.assertAlmostEqual(blm.layer_false_positive_rates[0], 0.05)
+        self.assertAlmostEqual(blm.false_positive_rate_bound, 0.05)
+
+    def test_overall_budget_initial_layer(self):
+        """the first layer receives half of the overall budget"""
+        blm = ExpandingBloomFilter(est_elements=10, overall_false_positive_rate=0.05)
+        self.assertTrue(blm.budget_mode)
+        self.assertEqual(blm.budget_strategy, "geometric")
+        self.assertEqual(blm.overall_false_positive_rate, 0.05)
+        self.assertEqual(blm.false_positive_rate, 0.05)
+        self.assertEqual(len(blm.layer_false_positive_rates), 1)
+        self.assertAlmostEqual(blm.layer_false_positive_rates[0], 0.025)
+        self.assertLessEqual(blm.false_positive_rate_bound, 0.05)
+        self.assertEqual(blm.next_layer_index, 1)
+        self.assertAlmostEqual(blm.next_layer_false_positive_rate, 0.0125)
+
+    def test_overall_budget_layers_halve(self):
+        """each layer receives half of the previous layer's budget"""
+        blm = ExpandingBloomFilter(est_elements=10, overall_false_positive_rate=0.05)
+        for i in range(100):
+            blm.add(f"{i}", True)
+        self.assertEqual(blm.expansions, 9)
+        rates = blm.layer_false_positive_rates
+        self.assertEqual(len(rates), 10)
+        for idx, rate in enumerate(rates):
+            self.assertAlmostEqual(rate, 0.05 / (2 ** (idx + 1)), places=6)
+            self.assertLessEqual(rate, 0.05 / (2 ** (idx + 1)))
+        self.assertLessEqual(blm.false_positive_rate_bound, 0.05)
+        self.assertLess(blm.false_positive_rate_bound, 0.05)
+        self.assertEqual(blm.next_layer_index, 10)
+
+    def test_overall_budget_growth_schedule(self):
+        """a new layer opens exactly when the newest layer reaches est_elements"""
+        blm = ExpandingBloomFilter(est_elements=10, overall_false_positive_rate=0.05)
+        for i in range(9):
+            blm.add(f"{i}", True)
+        self.assertEqual(blm.expansions, 0)
+        self.assertEqual(blm.elements_added, 9)
+        blm.add("9", True)
+        self.assertEqual(blm.expansions, 0)
+        blm.add("10", True)
+        self.assertEqual(blm.expansions, 1)
+        self.assertEqual(blm.layer_metrics()[0]["elements_added"], 10)
+        self.assertEqual(blm.layer_metrics()[1]["elements_added"], 1)
+
+    def test_budget_mode_alias_keywords(self):
+        """explicit budget can be enabled with the documented aliases"""
+        for kwargs in (
+            {"overall_false_positive_rate": 0.02},
+            {"overall_fpr": 0.02},
+            {"overall_budget": 0.02},
+            {"budget": 0.02},
+        ):
+            blm = ExpandingBloomFilter(est_elements=10, **kwargs)
+            self.assertTrue(blm.budget_mode)
+            self.assertEqual(blm.overall_false_positive_rate, 0.02)
+
+        blm = ExpandingBloomFilter(est_elements=10, false_positive_rate=0.02, budget_mode=True)
+        self.assertTrue(blm.budget_mode)
+        self.assertEqual(blm.overall_false_positive_rate, 0.02)
+
+        blm = ExpandingBloomFilter(est_elements=10, false_positive_rate=0.02, mode="per-layer")
+        self.assertFalse(blm.budget_mode)
+
+    def test_budget_mode_requires_budget(self):
+        """enabling budget mode without a numeric budget raises"""
+        with self.assertRaises(InitializationError):
+            ExpandingBloomFilter(est_elements=10, budget_mode=True)
+
+    def test_conflicting_budgets_raise(self):
+        """two different explicit overall budgets are rejected"""
+        with self.assertRaises(InitializationError):
+            ExpandingBloomFilter(est_elements=10, overall_fpr=0.02, budget=0.03)
+
+    def test_invalid_overall_budget(self):
+        """overall budget must be strictly between zero and one"""
+        for value in (0.0, 1.0, -0.5, 1.5):
+            with self.assertRaises(InitializationError):
+                ExpandingBloomFilter(est_elements=10, overall_false_positive_rate=value)
+
+    def test_layer_parameters_grow(self):
+        """tighter layer budgets imply more hashes and more bits"""
+        blm = ExpandingBloomFilter(est_elements=25, overall_false_positive_rate=0.05)
+        for i in range(100):
+            blm.add(f"{i}", True)
+        metrics = blm.layer_metrics()
+        for prev, cur in itertools.pairwise(metrics):
+            self.assertGreater(cur["number_hashes"], prev["number_hashes"])
+            self.assertGreater(cur["number_bits"], prev["number_bits"])
+
+    def test_check_covers_all_layers_with_growing_hashes(self):
+        """every layer is queried and no layer is queried with a short hash list"""
+        blm = ExpandingBloomFilter(est_elements=10, overall_false_positive_rate=0.05)
+        added = [f"item-{i}" for i in range(50)]
+        for item in added:
+            blm.add(item, True)
+        self.assertGreater(blm.expansions, 1)
+        for item in added:
+            self.assertTrue(blm.check(item))
+            self.assertIn(item, blm)
+
+        hashes = blm.hashes("item-3")
+        self.assertGreaterEqual(len(hashes), max(metric["number_hashes"] for metric in blm.layer_metrics()))
+        for blm_layer in blm._blooms:
+            self.assertGreaterEqual(len(hashes), blm_layer.number_hashes)
+
+    def test_short_hash_list_is_rejected(self):
+        """a hash list that is too short for a layer raises instead of reusing values"""
+        blm = ExpandingBloomFilter(est_elements=10, overall_false_positive_rate=0.05)
+        for i in range(20):
+            blm.add(f"{i}", True)
+        short = blm.hashes("value")[: blm._blooms[-1].number_hashes - 1]
+        with self.assertRaises(ValueError):
+            blm.check_alt(short)
+        with self.assertRaises(ValueError):
+            blm.add_alt(short, True)
+
+    def test_add_alt_with_full_depth_hashes(self):
+        """add_alt accepts hash lists generated at the maximum required depth"""
+        blm = ExpandingBloomFilter(est_elements=10, overall_false_positive_rate=0.05)
+        for i in range(20):
+            hashes = blm.hashes(f"{i}")
+            blm.add_alt(hashes, True)
+        for i in range(20):
+            self.assertTrue(blm.check(f"{i}"))
+
+    def test_budget_round_trip_bytes(self):
+        """bytes preserve the budget mode, every layer rate, and the schedule"""
+        blm = ExpandingBloomFilter(est_elements=10, overall_false_positive_rate=0.05)
+        for i in range(35):
+            blm.add(f"{i}", True)
+        data = bytes(blm)
+        loaded = ExpandingBloomFilter.frombytes(data)
+        self.assertTrue(loaded.budget_mode)
+        self.assertEqual(loaded.overall_false_positive_rate, 0.05)
+        self.assertEqual(loaded.budget_strategy, "geometric")
+        self.assertEqual(loaded.layer_false_positive_rates, blm.layer_false_positive_rates)
+        self.assertEqual(loaded.next_layer_index, blm.next_layer_index)
+        self.assertEqual(loaded.elements_added, blm.elements_added)
+        self.assertEqual(bytes(loaded), data)
+        for i in range(35):
+            self.assertTrue(loaded.check(f"{i}"))
+
+    def test_budget_round_trip_file_ignores_constructor_budget(self):
+        """a loaded file's budget metadata wins over constructor arguments"""
+        with NamedTemporaryFile(dir=os.getcwd(), suffix=".ebf", delete=DELETE_TEMP_FILES) as fobj:
+            blm = ExpandingBloomFilter(est_elements=10, overall_false_positive_rate=0.05)
+            for i in range(30):
+                blm.add(f"{i}", True)
+            blm.export(fobj.name)
+
+            loaded = ExpandingBloomFilter(est_elements=99, overall_false_positive_rate=0.9, filepath=fobj.name)
+            self.assertEqual(loaded.estimated_elements, 10)
+            self.assertEqual(loaded.overall_false_positive_rate, 0.05)
+            self.assertEqual(loaded.layer_false_positive_rates, blm.layer_false_positive_rates)
+
+    def test_legacy_file_still_loads(self):
+        """files written in per layer mode keep the legacy footer layout"""
+        with NamedTemporaryFile(dir=os.getcwd(), suffix=".ebf", delete=DELETE_TEMP_FILES) as fobj:
+            blm = ExpandingBloomFilter(est_elements=25, false_positive_rate=0.05)
+            for i in range(30):
+                blm.add(f"{i}", True)
+            blm.export(fobj.name)
+            loaded = ExpandingBloomFilter(filepath=fobj.name)
+            self.assertFalse(loaded.budget_mode)
+            self.assertIsNone(loaded.overall_false_positive_rate)
+            self.assertEqual(loaded.layer_false_positive_rates, (loaded.false_positive_rate,) * len(loaded._blooms))
+
+    def test_budget_bound_never_exceeds_commitment(self):
+        """the union bound stays at or below the overall budget as layers grow"""
+        for count in (1, 2, 5, 10, 25, 60):
+            blm = ExpandingBloomFilter(est_elements=7, overall_false_positive_rate=0.03)
+            for i in range(count * 7):
+                blm.add(f"{i}", True)
+            self.assertLessEqual(blm.false_positive_rate_bound, 0.03)
+            self.assertEqual(blm.false_positive_rate_bound, sum(blm.layer_false_positive_rates))
+
+    def test_empirical_false_positive_rate_is_only_sanity_check(self):
+        """a single sample frequency is checked loosely; the math bound is authoritative"""
+        budget = 0.05
+        blm = ExpandingBloomFilter(est_elements=200, overall_false_positive_rate=budget)
+        for i in range(2000):
+            blm.add(f"present-{i}", True)
+        self.assertGreater(blm.expansions, 1)
+
+        probes = 5000
+        false_positives = sum(1 for i in range(probes) if blm.check(f"absent-{i}"))
+        observed = false_positives / probes
+        self.assertLessEqual(blm.false_positive_rate_bound, budget)
+        self.assertLess(observed, budget * 2)
+
+    def test_rotating_budget_mode(self):
+        """rotating filters allocate within the budget and preserve it on reload"""
+        blm = RotatingBloomFilter(est_elements=5, overall_false_positive_rate=0.04, max_queue_size=3)
+        self.assertTrue(blm.budget_mode)
+        worst_bound = 0.0
+        for i in range(60):
+            blm.add(f"{i}", True)
+            worst_bound = max(worst_bound, blm.false_positive_rate_bound)
+        self.assertEqual(blm.current_queue_size, 3)
+        self.assertLessEqual(worst_bound, 0.04)
+        self.assertLessEqual(blm.false_positive_rate_bound, 0.04)
+
+        loaded = RotatingBloomFilter.frombytes(bytes(blm), max_queue_size=3)
+        self.assertTrue(loaded.budget_mode)
+        self.assertEqual(loaded.overall_false_positive_rate, 0.04)
+        self.assertEqual(loaded.layer_false_positive_rates, blm.layer_false_positive_rates)
+        self.assertEqual(bytes(loaded), bytes(blm))
+
+    def test_rotating_queue_size_budget_bound(self):
+        """the active rotating queue stays inside the budget for several queue sizes"""
+        for queue_size in (2, 3, 5, 10):
+            blm = RotatingBloomFilter(est_elements=5, overall_false_positive_rate=0.04, max_queue_size=queue_size)
+            worst_bound = 0.0
+            for i in range(300):
+                blm.add(f"{i}", True)
+                worst_bound = max(worst_bound, blm.false_positive_rate_bound)
+            self.assertLessEqual(worst_bound, 0.04)
+            self.assertEqual(blm.current_queue_size, queue_size)
+
+    def test_budget_exhaustion_raises(self):
+        """when the geometric schedule underflows, growth raises instead of mis-allocating"""
+        blm = ExpandingBloomFilter(est_elements=1, overall_false_positive_rate=0.5)
+        with self.assertRaises(InitializationError):
+            for i in range(200):
+                blm.add(f"{i}", True)
+
+    def test_invalid_file_budget_metadata(self):
+        """corrupt budget metadata is rejected instead of silently trusted"""
+        blm = ExpandingBloomFilter(est_elements=10, overall_false_positive_rate=0.05)
+        for i in range(15):
+            blm.add(f"{i}", True)
+        data = bytearray(bytes(blm))
+        footer = Struct("<QQQQdBB4s")
+        size, est_els, els_added, next_idx, overall, mode, strategy, magic = footer.unpack(bytes(data[-footer.size :]))
+        data[-footer.size + 32 : -footer.size + 40] = Struct("<d").pack(1.5)
+        with self.assertRaises(InitializationError):
+            ExpandingBloomFilter.frombytes(bytes(data))
+
+    def test_rotating_rotation_opens_new_layer(self):
+        """rotation uses the next layer budget and queries all queued layers"""
+        blm = RotatingBloomFilter(est_elements=5, overall_false_positive_rate=0.04, max_queue_size=3)
+        for i in range(10):
+            blm.add(f"{i}", True)
+        self.assertEqual(blm.current_queue_size, 2)
+        self.assertNotEqual(blm.layer_false_positive_rates[0], blm.layer_false_positive_rates[1])
+        self.assertLessEqual(blm.false_positive_rate_bound, 0.04)
+        for i in range(10):
+            self.assertTrue(blm.check(f"{i}"))
 
 
 class TestRotatingBloomFilter(unittest.TestCase):

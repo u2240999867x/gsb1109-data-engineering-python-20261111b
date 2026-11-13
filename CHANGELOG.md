@@ -1,5 +1,15 @@
 # PyProbables Changelog
 
+### Unreleased
+
+* `ExpandingBloomFilter` / `RotatingBloomFilter`
+  * Add explicit overall false positive budget mode (`overall_false_positive_rate`, aliases, or `budget_mode=True`)
+  * Allocate layer `i` a target rate of `P / 2 ** (i + 1)` so the union bound stays within `P` for any number of layers
+  * Open a new layer when the newest layer reaches `est_elements`; queries still cover every layer
+  * Generate hashes at the depth required by the tightest layer and reject too-short pre-computed hash lists
+  * Persist budget mode, overall budget, per-layer rates, and the next layer index; legacy files still load
+  * Expose `false_positive_rate_bound` and per-layer allocation metrics
+
 ### Version 0.7.1
 
 * `Cuckoo Filter`
