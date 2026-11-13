@@ -141,6 +141,9 @@ classDiagram
     class ParseResults {
         +as_list()
         +as_dict()
+        +as_sources()
+        +iter_named()
+        +as_named_dict()
         +dump()
         +get()
         +items()

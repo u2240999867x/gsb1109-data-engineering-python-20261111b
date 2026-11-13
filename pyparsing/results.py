@@ -25,6 +25,18 @@ class _ParseResultsWithOffset(NamedTuple):
     result: Any
     offset: int
 
+    @property
+    def source(self) -> int | None:
+        return self.offset if self.offset >= 0 else None
+
+    @property
+    def origin(self) -> int | None:
+        return self.source
+
+
+DERIVED = -1
+"""Original-item index used when a named item has no input counterpart."""
+
 
 class ParseResults:
     """Structured parse results, to provide multiple means of access to
@@ -84,6 +96,7 @@ class ParseResults:
     _parent: ParseResults
     _all_names: set[str]
     _toklist: list[Any]
+    _sources: list[int | None]
     _tokdict: dict[str, list[_ParseResultsWithOffset]]
     _is_dict_context: bool
 
@@ -92,6 +105,7 @@ class ParseResults:
         "_parent",
         "_all_names",
         "_toklist",
+        "_sources",
         "_tokdict",
         "_is_dict_context",
     )
@@ -186,6 +200,7 @@ class ParseResults:
             )
         else:
             self._toklist = [toklist]
+        self._sources = list(range(len(self._toklist)))
         self._tokdict = {}
         return self
 
@@ -265,17 +280,54 @@ class ParseResults:
                 cur_tokdict_value.append(v)
             sub = v.result
         elif isinstance(k, (int, slice)):
-            self._toklist[k] = v
+            if isinstance(k, int):
+                index = k + len(self._toklist) if k < 0 else k
+                self._toklist[k] = v
+                if 0 <= index < len(self._sources):
+                    self._sources[index] = None
+                else:
+                    self._sources.append(None)
+            else:
+                start, stop, step = k.indices(len(self._toklist))
+                self._toklist[k] = v
+                if step == 1:
+                    self._sources[start:stop] = [None] * (stop - start)
+                else:
+                    for index in range(start, stop, step):
+                        self._sources[index] = None
             sub = v
         else:
             cur_tokdict_value = self._tokdict.get(k, no_value)
+            occurrence = _ParseResultsWithOffset(v, self._source_for(v))
             if cur_tokdict_value is no_value:
-                self._tokdict[k] = [_ParseResultsWithOffset(v, 0)]
+                self._tokdict[k] = [occurrence]
             else:
-                cur_tokdict_value.append(_ParseResultsWithOffset(v, 0))
+                cur_tokdict_value.append(occurrence)
             sub = v
         if isinstance(sub, ParseResults):
             sub._parent = self
+
+    def _source_for(self, value: Any) -> int:
+        positions = [
+            index for index, token in enumerate(self._toklist) if token is value
+        ]
+        if not positions:
+            return DERIVED
+        claimed = {
+            occurrence.offset
+            for occurrences in self._tokdict.values()
+            for occurrence in occurrences
+            if occurrence.offset >= 0
+        }
+        for index in positions:
+            source = self._sources[index]
+            if source is not None and source not in claimed:
+                return source
+        for index in positions:
+            source = self._sources[index]
+            if source is not None:
+                return source
+        return DERIVED
 
     def __delitem__(self, i):
         if not isinstance(i, (int, slice)):
@@ -285,31 +337,29 @@ class ParseResults:
         # slight optimization if del results[:]
         if i == NULL_SLICE:
             self._toklist.clear()
+            self._sources.clear()
             return
 
         mylen = len(self._toklist)
-        del self._toklist[i]
-
-        # convert int to slice
         if isinstance(i, int):
-            if i < 0:
-                i += mylen
-            i = slice(i, i + 1)
-        # get removed indices
-        removed = list(range(*i.indices(mylen)))
-        removed.reverse()
-        # fixup indices in token dictionary; copy() shares these lists, so
-        # renumber a private copy rather than the list itself
+            removed = [i + mylen if i < 0 else i]
+        else:
+            removed = list(range(*i.indices(mylen)))
+        removed = [index for index in removed if 0 <= index < mylen]
+        removed_sources = {
+            self._sources[index] for index in removed if self._sources[index] is not None
+        }
+        for index in sorted(removed, reverse=True):
+            del self._toklist[index]
+            del self._sources[index]
+        # Named occurrences keep the original-item index they were created
+        # with.  An occurrence whose item was removed becomes derived; it is
+        # never reassigned to the item that takes its place.
         for name, occurrences in self._tokdict.items():
             occurrences = occurrences[:]
-            for j in removed:
-                for k, (value, position) in enumerate(reversed(occurrences)):
-                    if position > j:
-                        occurrences[len(occurrences) - 1 - k] = _ParseResultsWithOffset(
-                            value, position - 1
-                        )
-                    else:
-                        break
+            for k, (value, source) in enumerate(occurrences):
+                if source in removed_sources:
+                    occurrences[k] = _ParseResultsWithOffset(value, DERIVED)
             self._tokdict[name] = occurrences
 
     def __contains__(self, k) -> bool:
@@ -457,15 +507,10 @@ class ParseResults:
            [0, '0', '123', '321']
 
         """
+        if index < 0:
+            index = max(0, len(self._toklist) + index)
         self._toklist.insert(index, ins_string)
-        # fixup indices in token dictionary; copy() shares these lists, so
-        # renumber a private copy rather than the list itself
-        for name, occurrences in self._tokdict.items():
-            occurrences = occurrences[:]
-            for k, (value, position) in enumerate(occurrences):
-                if position > index:
-                    occurrences[k] = _ParseResultsWithOffset(value, position + 1)
-            self._tokdict[name] = occurrences
+        self._sources.insert(index, None)
 
     def append(self, item):
         """
@@ -490,6 +535,7 @@ class ParseResults:
            ['0', '123', '321', 444]
         """
         self._toklist.append(item)
+        self._sources.append(None)
 
     def extend(self, itemseq):
         """
@@ -519,13 +565,16 @@ class ParseResults:
         if isinstance(itemseq, ParseResults):
             self.__iadd__(itemseq)
         else:
+            itemseq = list(itemseq)
             self._toklist.extend(itemseq)
+            self._sources.extend([None] * len(itemseq))
 
     def clear(self):
         """
         Clear all elements and results names.
         """
         del self._toklist[:]
+        self._sources.clear()
         self._tokdict.clear()
 
     def __getattr__(self, name):
@@ -552,8 +601,8 @@ class ParseResults:
         if not other:
             return self
 
+        offset = len(self._toklist)
         if other._tokdict:
-            offset = len(self._toklist)
             # addoffset = lambda a: offset if a < 0 else a + offset
             otheritems = other._tokdict.items()
             otherdictitems = [
@@ -563,7 +612,7 @@ class ParseResults:
                     _ParseResultsWithOffset(
                         v.result,
                         # addoffset(v[1])
-                        (offset if v.offset < 0 else v.offset + offset),
+                        (DERIVED if v.offset < 0 else v.offset + offset),
                     ),
                 )
                 for k, vlist in otheritems
@@ -574,6 +623,10 @@ class ParseResults:
                 if isinstance(v.result, ParseResults):
                     v.result._parent = self
 
+        self._sources += [
+            None if source is None else source + offset
+            for source in other._sources
+        ]
         self._toklist += other._toklist
         self._all_names |= other._all_names
         return self
@@ -692,6 +745,34 @@ class ParseResults:
 
         return dict((k, to_item(v)) for k, v in self.items())
 
+    def as_sources(self) -> list[int | None]:
+        """Return each sequential item's original input index.
+
+        The list is positionally aligned with :meth:`as_list` at this level.
+        Derived items, and items whose original input item can no longer be
+        identified, are reported as ``None``.
+        """
+        return self._sources[:]
+
+    def iter_named(self) -> Iterator[tuple[str, Any, int | None]]:
+        """Yield ``(name, value, original_index)`` for each named occurrence.
+
+        ``original_index`` is the index in the original input token sequence,
+        or ``None`` when the named item is derived.  Duplicate names, nested
+        results, and fields sharing the same value each keep their own entry.
+        """
+        for name, occurrences in self._tokdict.items():
+            for occurrence in occurrences:
+                source = occurrence.offset
+                yield name, occurrence.result, None if source < 0 else source
+
+    def as_named_dict(self) -> dict[str, list[tuple[Any, int | None]]]:
+        """Return named occurrences grouped by name as ``(value, origin)``."""
+        result: dict[str, list[tuple[Any, int | None]]] = {}
+        for name, value, origin in self.iter_named():
+            result.setdefault(name, []).append((value, origin))
+        return result
+
     def copy(self) -> ParseResults:
         """
         Returns a new shallow copy of a :class:`ParseResults` object.
@@ -701,9 +782,10 @@ class ParseResults:
         """
         ret: ParseResults = object.__new__(ParseResults)
         ret._toklist = self._toklist[:]
-        # the occurrence lists are shared with the original; the only methods
-        # that renumber them (__delitem__, insert) copy before writing, so a
-        # copy can never renumber the original's offsets
+        ret._sources = self._sources[:]
+        # Result-name occurrence lists are shared with the original; methods
+        # that change them replace their per-name list rather than mutating a
+        # shared one, so a copy can never disturb the original.
         ret._tokdict = {**self._tokdict}
         ret._parent = self._parent
         ret._all_names = {*self._all_names}
@@ -799,7 +881,8 @@ class ParseResults:
             )
         elif len(self) == 1 and len(self._tokdict) == 1:
             first_name, first_pr_offset = next(iter(self._tokdict.items()))
-            if first_pr_offset[0].offset <= 0:
+            origin = first_pr_offset[0].offset
+            if origin <= 0 or origin in self._sources:
                 return first_name
 
         return None
@@ -923,17 +1006,21 @@ class ParseResults:
                 list(self._all_names),
                 self._name,
                 self._is_dict_context,
+                list(self._sources),
             ),
         )
 
     def __setstate__(self, state):
-        self._toklist, (
+        (self._toklist, state_values) = state
+        (
             self._tokdict,
             _,
             inAccumNames,
             self._name,
             self._is_dict_context,
-        ) = state
+            *rest,
+        ) = state_values
+        self._sources = list(rest[0]) if rest else [None] * len(self._toklist)
         self._all_names = set(inAccumNames)
         self._parent = None
 

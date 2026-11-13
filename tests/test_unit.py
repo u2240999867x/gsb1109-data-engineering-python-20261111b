@@ -4394,6 +4394,98 @@ class Test02_WithoutPackrat(ppt.TestParseResultsAsserts, TestCase):
         del r2[0]
         self.assertEqual("b", r2.get_name())
 
+    def testParseResultsNamedSources(self):
+        expr = (
+            pp.Word(pp.nums)("a")
+            + pp.Word(pp.nums)("b")
+            + pp.Word(pp.nums)("c")
+        )
+        result = expr.parse_string("1 2 3")
+        self.assertEqual([0, 1, 2], result.as_sources())
+        self.assertEqual(
+            [("a", "1", 0), ("b", "2", 1), ("c", "3", 2)],
+            list(result.iter_named()),
+        )
+        self.assertEqual(
+            {"a": [("1", 0)], "b": [("2", 1)], "c": [("3", 2)]},
+            result.as_named_dict(),
+        )
+
+        # deleting an item invalidates its named occurrence, but that
+        # occurrence must not be handed to the item that follows it
+        del result[1]
+        self.assertEqual(["1", "3"], result.as_list())
+        self.assertEqual([0, 2], result.as_sources())
+        self.assertEqual(
+            [("a", "1", 0), ("b", "2", None), ("c", "3", 2)],
+            list(result.iter_named()),
+        )
+
+        # inserting a derived item gives it no original row
+        result = expr.parse_string("1 2 3")
+        result.insert(1, "X")
+        self.assertEqual([0, None, 1, 2], result.as_sources())
+        self.assertEqual(
+            [("a", "1", 0), ("b", "2", 1), ("c", "3", 2)],
+            list(result.iter_named()),
+        )
+
+    def testParseResultsNamedSourcesDistinguishOccurrences(self):
+        # same name twice, same interned value twice: each occurrence keeps
+        # its own position
+        expr = pp.Word(pp.nums)("x") + pp.Word(pp.nums)("x")
+        result = expr.parse_string("1 1")
+        self.assertEqual(
+            [("x", "1", 0), ("x", "1", 1)], list(result.iter_named())
+        )
+
+        # equal values under different names keep their own attribution
+        expr = pp.Word(pp.nums)("a") + pp.Word(pp.nums)("b")
+        result = expr.parse_string("1 1")
+        self.assertEqual(
+            [("a", "1", 0), ("b", "1", 1)], list(result.iter_named())
+        )
+
+    def testParseResultsNamedSourcesNested(self):
+        expr = pp.Group(pp.Word(pp.nums)("a") + pp.Word(pp.nums)("b"))(
+            "group"
+        ) + pp.Word(pp.alphas)("w")
+        result = expr.parse_string("1 2 xy")
+        self.assertEqual(
+            [("group", result["group"], 0), ("w", "xy", 1)],
+            list(result.iter_named()),
+        )
+        self.assertEqual([0, 1], result["group"].as_sources())
+        self.assertEqual(
+            [("a", "1", 0), ("b", "2", 1)],
+            list(result["group"].iter_named()),
+        )
+
+    def testParseResultsNamedSourcesDuplicateNames(self):
+        expr = pp.Word(pp.nums)("dup*")[...]
+        result = expr.parse_string("7 7 7")
+        self.assertEqual(
+            [("dup", "7", 0), ("dup", "7", 1), ("dup", "7", 2)],
+            list(result.iter_named()),
+        )
+        self.assertEqual(
+            {"dup": [("7", 0), ("7", 1), ("7", 2)]},
+            result.as_named_dict(),
+        )
+
+    def testParseResultsNamedSourcesCopyIsolation(self):
+        expr = pp.Word(pp.nums)("a") + pp.Word(pp.nums)("b")
+        result = expr.parse_string("1 2")
+        r2 = result.copy()
+        r2.insert(0, "X")
+        del result[0]
+        self.assertEqual(
+            [("a", "1", None), ("b", "2", 1)], list(result.iter_named())
+        )
+        self.assertEqual(
+            [("a", "1", 0), ("b", "2", 1)], list(r2.iter_named())
+        )
+
     def testParseResultsDeepcopy(self):
         expr = (
             pp.Word(pp.nums)
