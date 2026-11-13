@@ -88,6 +88,11 @@ from voluptuous.util import *
 from voluptuous.validators import *
 
 from voluptuous.error import *  # isort: skip
+from voluptuous.inference import (  # isort: skip
+    ContractCandidate,
+    InferredContract,
+    infer_contract,
+)
 
 # fmt: on
 

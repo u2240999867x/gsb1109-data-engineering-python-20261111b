@@ -17,6 +17,7 @@ from voluptuous import (
     Coerce,
     Contains,
     ContainsInvalid,
+    ContradictoryExamplesError,
     Date,
     Datetime,
     Email,
@@ -1360,6 +1361,202 @@ def test_schema_infer_accepts_kwargs():
 
     # Extra fields should be acceptable thanks to extra=True.
     schema({'str': 'bar', 'int': 42})
+
+
+MONEY_COUNT_POSITIVES = [
+    {'type': 'money', 'amount': 10, 'currency': 'USD'},
+    {'type': 'count', 'count': 3, 'unit': 'pcs'},
+]
+
+MONEY_COUNT_NEGATIVES = [
+    {'type': 'money', 'amount': 10, 'unit': 'pcs'},
+    {'type': 'count', 'count': 3, 'currency': 'USD'},
+    {'type': 'money', 'amount': 10, 'currency': 'USD', 'unit': 'x'},
+]
+
+
+def test_infer_contract_separates_money_and_count_rows():
+    contract = Schema.infer_contract(
+        MONEY_COUNT_POSITIVES,
+        MONEY_COUNT_NEGATIVES,
+        discriminators=['type'],
+    )
+
+    assert contract.branches == 2
+    assert contract.discriminators == ('type',)
+    assert not contract.ambiguous
+
+    for positive in MONEY_COUNT_POSITIVES:
+        contract.schema(positive)
+
+    for negative in MONEY_COUNT_NEGATIVES:
+        with pytest.raises(Invalid):
+            contract.schema(negative)
+
+
+def test_infer_contract_rejects_combinations_naive_union_allows():
+    # A plain column union cannot tell the two row kinds apart and accepts a
+    # forbidden cross combination.
+    naive = Schema(
+        {
+            'type': str,
+            'amount': int,
+            'currency': str,
+            'count': int,
+            'unit': str,
+        }
+    )
+    cross = {'type': 'money', 'amount': 10, 'unit': 'pcs'}
+    naive(cross)
+
+    contract = Schema.infer_contract(
+        MONEY_COUNT_POSITIVES, MONEY_COUNT_NEGATIVES, discriminators=['type']
+    )
+    with pytest.raises(Invalid):
+        contract.schema(cross)
+
+
+def test_infer_contract_uses_fewest_branches():
+    contract = Schema.infer_contract(
+        MONEY_COUNT_POSITIVES, MONEY_COUNT_NEGATIVES, discriminators=['type']
+    )
+    # A single merged branch would accept the cross combinations, so two
+    # branches is the minimum feasible contract.
+    assert contract.branches == 2
+
+
+def test_infer_contract_searches_discriminator_subsets():
+    # 'other' alone cannot separate the rows; the search must still find
+    # 'type', including it via the ('other', 'type') subset.
+    contract = Schema.infer_contract(
+        MONEY_COUNT_POSITIVES,
+        MONEY_COUNT_NEGATIVES,
+        discriminators=['other', 'type'],
+    )
+    assert contract.discriminators == ('type',)
+    assert contract.branches == 2
+
+
+def test_infer_contract_raises_when_no_subset_separates():
+    # Both optional keys are independently observed, so dropping both is
+    # accepted by the leaf even though it is a stated negative.
+    positives = [
+        {'a': 1, 'b': 2, 'c': 3},
+        {'a': 1, 'b': 2},
+        {'a': 1, 'c': 3},
+    ]
+    negatives = [{'a': 1}]
+    with pytest.raises(SchemaError):
+        Schema.infer_contract(positives, negatives, discriminators=['a'])
+
+
+def test_infer_contract_reports_contradictory_rows():
+    positives = [{'kind': 'money', 'value': 1}]
+    negatives = [{'kind': 'money', 'value': 2}]
+    with pytest.raises(ContradictoryExamplesError) as excinfo:
+        Schema.infer_contract(positives, negatives, discriminators=['kind'])
+    # 1-based indices into the positives and negatives arguments.
+    assert excinfo.value.contradictions == [(1, 1)]
+
+
+def test_infer_contract_no_negatives_uses_single_branch():
+    contract = Schema.infer_contract(
+        MONEY_COUNT_POSITIVES, [], discriminators=['type']
+    )
+    assert contract.branches == 1
+    assert contract.discriminators == ()
+    assert not contract.ambiguous
+
+
+def test_infer_contract_encodes_required_and_optional_presence():
+    contract = Schema.infer_contract(
+        [
+            {'kind': 'a', 'always': 1},
+            {'kind': 'a', 'always': 2, 'sometimes': 'x'},
+        ],
+        [],
+        discriminators=['kind'],
+    )
+    schema = contract.schema
+    schema({'kind': 'a', 'always': 3})
+    schema({'kind': 'a', 'always': 3, 'sometimes': 'y'})
+    with pytest.raises(Invalid):
+        schema({'kind': 'a', 'sometimes': 'y'})
+
+
+def test_infer_contract_empty_array_keeps_element_type_unknown():
+    contract = Schema.infer_contract(
+        [{'rows': []}, {'rows': [1, 2]}],
+        [{'rows': ['x']}],
+        discriminators=[],
+    )
+    schema = contract.schema
+    # Non-empty observed rows are number arrays.
+    schema({'rows': [3]})
+    with pytest.raises(Invalid):
+        schema({'rows': ['x']})
+
+    empty_only = Schema.infer_contract([{'rows': []}], [], discriminators=[])
+    # An empty array gives no element information, so any elements are allowed.
+    empty_only.schema({'rows': []})
+    empty_only.schema({'rows': [1, 'x', {}]})
+
+
+def test_infer_contract_json_number_excludes_boolean():
+    contract = Schema.infer_contract(
+        [{'v': 1}], [{'v': True}], discriminators=[]
+    )
+    with pytest.raises(Invalid):
+        contract.schema({'v': True})
+    contract.schema({'v': 1})
+
+    both = Schema.infer_contract([{'v': 1}, {'v': True}], [], discriminators=[])
+    both.schema({'v': 1})
+    both.schema({'v': True})
+
+
+def test_infer_contract_ambiguity_offers_separating_record():
+    positives = [
+        {'d': 'a', 'e': 'p', 'x': 1},
+        {'d': 'a', 'e': 'p', 'x': 2},
+        {'d': 'b', 'e': 'q', 'y': 5},
+        {'d': 'b', 'e': 'q', 'y': 6},
+        {'d': 'a', 'e': 'q', 'z': 9},
+    ]
+    negatives = [{'d': 'a', 'e': 'p', 'x': 1, 'y': 5}]
+    contract = Schema.infer_contract(
+        positives, negatives, discriminators=['d', 'e']
+    )
+
+    assert contract.ambiguous
+    assert len(contract.candidates) == 2
+    record = contract.separating_record
+    assert record is not None
+
+    accepted = contract.candidates[contract.separating_record_accepted_by]
+    rejected = contract.candidates[contract.separating_record_rejected_by]
+    accepted.schema(record)
+    with pytest.raises(Invalid):
+        rejected.schema(record)
+
+
+def test_infer_contract_nested_objects_and_arrays():
+    positives = [
+        {'kind': 'm', 'meta': {'cur': 'USD'}, 'tags': ['a']},
+        {'kind': 'c', 'meta': {'unit': 'pcs'}, 'tags': []},
+    ]
+    negatives = [{'kind': 'm', 'meta': {'unit': 'pcs'}, 'tags': []}]
+    contract = Schema.infer_contract(
+        positives, negatives, discriminators=['kind']
+    )
+
+    assert contract.branches == 2
+    for positive in positives:
+        contract.schema(positive)
+    with pytest.raises(Invalid):
+        contract.schema(negatives[0])
+    # The empty-array branch still permits arbitrary element types.
+    contract.schema({'kind': 'c', 'meta': {'unit': 'kg'}, 'tags': [1, {}, 'x']})
 
 
 def test_validation_performance():

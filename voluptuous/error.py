@@ -12,6 +12,21 @@ class SchemaError(Error):
     """An error was encountered in the schema."""
 
 
+class ContradictoryExamplesError(SchemaError):
+    """The positive and negative examples cannot be separated.
+
+    Raised by :meth:`Schema.infer_contract` when at least one negative
+    example is indistinguishable from a positive example using only the
+    observed key presence and JSON value types. ``contradictions`` holds the
+    offending row pairs as ``(positive_index, negative_index)`` tuples using
+    1-based indices into the ``positives`` and ``negatives`` arguments.
+    """
+
+    def __init__(self, message, contradictions=None):
+        SchemaError.__init__(self, message)
+        self.contradictions = contradictions or []
+
+
 class Invalid(Error):
     """The data was invalid.
 

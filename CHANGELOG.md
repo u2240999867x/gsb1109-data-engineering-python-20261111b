@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+**New**:
+
+* Add `Schema.infer_contract()` for minimum-branch contract inference from accepted positives, rejected negatives and a finite set of candidate discriminator columns. Leaves use only observed required/optional presence and JSON types, empty arrays keep an unknown element type, contradictory examples raise `ContradictoryExamplesError`, and equally minimal contracts return a `separating_record` for disambiguation.
+
 **Fixes**:
 
 * [#539](https://github.com/alecthomas/voluptuous/pull/539): Raise `Invalid` instead of leaking `TypeError`/`ValueError` for non-numeric input to the `Number` validator

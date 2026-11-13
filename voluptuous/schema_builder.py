@@ -180,6 +180,58 @@ class Schema(object):
 
         return cls(value_to_schema_type(data), **kwargs)
 
+    @classmethod
+    def infer_contract(
+        cls,
+        positives,
+        negatives=(),
+        discriminators=(),
+        **kwargs,
+    ):
+        """Infer a branched contract from accepted and rejected examples.
+
+        Unlike :meth:`infer`, which unions every observed column and can
+        therefore admit combinations that never occur together, this searches
+        the candidate ``discriminators`` columns for the contract with the
+        fewest branches that accepts every record in ``positives`` and rejects
+        every record in ``negatives``.  Branch leaves use only the observed
+        key presence (required versus optional) and JSON value types.
+
+        A money/count API is a typical use case::
+
+            positives = [
+                {'type': 'money', 'amount': 10, 'currency': 'USD'},
+                {'type': 'count', 'count': 3, 'unit': 'pcs'},
+            ]
+            negatives = [
+                {'type': 'money', 'amount': 10, 'unit': 'pcs'},
+            ]
+            contract = Schema.infer_contract(
+                positives, negatives, discriminators=['type'],
+            )
+            contract.schema(positives[0])
+
+        :param positives: accepted sample records.
+        :param negatives: explicitly rejected sample records.
+        :param discriminators: finite candidate column names allowed to define
+            branches; every subset is tried from the smallest upwards.
+        :returns: an ``InferredContract`` exposing the minimum-branch
+            ``schema`` and, when several equally small contracts exist, a
+            ``separating_record`` to confirm the intended one.
+        :raises voluptuous.error.ContradictoryExamplesError: when a negative
+            row is structurally indistinguishable from a positive row using
+            only observed presence and JSON types.
+        """
+        from voluptuous.inference import infer_contract
+
+        return infer_contract(
+            positives,
+            negatives,
+            discriminators,
+            schema_cls=cls,
+            **kwargs,
+        )
+
     def __eq__(self, other):
         if not isinstance(other, Schema):
             return False
