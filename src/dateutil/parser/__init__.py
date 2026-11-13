@@ -1,19 +1,22 @@
 from ._parser import (
+    ConsistencyResult,
     DEFAULTPARSER,
     DEFAULTTZPARSER,
+    InstantCandidate,
     ParserError,
     UnknownTimezoneWarning,
     __doc__,
     parse,
+    parse_consistent,
     parser,
     parserinfo,
 )
 from .isoparser import isoparse, isoparser
 
-__all__ = ['parse', 'parser', 'parserinfo',
+__all__ = ['parse', 'parse_consistent', 'parser', 'parserinfo',
            'isoparse', 'isoparser',
-           'ParserError',
-           'UnknownTimezoneWarning']
+           'ParserError', 'UnknownTimezoneWarning',
+           'InstantCandidate', 'ConsistencyResult']
 
 
 ###

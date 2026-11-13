@@ -35,6 +35,7 @@ import time
 import warnings
 
 from calendar import monthrange
+from collections.abc import Mapping
 from io import StringIO
 
 
@@ -45,7 +46,16 @@ from warnings import warn
 from .. import relativedelta
 from .. import tz
 
-__all__ = ["parse", "parserinfo", "ParserError"]
+__all__ = [
+    "parse",
+    "parse_consistent",
+    "parserinfo",
+    "parser",
+    "InstantCandidate",
+    "ConsistencyResult",
+    "ParserError",
+    "UnknownTimezoneWarning",
+]
 
 
 # TODO: pandas.core.tools.datetimes imports this explicitly.  Might be worth
@@ -230,6 +240,251 @@ class _resultbase:
 
     def __repr__(self):
         return self._repr(self.__class__.__name__)
+
+
+class InstantCandidate:
+    """
+    One UTC instant compatible with a local wall time and a candidate site.
+
+    :param site:
+        The caller-provided label for the candidate site.
+
+    :param instant:
+        The corresponding timezone-aware UTC datetime.
+
+    :param local:
+        The naive local wall time that was interpreted.
+
+    :param tzname:
+        The abbreviation that ``site`` uses at this instant.
+
+    :param utcoffset:
+        The UTC offset (a :class:`datetime.timedelta`) that ``site`` uses at
+        this instant.
+
+    :param fold:
+        The ``fold`` value used when interpreting the local wall time.
+        ``fold=1`` is only distinct for a repeated (fall-back) wall time.
+
+    :param timezone:
+        The candidate site's :class:`datetime.tzinfo` object.
+    """
+
+    __slots__ = ["site", "instant", "local", "tzname", "utcoffset", "fold",
+                 "timezone"]
+
+    def __init__(self, site, instant, local, tzname, utcoffset, fold,
+                 timezone):
+        self.site = site
+        self.instant = instant
+        self.local = local
+        self.tzname = tzname
+        self.utcoffset = utcoffset
+        self.fold = fold
+        self.timezone = timezone
+
+    @property
+    def offset_seconds(self):
+        """The candidate's UTC offset in seconds (or ``None``)."""
+        if self.utcoffset is None:
+            return None
+        return int(self.utcoffset.total_seconds())
+
+    def __eq__(self, other):
+        if not isinstance(other, InstantCandidate):
+            return NotImplemented
+        return self._key() == other._key()
+
+    def __hash__(self):
+        return hash(self._key())
+
+    def _key(self):
+        return (self.site, self.instant, self.local, self.tzname,
+                self.utcoffset, self.fold)
+
+    def __repr__(self):
+        return ("InstantCandidate(site=%r, instant=%r, local=%r, tzname=%r, "
+                "utcoffset=%r, fold=%r)" %
+                (self.site, self.instant, self.local, self.tzname,
+                 self.utcoffset, self.fold))
+
+
+class ConsistencyResult:
+    """
+    Result of :func:`parse_consistent`.
+
+    The result keeps every candidate that agrees with the supplied evidence.
+    It deliberately does not choose a winner: an ambiguous local time (a
+    fall-back transition) can produce two candidates for one site, while a
+    skipped local time (a spring-forward gap) can produce none.
+
+    :param local:
+        The naive local wall time that was parsed.
+
+    :param candidates:
+        All compatible :class:`InstantCandidate` objects, in site order and
+        then fold order.
+
+    :param site_candidates:
+        A mapping from site label to the tuple of candidates found for that
+        site. Sites with no compatible candidate are present with an empty
+        tuple.
+
+    :param instants:
+        The distinct UTC instants among ``candidates``, in chronological order.
+
+    :param evidence:
+        The evidence that was parsed from the input. Abbreviations and
+        offsets are ``None`` when they were not written explicitly; no value
+        is inferred from the host machine's local time zone.
+
+    :param critical_evidence:
+        Labels of the parsed evidence whose removal changes the result. The
+        labels are ``"abbreviation"`` and ``"offset"``.
+
+    :param missing:
+        Evidence that was not supplied and therefore could not be checked.
+    """
+
+    __slots__ = ["local", "candidates", "site_candidates", "instants",
+                 "evidence", "critical_evidence", "critical_sites", "missing"]
+
+    def __init__(self, local, candidates, site_candidates, instants, evidence,
+                 critical_evidence, critical_sites, missing):
+        self.local = local
+        self.candidates = tuple(candidates)
+        self.site_candidates = dict(site_candidates)
+        self.instants = tuple(instants)
+        self.evidence = dict(evidence)
+        self.critical_evidence = tuple(critical_evidence)
+        self.critical_sites = tuple(critical_sites)
+        self.missing = tuple(missing)
+
+    @property
+    def status(self):
+        """
+        A short description of the result.
+
+        ``"resolved"``
+            Exactly one site and one UTC instant are compatible. The instant
+            and the site are both identified.
+
+        ``"site_pending"``
+            All compatible sites point at the same single UTC instant. The
+            instant may be stored, but the site remains unidentified.
+
+        ``"conflict"``
+            The compatible candidates point at more than one UTC instant (for
+            example a fall-back wall time, or sites in different zones). The
+            input must be handed to review rather than resolved here.
+
+        ``"no_candidate"``
+            At least one site was supplied, but none of them agrees with the
+            evidence (for example every candidate falls in a spring-forward
+            gap, or the abbreviation and numeric offset contradict each other
+            at every site).
+
+        ``"missing_sites"``
+            No candidate sites were supplied. No instant can be established
+            without falling back to the host's local time zone.
+        """
+        if not self.site_candidates:
+            return "missing_sites"
+        if not self.instants:
+            return "no_candidate"
+        if len(self.instants) > 1:
+            return "conflict"
+
+        sites = self._sites_for(self.instants[0])
+        if len(sites) > 1:
+            return "site_pending"
+        return "resolved"
+
+    @property
+    def compatible_sites(self):
+        """Tuple of site labels that produced at least one candidate."""
+        return tuple(site for site, candidates in self.site_candidates.items()
+                     if candidates)
+
+    @property
+    def pending_sites(self):
+        """
+        Site labels that cannot be narrowed down by the evidence.
+
+        These are the sites pointing at the single shared instant of a
+        ``"site_pending"`` result, or all compatible sites of a
+        ``"conflict"`` result. If the result is resolved, this is empty.
+        """
+        status = self.status
+        if status == "site_pending":
+            return self.compatible_sites
+        elif status == "conflict":
+            return self.compatible_sites
+        return ()
+
+    @property
+    def review_required(self):
+        """Whether the input needs manual handling before it can be trusted."""
+        return self.status in ("conflict", "no_candidate", "missing_sites")
+
+    @property
+    def warehoused_instant(self):
+        """
+        The UTC instant that may be stored before site identification, if any.
+
+        A single shared instant is safe to store even while the site is still
+        pending. For a conflict this is ``None``.
+        """
+        if self.status in ("resolved", "site_pending"):
+            return self.instants[0]
+        return None
+
+    @property
+    def load_bearing_evidence(self):
+        """Alias for :attr:`critical_evidence`."""
+        return self.critical_evidence
+
+    @property
+    def utc_instants(self):
+        """Alias for :attr:`instants`."""
+        return self.instants
+
+    def _sites_for(self, instant):
+        return tuple(sorted({candidate.site for candidate in self.candidates
+                             if candidate.instant == instant}))
+
+    def as_dict(self):
+        """Return a plain, serializable representation of the result."""
+        return {
+            "local": self.local.isoformat(),
+            "status": self.status,
+            "instants": [instant.isoformat() for instant in self.instants],
+            "warehoused_instant": (self.warehoused_instant.isoformat()
+                                   if self.warehoused_instant is not None
+                                   else None),
+            "candidates": [
+                {
+                    "site": candidate.site,
+                    "instant": candidate.instant.isoformat(),
+                    "tzname": candidate.tzname,
+                    "offset_seconds": candidate.offset_seconds,
+                    "fold": candidate.fold,
+                }
+                for candidate in self.candidates
+            ],
+            "pending_sites": list(self.pending_sites),
+            "review_required": self.review_required,
+            "evidence": dict(self.evidence),
+            "critical_evidence": list(self.critical_evidence),
+            "critical_sites": list(self.critical_sites),
+            "missing": list(self.missing),
+        }
+
+    def __repr__(self):
+        return ("ConsistencyResult(local=%r, status=%r, instants=%r, "
+                "candidates=%r, critical_evidence=%r)" %
+                (self.local, self.status, self.instants, self.candidates,
+                 self.critical_evidence))
 
 
 class parserinfo:
@@ -564,9 +819,21 @@ class parser:
         self.info = info or parserinfo()
 
     def parse(self, timestr, default=None,
-              ignoretz=False, tzinfos=None, **kwargs):
+              ignoretz=False, tzinfos=None, sites=None, consistent=False,
+              **kwargs):
         """
         Parse the date/time string into a :class:`datetime.datetime` object.
+
+        If ``sites`` is passed (or ``consistent=True`` is set), this returns a
+        :class:`ConsistencyResult` instead; see :meth:`parse_consistent`.
+
+        :param sites:
+            Candidate sites for consistency checking. Passing this switches
+            the method to :meth:`parse_consistent`.
+
+        :param consistent:
+            If ``True``, use :meth:`parse_consistent` even without ``sites``.
+            A ``sites`` value takes precedence over ``tzinfos``.
 
         :param timestr:
             Any date/time string using the supported formats.
@@ -626,6 +893,10 @@ class parser:
             Raised if the parsed date exceeds the largest valid C integer on
             your system.
         """
+        if sites is not None or consistent:
+            return self.parse_consistent(
+                timestr, sites=sites, default=default, tzinfos=tzinfos,
+                **kwargs)
 
         if default is None:
             default = datetime.datetime.now().replace(hour=0, minute=0,
@@ -1150,6 +1421,262 @@ class parser:
     #  methods instead of functions for the sake of customizability via
     #  subclassing.
 
+    def parse_consistent(self, timestr, sites=None, default=None,
+                         tzinfos=None, **kwargs):
+        """
+        Parse a local time and retain every UTC instant compatible with the
+        supplied site rules and time zone evidence.
+
+        This is an explicit alternative to :meth:`parse`: it never falls back
+        to the host machine's local time zone, and it does not choose between
+        two valid interpretations. The input may contain a local wall time, an
+        optional time zone abbreviation and an optional numeric UTC offset.
+        Each candidate site is checked using the rules that its zone actually
+        applies on the parsed date.
+
+        A fall-back transition can give one site two compatible candidates
+        (one for each ``fold`` value). A spring-forward transition can leave a
+        site with no candidate because the local wall time does not exist.
+
+        :param timestr:
+            A string containing the local date/time and optional time zone
+            evidence.
+
+        :param sites:
+            The candidate sites. This can be a mapping from a site label to a
+            time zone, a sequence of time zones, a sequence of
+            ``(label, time zone)`` pairs, or a sequence of labels looked up
+            in ``tzinfos``. A time zone can be a :class:`datetime.tzinfo`, an
+            IANA key, or an integer offset in seconds. If omitted, ``tzinfos``
+            is used as the site mapping.
+
+        :param default:
+            The default datetime used for unspecified date/time elements, as
+            in :meth:`parse`. Its time zone, if any, is not used.
+
+        :param tzinfos:
+            Additional site aliases, in the same form accepted by
+            :meth:`parse`. When ``sites`` is given, these aliases resolve site
+            labels; otherwise they are the candidate-site mapping.
+
+        :param \\*\\*kwargs:
+            Further keyword arguments passed to the private parser (for
+            example ``dayfirst`` or ``yearfirst``).
+
+        :return:
+            A :class:`ConsistencyResult`.
+        """
+        res, _ = self._parse(timestr, **kwargs)
+        if res is None:
+            raise ParserError("Unknown string format: %s", timestr)
+        if len(res) == 0:
+            raise ParserError("String does not contain a date: %s", timestr)
+
+        if default is None:
+            default = datetime.datetime.now().replace(hour=0, minute=0,
+                                                      second=0, microsecond=0)
+
+        try:
+            naive = self._build_naive(res, default)
+        except ValueError as e:
+            raise ParserError(str(e) + ": %s", timestr) from e
+
+        local = naive.replace(tzinfo=None)
+        evidence = self._extract_evidence(timestr, res)
+
+        site_map = self._coerce_sites(sites if sites is not None else tzinfos,
+                                     aliases=tzinfos if sites is not None
+                                     else None)
+        evidence["sites"] = tuple(site_map)
+
+        missing = tuple(name for name in
+                        ("abbreviation", "offset", "sites")
+                        if evidence.get(name) is None or
+                        (name == "sites" and not evidence[name]) or
+                        (name == "offset" and evidence.get("unknown_offset")))
+        if not site_map:
+            return ConsistencyResult(local, (), {}, (), evidence, (), (),
+                                     missing)
+
+        candidate_map, candidates, instants = self._resolve_candidates(
+            local, site_map, evidence)
+
+        original_key = _conclusion_key(candidate_map, instants)
+        critical = []
+        critical_sites = []
+
+        if evidence.get("abbreviation") is not None:
+            changed = dict(evidence)
+            changed["abbreviation"] = None
+            if self._conclusion_for(local, site_map, changed) != original_key:
+                critical.append("abbreviation")
+
+        if evidence.get("offset") is not None:
+            changed = dict(evidence)
+            changed["offset"] = None
+            if self._conclusion_for(local, site_map, changed) != original_key:
+                critical.append("offset")
+
+        for label in site_map:
+            reduced = dict(site_map)
+            del reduced[label]
+            if self._conclusion_for(local, reduced, evidence) != original_key:
+                critical_sites.append(label)
+
+        return ConsistencyResult(local, candidates, candidate_map, instants,
+                                 evidence, critical, critical_sites, missing)
+
+    def _extract_evidence(self, timestr, res):
+        tokens = _timelex.split(timestr)
+
+        abbreviation = None
+        if res.tzname:
+            for token in tokens:
+                if token.lower() == res.tzname.lower():
+                    abbreviation = res.tzname
+                    break
+            else:
+                if res.tzname == "UTC" and any(
+                        token in ("Z", "z") for token in tokens):
+                    abbreviation = "UTC"
+
+        offset = None
+        unknown_offset = False
+        if res.hour is not None:
+            offset, unknown_offset = _parse_written_offset(timestr)
+
+        return {
+            "abbreviation": abbreviation,
+            "offset": offset,
+            "unknown_offset": unknown_offset,
+        }
+
+    def _coerce_sites(self, sites, aliases=None):
+        if sites is None:
+            return {}
+
+        if isinstance(sites, Mapping):
+            items = list(sites.items())
+        elif isinstance(sites, (str, datetime.tzinfo, int, float)):
+            items = [(None, sites)]
+        else:
+            items = []
+            for item in sites:
+                if (isinstance(item, (tuple, list)) and len(item) == 2 and
+                        isinstance(item[0], str)):
+                    items.append((item[0], item[1]))
+                else:
+                    items.append((None, item))
+
+        out = {}
+        for label, value in items:
+            zone = self._coerce_site_zone(value, aliases)
+            if label is None:
+                if isinstance(value, str):
+                    label = value
+                elif isinstance(value, (int, float)) and not isinstance(
+                        value, bool):
+                    label = str(value)
+                else:
+                    label = (getattr(zone, "key", None) or
+                             getattr(zone, "_name", None) or
+                             repr(zone))
+            if label in out:
+                raise ValueError("Duplicate site label: %s" % label)
+            out[label] = zone
+        return out
+
+    def _coerce_site_zone(self, value, aliases=None):
+        if isinstance(value, datetime.tzinfo):
+            return value
+        if isinstance(value, str):
+            zone = tz.gettz(value)
+            if zone is not None:
+                return zone
+            if aliases is not None:
+                alias_zone = self._coerce_alias(aliases, value)
+                if alias_zone is not None:
+                    return alias_zone
+            raise ValueError("Unknown site time zone: %s" % value)
+        if isinstance(value, bool):
+            raise TypeError("Site time zone must not be a bool")
+        if isinstance(value, (int, float)):
+            return tz.tzoffset(None, int(value))
+        raise TypeError("Site time zone must be a tzinfo, IANA key, "
+                        "or integer offset")
+
+    def _coerce_alias(self, aliases, name):
+        if callable(aliases):
+            data = aliases(name, None)
+            if data is None:
+                return None
+            return self._coerce_site_zone(data)
+        if not isinstance(aliases, Mapping) or name not in aliases:
+            return None
+        data = aliases[name]
+        if data is None:
+            return None
+        return self._coerce_site_zone(data)
+
+    def _resolve_candidates(self, local, site_map, evidence):
+        abbreviation = evidence.get("abbreviation")
+        offset = evidence.get("offset")
+        candidate_map = {}
+        candidates = []
+
+        for label, zone in site_map.items():
+            site_candidates = []
+            seen = set()
+            for fold in (0, 1):
+                aware = local.replace(tzinfo=zone, fold=fold)
+                try:
+                    utcoffset = aware.utcoffset()
+                except Exception:
+                    # A tzinfo that cannot answer for a wall time simply
+                    # provides no candidate for it.
+                    utcoffset = None
+                if utcoffset is None:
+                    continue
+
+                round_trip = (aware.astimezone(tz.UTC).astimezone(zone)
+                              .replace(tzinfo=None))
+                if round_trip != local:
+                    continue
+
+                tzname = aware.tzname()
+                if (abbreviation is not None and
+                        (tzname is None or
+                         tzname.casefold() != abbreviation.casefold())):
+                    continue
+
+                offset_seconds = int(utcoffset.total_seconds())
+                if offset is not None and offset_seconds != offset:
+                    continue
+
+                instant = aware.astimezone(tz.UTC)
+                key = (instant, offset_seconds, tzname)
+                if key in seen:
+                    continue
+                seen.add(key)
+
+                candidate = InstantCandidate(
+                    label, instant, local, tzname, utcoffset, fold, zone)
+                site_candidates.append(candidate)
+                candidates.append(candidate)
+
+            candidate_map[label] = tuple(site_candidates)
+
+        instants = tuple(sorted({
+            candidate.instant for candidate in candidates}))
+        return candidate_map, tuple(candidates), instants
+
+    def _conclusion_for(self, local, site_map, evidence):
+        if not site_map:
+            return ("missing_sites", ())
+        candidate_map, _, instants = self._resolve_candidates(
+            local, site_map, evidence)
+        return _conclusion_key(candidate_map, instants)
+
     def _build_tzinfo(self, tzinfos, tzname, tzoffset):
         if callable(tzinfos):
             tzdata = tzinfos(tzname, tzoffset)
@@ -1259,6 +1786,74 @@ class parser:
 
 
 DEFAULTPARSER = parser()
+
+# A UTC offset at the end of the string, optionally followed by a bracketed
+# abbreviation such as "(EST)". The two-digit-only form is accepted by the
+# parser for strings like "GMT+3" and "-05".
+_WRITTEN_OFFSET_RE = re.compile(
+    r"(?P<sign>[+-])(?:(?P<hours>[0-9]{2})(?::?(?P<minutes>[0-9]{2}))?"
+    r"|(?P<hour1>[0-9]))(?:\s*\([^()]*\))?\s*$")
+
+
+def _parse_written_offset(timestr):
+    # Only call this when a time was parsed: a date-only string such as
+    # "2024-11-03" also ends in something that looks like an offset.
+    match = _WRITTEN_OFFSET_RE.search(timestr)
+    if match is None:
+        return None, False
+
+    hours = int(match.group("hours") or match.group("hour1"))
+    minutes = int(match.group("minutes") or 0)
+    if hours > 23 or minutes > 59:
+        return None, False
+
+    if match.group("sign") == "-" and hours == 0 and minutes == 0:
+        # RFC 822 and ISO 8601 use "-0000" / "-00:00" for an unknown local
+        # offset, which is not the same as a known UTC offset.
+        return None, True
+
+    offset = (-1 if match.group("sign") == "-" else 1) * (
+        hours * 3600 + minutes * 60)
+    return offset, False
+
+
+def _conclusion_key(candidate_map, instants):
+    if not candidate_map:
+        return ("missing_sites", ())
+    if not instants:
+        return ("no_candidate", ())
+    if len(instants) > 1:
+        return ("conflict", instants)
+
+    sites = tuple(sorted({
+        site for site, candidates in candidate_map.items()
+        for candidate in candidates
+        if candidate.instant == instants[0]
+    }))
+    if len(sites) > 1:
+        return ("site_pending", instants)
+    return ("resolved", instants, sites)
+
+
+def parse_consistent(timestr, sites=None, parserinfo=None, default=None,
+                     tzinfos=None, **kwargs):
+    """
+    Parse a local time against candidate sites without guessing an instant.
+
+    This wrapper mirrors :func:`parse`: pass ``parserinfo`` to use a custom
+    parser configuration. ``sites`` and ``tzinfos`` are described in
+    :meth:`parser.parse_consistent`.
+
+    :return:
+        A :class:`ConsistencyResult`.
+
+    .. versionadded:: 4.1.0
+    """
+    if parserinfo is not None:
+        return parser(parserinfo).parse_consistent(
+            timestr, sites=sites, default=default, tzinfos=tzinfos, **kwargs)
+    return DEFAULTPARSER.parse_consistent(
+        timestr, sites=sites, default=default, tzinfos=tzinfos, **kwargs)
 
 
 def parse(timestr, parserinfo=None, **kwargs):

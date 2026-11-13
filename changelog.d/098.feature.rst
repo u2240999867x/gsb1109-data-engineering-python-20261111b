@@ -1,0 +1,9 @@
+Added :func:`dateutil.parser.parse_consistent` for parsing a local wall time
+against a list of candidate sites. Each site is checked with the time zone
+rules it actually applies on that date, and every UTC instant that agrees
+with the supplied abbreviation and numeric offset is retained. Fall-back
+times can produce two candidates for one site, while spring-forward gaps can
+produce none; sites that share one instant are stored with the site left
+pending, and sites that disagree are reported for review. The result records
+which of the original evidence pieces are load-bearing and which were missing,
+without falling back to the host machine's local time zone.
