@@ -2504,6 +2504,33 @@ class Table(Queryable):
             indexes.append(XIndex(index_name, index_columns))
         return indexes
 
+    def index_slimming_preview(
+        self,
+        queries: list[dict] | None = None,
+        uniques: list[dict] | None = None,
+    ) -> dict:
+        """
+        Preview which indexes on this table can be dropped given a declared
+        workload, and which must be kept.
+
+        Returns a dictionary with ``keep``, ``drop``, ``unknown`` and
+        ``uncovered`` lists. See :ref:`python_api_index_slimming`.
+
+        :param queries: List of declared query patterns, each a dictionary
+          with optional ``name``, ``equality`` (list of columns, or a
+          ``{column: constant}`` dictionary where ``None`` marks a bound
+          parameter), ``range`` (a single range column), ``order_by`` (list
+          of columns, ``(column, direction)`` pairs or ``{"column",
+          "direction"}`` dictionaries) and ``collate`` (a ``{column:
+          collation}`` dictionary)
+        :param uniques: List of declared uniqueness rules, each a dictionary
+          with ``columns`` and optional ``name`` and ``where``
+          (a ``{column: constant}`` predicate for partial rules)
+        """
+        from .index_slimming import index_slimming_preview
+
+        return index_slimming_preview(self, queries=queries, uniques=uniques)
+
     @property
     def triggers(self) -> list[Trigger]:
         "List of triggers defined on this table."

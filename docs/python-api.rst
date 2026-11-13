@@ -3145,6 +3145,88 @@ Use ``ignore=True`` to ignore the error if the index does not exist.
 .. note::
     In the CLI: :ref:`sqlite-utils create-index <cli_create_index>` and :ref:`sqlite-utils drop-index <cli_drop_index>`
 
+.. _python_api_index_slimming:
+
+Previewing index slimming for a declared workload
+=================================================
+
+Tables that accumulate indexes over time often carry more of them than the
+application actually needs. ``table.index_slimming_preview()`` compares the
+indexes that exist on a table against a *declared workload* - the query
+patterns and uniqueness rules the application relies on - and previews the
+minimal set of indexes that must be kept. Nothing is dropped; the method
+returns a preview dictionary you can inspect before acting.
+
+Consider a feature store table written by a daily batch, which is only ever
+read in order by entity and date range, and must reject duplicate samples
+within a batch:
+
+.. code-block:: python
+
+    preview = db["features"].index_slimming_preview(
+        queries=[
+            {
+                "name": "sample_by_entity_date",
+                "equality": ["entity_id"],
+                "range": "sample_date",
+                "order_by": [("sample_date", "asc")],
+            }
+        ],
+        uniques=[
+            {
+                "name": "no_duplicate_samples",
+                "columns": ["entity_id", "batch_id", "sample_date"],
+            }
+        ],
+    )
+
+Each declared query supports these keys:
+
+- ``name`` - optional label used in the report.
+- ``equality`` - the equality prefix: a list of column names, or a
+  dictionary mapping columns to constants. Use ``None`` for a bound
+  parameter (``column = ?``).
+- ``range`` - at most one column used with a range comparison such as
+  ``BETWEEN``.
+- ``order_by`` - list of columns, ``(column, direction)`` pairs or
+  ``{"column": ..., "direction": ...}`` dictionaries. Direction is
+  ``"asc"`` or ``"desc"``; a single index scan can satisfy either direction.
+- ``collate`` - optional ``{column: collation}`` dictionary. An index only
+  provides an ordering or lookup if its collation matches.
+
+Each declared uniqueness rule takes ``columns`` and an optional ``where``
+dictionary of ``{column: constant}`` predicate values, matching the partial
+index predicates described below.
+
+The returned preview has four lists:
+
+- ``keep`` - the minimal retained set. Each entry lists the requirements it
+  ``covers`` and an ``if_dropped`` explanation: ``lost_orders`` shows the
+  query orderings no other retained index provides, and ``writable_rows``
+  shows example duplicate rows that could be written if a uniqueness rule
+  were lost. Automatic indexes (primary key, ``UNIQUE`` constraints) are
+  always kept and marked with a ``reason``.
+- ``drop`` - indexes that are safe to remove. Each entry names the
+  ``successor`` retained index that takes over its declared duties, or
+  ``None`` if the index is not used by the declared workload at all.
+- ``unknown`` - indexes that could not be analyzed: partial indexes whose
+  predicate is not a conjunction of ``column = constant`` equalities, or
+  indexes on expressions. They are conservatively kept and are never used
+  as successors.
+- ``uncovered`` - declared requirements that no existing index can satisfy.
+  Slimming cannot fix these; a new index would be needed.
+
+Partial indexes are understood only when their predicate is a conjunction of
+``column = constant`` equalities, for example ``WHERE kind = 'train'``. Such
+an index covers a query only if the query pins the same columns to the same
+constants. A partial unique index enforces a uniqueness rule only if the
+rule declares the same predicate constants. Any other predicate marks the
+index as ``unknown``.
+
+An ``INTEGER PRIMARY KEY`` column is an alias for the rowid, so it appears
+in the report as a ``rowid`` entry that can serve equality, range and
+ordered access on that column.
+
 .. _python_api_analyze:
 
 Optimizing index usage with ANALYZE
