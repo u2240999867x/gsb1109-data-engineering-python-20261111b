@@ -1,5 +1,19 @@
 # PyProbables Changelog
 
+### Version 0.7.2
+
+* `WindowedSummary`
+  * Add mergeable, event-time windowed approximate de-duplication summary
+  * Per-partition watermarks with out-of-order acceptance within an explicit
+    allowed-lateness bound and deterministic late-event policies
+  * Explicit partition sealing for idle streams, with defined handling of old
+    events after recovery
+  * Merge reports the time span every partition covers completely versus the
+    span that remains uncertain; retained events cannot be lost to
+    fast-partition bucket rotation
+  * Granularity changes reuse old buckets only on aligned boundaries; time
+    coverage and estimated false positive rate are reported separately
+
 ### Version 0.7.1
 
 * `Cuckoo Filter`

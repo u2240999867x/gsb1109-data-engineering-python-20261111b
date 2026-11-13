@@ -16,9 +16,11 @@ from probables.exceptions import (
     ProbablesBaseException,
     RotatingBloomFilterError,
     SimilarityError,
+    WindowSummaryError,
 )
 from probables.quotientfilter import QuotientFilter
 from probables.utilities import Bitarray
+from probables.windows import Coverage, LateEventPolicy, WindowedSummary, WindowInsertResult
 
 __author__ = "Tyler Barrus"
 __maintainer__ = "Tyler Barrus"
@@ -50,4 +52,9 @@ __all__ = [
     "QuotientFilter",
     "Bitarray",
     "SimilarityError",
+    "WindowedSummary",
+    "WindowInsertResult",
+    "LateEventPolicy",
+    "Coverage",
+    "WindowSummaryError",
 ]

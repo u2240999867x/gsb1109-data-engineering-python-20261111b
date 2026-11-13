@@ -62,6 +62,40 @@ CountingBloomFilter
     :inherited-members:
 
 
+Windowed De-duplication Summaries
+----------------------------------
+
+Windowed summaries let several collection streams (partitions) share one
+approximate de-duplication window while keeping per-partition event-time
+watermarks. They accept out-of-order events within an explicit lateness bound,
+support sealing idle partitions, merge conservatively across streams and keep
+time coverage separate from the estimated Bloom Filter false positive rate.
+
+WindowedSummary
++++++++++++++++++++++++++++++++
+
+.. autoclass:: probables.WindowedSummary
+    :members:
+
+LateEventPolicy
++++++++++++++++++++++++++++++++
+
+.. autoclass:: probables.LateEventPolicy
+    :members:
+
+Coverage
++++++++++++++++++++++++++++++++
+
+.. autoclass:: probables.Coverage
+    :members:
+
+WindowInsertResult
++++++++++++++++++++++++++++++++
+
+.. autoclass:: probables.WindowInsertResult
+    :members:
+
+
 Cuckoo Filters
 --------------
 

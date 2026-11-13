@@ -148,6 +148,38 @@ Import pyprobables and setup a Quotient Filter
     qf.check('google.com')  # should return True
 
 
+Import pyprobables and setup a mergeable windowed de-duplication summary
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+.. code:: python
+
+    from probables import LateEventPolicy, WindowedSummary
+
+    summary = WindowedSummary(
+        bucket_width=10,
+        est_elements_per_bucket=1000,
+        false_positive_rate=0.05,
+        allowed_lateness=5,
+        late_policy=LateEventPolicy.DROP,
+        partitions=["p1", "p2"],
+    )
+    summary.add("p1", 12, "google.com")
+    summary.advance_watermark("p1", 15)
+    summary.add("p1", 11, "google.com")  # out-of-order, reported as duplicate
+    summary.advance_watermark("p2", 30)
+    coverage = summary.coverage()  # complete vs. uncertain event-time spans
+
+    other_summary = WindowedSummary(
+        bucket_width=10,
+        est_elements_per_bucket=1000,
+        false_positive_rate=0.05,
+        allowed_lateness=5,
+        late_policy=LateEventPolicy.DROP,
+        partitions=["p1", "p2"],
+    )
+    merged = WindowedSummary.merge(summary, other_summary)  # union of per-partition windows
+
+
 Supplying a pre-defined, alternative hashing strategies
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
