@@ -11,6 +11,7 @@ from .ifiles import ifind
 from .struct_parser import StructParser
 from .field_parser import FieldParser
 from .memo import find_memofile, open_memofile, FakeMemoFile
+from .memo_audit import ReadBudget
 from .codepages import guess_encoding
 from .dbversions import get_dbversion_string
 from .exceptions import DBFNotFound, MissingMemoFile
@@ -92,7 +93,9 @@ class DBF(object):
                  load=False,
                  raw=False,
                  ignore_missing_memofile=False,
-                 char_decode_errors='strict'):
+                 char_decode_errors='strict',
+                 max_memo_size=None,
+                 memo_budget=None):
 
         self.encoding = encoding
         self.ignorecase = ignorecase
@@ -101,6 +104,8 @@ class DBF(object):
         self.raw = raw
         self.ignore_missing_memofile = ignore_missing_memofile
         self.char_decode_errors = char_decode_errors
+        self.max_memo_size = max_memo_size
+        self.memo_budget = memo_budget
 
         if recfactory is None:
             self.recfactory = lambda items: items
@@ -140,6 +145,14 @@ class DBF(object):
                 self.date = None
 
         self.memofilename = self._get_memofilename()
+
+        if self.max_memo_size is not None or self.memo_budget is not None:
+            # One budget per table, shared across every record pass so
+            # totals, cached memos and quarantine decisions persist.
+            self.memo_audit = ReadBudget(max_bytes=self.memo_budget,
+                                         max_memo_size=self.max_memo_size)
+        else:
+            self.memo_audit = None
 
         if load:
             self.load()
@@ -251,7 +264,8 @@ class DBF(object):
 
     def _open_memofile(self):
         if self.memofilename and not self.raw:
-            return open_memofile(self.memofilename, self.header.dbversion)
+            return open_memofile(self.memofilename, self.header.dbversion,
+                                 budget=self.memo_audit)
         else:
             return FakeMemoFile(self.memofilename)
 
@@ -314,21 +328,29 @@ class DBF(object):
             # Shortcuts for speed.
             skip_record = self._skip_record
             read = infile.read
+            record_number = 0
 
             while True:
                 sep = read(1)
 
                 if sep == record_type:
-                    items = [
-                        (field.name, parse(field, read(field.length)))
-                        for field in self.fields
-                    ]
+                    items = []
+                    for field in self.fields:
+                        # Annotate any quarantine with its record and field.
+                        memofile.audit_ref = (record_number, field.name)
+                        items.append(
+                            (field.name, parse(field, read(field.length))))
                     yield self.recfactory(items)
+                    record_number += 1
 
                 elif sep in (b'\x1a', b''):
                     # End of records.
                     break
                 else:
+                    # Deleted (or otherwise skipped) records still occupy a
+                    # physical slot, so the ordinal stays stable across the
+                    # active and deleted passes.
+                    record_number += 1
                     skip_record(infile)
 
     def __iter__(self):

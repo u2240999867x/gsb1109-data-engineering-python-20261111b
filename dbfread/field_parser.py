@@ -6,6 +6,7 @@ import datetime
 import struct
 from decimal import Decimal
 from .memo import BinaryMemo
+from .memo_audit import QuarantinedMemo, MEMO_INDEX_INVALID
 
 PY2 = sys.version_info[0] == 2
 
@@ -38,9 +39,12 @@ class FieldParser:
         self.char_decode_errors = table.char_decode_errors
         self._lookup = self._create_lookup_table()
         if memofile:
+            self.memofile = memofile
             self.get_memo = memofile.__getitem__
         else:
+            self.memofile = None
             self.get_memo = lambda x: None
+        self._auditing = bool(getattr(memofile, 'budget', None))
 
     def decode_text(self, text):
         return decode_text(text, self.encoding, errors=self.char_decode_errors)
@@ -140,13 +144,36 @@ class FieldParser:
                     raise ValueError(
                         'Memo index is not an integer: {!r}'.format(data))
 
+    def _lookup_memo(self, data):
+        """Resolve a memo field's raw bytes to its memo file value.
+
+        Under audit control an unparseable index is quarantined with
+        the current record/field reference instead of aborting the
+        whole record, and quarantines returned by the memo file are
+        annotated with the referencing record and field.
+        """
+        try:
+            index = self._parse_memo_index(data)
+        except ValueError as error:
+            if not self._auditing:
+                raise
+            record, field = self.memofile.audit_ref
+            return QuarantinedMemo(MEMO_INDEX_INVALID, detail=str(error),
+                                   record=record, field=field)
+
+        memo = self.get_memo(index)
+        if isinstance(memo, QuarantinedMemo) and memo.record is None:
+            record, field = self.memofile.audit_ref
+            memo = memo.at(field, record)
+        return memo
+
     def parseM(self, field, data):
         """Parse memo field (M, G, B or P)
 
         Returns memo index (an integer), which can be used to look up
         the corresponding memo in the memo file.
         """
-        memo = self.get_memo(self._parse_memo_index(data))
+        memo = self._lookup_memo(data)
         # Visual FoxPro allows binary data in memo fields.
         # These should not be decoded as string.
         if isinstance(memo, BinaryMemo):
@@ -154,6 +181,8 @@ class FieldParser:
         else:
             if memo is None:
                 return None
+            elif isinstance(memo, QuarantinedMemo):
+                return memo
             else:
                 return self.decode_text(memo)
 
@@ -233,19 +262,19 @@ class FieldParser:
         if self.dbversion in [0x30, 0x31, 0x32]:
             return struct.unpack('d', data)[0]
         else:
-            return self.get_memo(self._parse_memo_index(data))
+            return self._lookup_memo(data)
 
     def parseG(self, field, data):
         """OLE Object stored in memofile.
 
         The raw data is returned as a binary string."""
-        return self.get_memo(self._parse_memo_index(data))
+        return self._lookup_memo(data)
 
     def parseP(self, field, data):
         """Picture stored in memofile.
 
         The raw data is returned as a binary string."""
-        return self.get_memo(self._parse_memo_index(data))
+        return self._lookup_memo(data)
 
     # Autoincrement field ('+')
     parse2B = parseI

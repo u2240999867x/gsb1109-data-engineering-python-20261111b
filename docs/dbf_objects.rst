@@ -74,6 +74,25 @@ raw=False
   Returns all data values as byte strings. This can be used for
   debugging or for doing your own decoding.
 
+max_memo_size=None
+  Maximum size in bytes of a single memo value. A memo that declares a
+  larger payload is not read and is returned as a
+  :class:`dbfread.QuarantinedMemo` instead. With FPT and dBase IV memo
+  files the length is known from the block header, so an oversized
+  block is isolated without any of its payload being read. With dBase
+  III ``.dbt`` files the end of the block has to be found by probing,
+  so reading stops as soon as the limit would be crossed.
+
+memo_budget=None
+  Total number of *distinct* bytes that may be read from the memo
+  file. Several fields or records can point at the same memo block;
+  the byte range of that block is paid for only once. When the budget
+  is exhausted the remaining blocks are returned as
+  :class:`dbfread.QuarantinedMemo` with their content left unknown,
+  while blocks that were fully cached earlier are still delivered.
+  The running totals live on the ``memo_audit`` attribute and persist
+  across iterations of the same table.
+
 
 Methods
 -------
@@ -136,6 +155,15 @@ filename
 
 memofilename
   File name of the memo file, or ``None`` if there is no memo file.
+
+memo_audit
+  The :class:`dbfread.ReadBudget` used to enforce ``max_memo_size``
+  and ``memo_budget``, or ``None`` when neither limit is set. It
+  exposes ``used`` and ``remaining`` budget bytes, the merged
+  ``ranges`` already read, the ``cache`` of fully read memo blocks,
+  the ``quarantined`` blocks that could not be delivered, and any
+  ``conflicts`` between declared memo ranges that overlap with
+  different boundaries.
 
 header
   The file header. This is only intended for internal use, but is exposed

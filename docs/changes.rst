@@ -7,6 +7,17 @@ Release History
 (Next Version)
 ^^^^^^^^^^^^^^^^^^
 
+* added ``max_memo_size`` and ``memo_budget`` arguments for audited
+  memo reading. The per-value limit isolates oversized memos, while the
+  budget limits the total number of distinct bytes read from the memo
+  file (memo blocks shared by several fields or records are counted
+  once). FPT/dBase IV blocks with a known length are gated from their
+  headers; dBase III ``.dbt`` blocks are probed chunk by chunk until
+  their end marker is found. Blocks that cannot be delivered under the
+  limits are returned as ``QuarantinedMemo`` objects carrying the reason
+  and the referencing record and field, and overlapping declared ranges
+  with conflicting boundaries are reported on ``table.memo_audit``.
+
 * records are now returned ``dict`` instead of ``collections.OrderedDict``
   in Python 3.7 and up (as well as CPython 3.6) since normal Python
   dictionaries are now ordered.
